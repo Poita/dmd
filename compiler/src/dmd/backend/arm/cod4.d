@@ -137,7 +137,7 @@ void cdeq(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
             // If loading result into a register
             if (cs.reg != NOREG)
             {
-                getregs(cdb, cs.reg);
+                getregs(cdb, mask(cs.reg));
                 const p = cast(targ_size_t*) &(e2.EV);
                 movregconst(cg,cdb,cs.reg,*p,sz == 8);
             }

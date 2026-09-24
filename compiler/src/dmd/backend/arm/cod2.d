@@ -2592,7 +2592,7 @@ void cdpost(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         gentstreg(cdb,cs.reg,sz == 8);          // CMP cs.reg,#0
 
         // If lvalue is a register variable, we must mark it as modified
-        getregs(cdb,cs.reg);
+        getregs(cdb,mask(cs.reg));
 
         const n = e2.Vint;
         uint opx = e.Eoper == OPpostinc ? 0 : 1;
@@ -2621,7 +2621,7 @@ void cdpost(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         }
 
         /* If lvalue is a register variable, we must mark it as modified */
-        getregs(cdb,reg);
+        getregs(cdb,mask(reg));
 
         const n = e2.Vint;
         uint opx = e.Eoper == OPpostinc ? 0 : 1;
