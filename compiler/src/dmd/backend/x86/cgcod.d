@@ -2857,7 +2857,8 @@ void codelem(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs,uin
                 {
                     if ((pretregs & (cg.allregs | INSTR.FLOATREGS)) == 0)
                     {
-                        pretregs = (tyfloating(e.Ety)) ? INSTR.FLOATREGS : cg.allregs;
+                        // keep mPSW, the result may also be wanted in the flags
+                        pretregs |= (tyfloating(e.Ety)) ? INSTR.FLOATREGS : cg.allregs;
                     }
                 }
                 else if ((pretregs & (mSTACK | mES | ALLREGS | mBP | XMMREGS)) == 0)
