@@ -99,7 +99,9 @@ ifeq (solaris,$(OS))
 endif
 ifeq (osx,$(OS))
 	ifeq (64,$(MODEL))
-		CFLAGS+=--target=x86_64-darwin-apple  # ARM cpu is not supported by dmd
+		ifneq (aarch64,$(ARCH))
+			CFLAGS+=--target=x86_64-darwin-apple  # match dmd's x86_64 output on any host
+		endif
 	endif
 endif
 
