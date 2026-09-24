@@ -2301,6 +2301,13 @@ uint codout(int seg, code* c, Barray!ubyte* disasmBuf, ref targ_size_t framehand
             op |= ((ad >> 2) & 0x7FFFF) << 5; // imm19 in opcode
             ggen.gen32(op);
         }
+        else if (INSTR.isBRANCHY26(op) && c.IFL1 == FL.block)   // B or BL to a block
+        {
+            ggen.flush();
+            int ad = cast(int)(c.IEV1.Vblock.Boffset - ggen.offset);
+            op |= (ad >> 2) & 0x3FF_FFFF;     // imm26 in opcode
+            ggen.gen32(op);
+        }
         else if (Symbol* s = c.IEV1.Vsym)
         {
             switch (s.Sclass)
