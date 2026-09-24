@@ -517,6 +517,14 @@ extern(C) Thread thread_attachThis()
     return thread_attachThis_tpl!Thread();
 }
 
+version (GNU) {} else version (AArch64)
+{
+    // Stores x19-x29 and d8-d15 into regs[0 .. 19]
+    private extern (C) void _d_aarch64_saveRegisters(size_t* regs) nothrow @nogc;
+    // Returns the stack pointer
+    private extern (C) void* _d_aarch64_getStackTop() nothrow @nogc;
+}
+
 // Calls the given delegate, passing the current thread's stack pointer to it.
 package extern(D) void callWithStackShell(scope callWithStackShellDg fn) nothrow
 in (fn)
@@ -685,24 +693,12 @@ in (fn)
     }
     else version (AArch64)
     {
-        // Callee-save registers, x19-x28 according to AAPCS64, section
-        // 5.1.1.  Include x29 fp because it optionally can be a callee
-        // saved reg
-        size_t[11] regs = void;
-        // store the registers in pairs
-        asm pure nothrow @nogc
-        {
-        /*
-            stp x19, x20, regs[0];
-            stp x21, x22, regs[2];
-            stp x23, x24, regs[4];
-            stp x25, x26, regs[6];
-            stp x27, x28, regs[8];
-            str x29, regs[10];
-            mov [sp], sp;
-         */
-        }
-        assert(0, "implement AArch64 inline assembler for callWithStackShell()"); // TODO AArch64
+        // Callee-saved registers x19-x28, x29 (fp) and d8-d15 according to
+        // AAPCS64 5.1.1 and 5.1.2, stored by switch_context_asm.S since
+        // there is no AArch64 inline assembler
+        size_t[19] regs = void;
+        _d_aarch64_saveRegisters(regs.ptr);
+        sp = regs.ptr;
     }
     else
     {
@@ -733,10 +729,7 @@ private extern(D) void* getStackTop() nothrow @nogc
     else version (D_InlineAsm_X86_64)
         asm pure nothrow @nogc { naked; mov RAX, RSP; ret; }
     else version (AArch64)
-        //asm pure nothrow @nogc { naked; mov x0, SP; ret; }    // TODO AArch64
-    {
-        return null;
-    }
+        return _d_aarch64_getStackTop();
     else version (GNU)
         return __builtin_frame_address(0);
     else

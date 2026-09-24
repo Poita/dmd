@@ -571,6 +571,44 @@ CSYM(fiber_switchContext):
         ret
 
 /**
+ * void _d_aarch64_saveRegisters(size_t* regs)
+ * Stores the callee-saved registers x19-x29 and d8-d15 into regs[0 .. 19]
+ * so the GC finds pointers that are only held in registers.
+ */
+        .text
+        .global CSYM(_d_aarch64_saveRegisters)
+        .p2align  2
+#ifndef __APPLE__
+        .type   _d_aarch64_saveRegisters, %function
+#endif
+CSYM(_d_aarch64_saveRegisters):
+        stp     x19, x20, [x0]
+        stp     x21, x22, [x0, #2*8]
+        stp     x23, x24, [x0, #4*8]
+        stp     x25, x26, [x0, #6*8]
+        stp     x27, x28, [x0, #8*8]
+        str     x29,      [x0, #10*8]
+        stp     d8, d9,   [x0, #11*8]
+        stp     d10, d11, [x0, #13*8]
+        stp     d12, d13, [x0, #15*8]
+        stp     d14, d15, [x0, #17*8]
+        ret
+
+/**
+ * void* _d_aarch64_getStackTop()
+ * Returns the stack pointer.
+ */
+        .text
+        .global CSYM(_d_aarch64_getStackTop)
+        .p2align  2
+#ifndef __APPLE__
+        .type   _d_aarch64_getStackTop, %function
+#endif
+CSYM(_d_aarch64_getStackTop):
+        mov     x0, sp
+        ret
+
+/**
  * When generating any kind of backtrace (gdb, exception handling) for
  * a function called in a Fiber, we need to tell the unwinder to stop
  * at our Fiber main entry point, i.e. we need to mark the bottom of
