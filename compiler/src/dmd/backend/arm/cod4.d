@@ -46,7 +46,7 @@ import dmd.backend.evalu8 : el_toreald;
 import dmd.backend.x86.xmm;
 import dmd.backend.arm.cod1 : getlvalue, loadFromEA, storeToEA,CLIB_A,callclib;
 import dmd.backend.arm.cod2 : idxregm, tyToExtend;
-import dmd.backend.arm.cod3 : COND, conditionCode, gentstreg, loadFloatRegConst;
+import dmd.backend.arm.cod3 : COND, conditionCode, gentstreg, loadFloatRegConst, genBranch;
 import dmd.backend.arm.instr;
 
 
@@ -1135,7 +1135,7 @@ void cdcmp(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
 
     retregs = cg.allregs;
 
-    ce = isPair ? gennop(ce) : null;
+    ce = isPair ? gen1(null, INSTR.nop) : null;     // branch target for register pairs
 
     switch (e2.Eoper)
     {
@@ -1150,7 +1150,7 @@ void cdcmp(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
                 rreg = findreg(rretregs & INSTR.MSW);
                 uint ins = INSTR.cmp_subs_addsub_shift(1, rreg, 0, 0, reg); // CMP reg, rreg
                 cdb.gen1(ins);
-                genjmp(cdb,JNE,FL.code,cast(block*) ce);      // JNE nop
+                genBranch(cdb,COND.ne,FL.code,cast(block*) ce);  // B.NE ce
 
                 reg = findreg(retregs & INSTR.LSW);
                 rreg = findreg(rretregs & INSTR.LSW);

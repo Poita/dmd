@@ -1022,6 +1022,20 @@ private code* callFinallyBlock(ref CGstate cg, block* bf, regm_t retregs)
     cg.calledFinally = true;
     uint npush = gensaverestore(cg,retregs,cdbs,cdbr);
 
+    if (cg.AArch64)
+    {
+        // BL bf; the stack pointer stays 16 byte aligned
+        code cs;
+        cs.Iop = INSTR.bl(0);           // offset filled in by codout()
+        cs.Iflags = CF.zero;
+        cs.IFL1 = FL.block;
+        cs.IEV1.Vblock = bf;
+        cdbs.gen(&cs);
+        cgstate.regcon.immed.mval = 0;
+        cdbs.append(cdbr);
+        return cdbs.finish();
+    }
+
     if (STACKALIGN >= 16)
     {   npush += REGSIZE;
         if (npush & (STACKALIGN - 1))
