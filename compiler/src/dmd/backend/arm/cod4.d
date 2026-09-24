@@ -1829,7 +1829,7 @@ void cdshtlng(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
                 //    INSTR.log_imm(sf,opc,N,immr,imms,Rn,Rd)
                 uint N,immr,imms;
                 assert(encodeNImmrImms(0xFF,N,immr,imms));
-                uint ins = INSTR.log_imm(0,0,N,immr,imms,cs.reg,reg); // AND reg,cs.reg,#0xFF
+                uint ins = INSTR.log_imm(0,0,0,immr,imms,cs.reg,reg); // AND reg,cs.reg,#0xFF (N is 0 for 32 bit patterns)
                 cdb.gen1(ins);
             }
             else
