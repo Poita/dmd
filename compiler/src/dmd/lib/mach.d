@@ -359,9 +359,8 @@ private:
             MachObjSymbol* os = objsymbols[i];
             moffset += 8 + os.name.length + 1;
         }
-        moffset = (moffset + 3) & ~3;
-        //if (moffset & 4)
-        //    moffset += 4;
+        // The Apple linker requires 64 bit object files to start on 8 byte boundaries
+        moffset = (moffset + 7) & ~7;
         uint hoffset = moffset;
         static if (LOG)
         {
@@ -370,7 +369,7 @@ private:
         for (size_t i = 0; i < objmodules.length; i++)
         {
             MachObjModule* om = objmodules[i];
-            moffset += moffset & 1;
+            moffset = (moffset + 7) & ~7;
             om.offset = moffset;
             if (om.scan)
             {
@@ -439,10 +438,8 @@ private:
             libbuf.writestring(os.name);
             libbuf.writeByte(0);
         }
-        while (libbuf.length & 3)
+        while (libbuf.length & 7)
             libbuf.writeByte(0);
-        //if (libbuf.length & 4)
-        //    libbuf.write(pad[0 .. 4]);
         static if (LOG)
         {
             printf("\tlibbuf.moffset = x%x\n", libbuf.length);
@@ -453,7 +450,7 @@ private:
         for (size_t i = 0; i < objmodules.length; i++)
         {
             MachObjModule* om2 = objmodules[i];
-            if (libbuf.length & 1)
+            while (libbuf.length & 7)
                 libbuf.writeByte('\n'); // module alignment
             assert(libbuf.length == om2.offset);
             if (om2.scan)
