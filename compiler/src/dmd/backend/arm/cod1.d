@@ -146,9 +146,11 @@ void loadFromEA(ref code cs, reg_t reg, uint szw, uint szr)
     {
         // LDRB/LDRH/LDR reg,[cs.base,cs.index,extend S]
         if (szr == 1)
-            cs.Iop = INSTR.ldrb_reg(szw == 8, cs.index, cs.Sextend & 7, cs.Sextend >> 3, cs.base, reg);
+            cs.Iop = signExtend ? INSTR.ldrsb_reg(szw == 8, cs.index, cs.Sextend & 7, cs.Sextend >> 3, cs.base, reg)
+                                : INSTR.ldrb_reg (szw == 8, cs.index, cs.Sextend & 7, cs.Sextend >> 3, cs.base, reg);
         else if (szr == 2)
-            cs.Iop = INSTR.ldrh_reg(szw == 8, cs.index, cs.Sextend & 7, cs.Sextend >> 3, cs.base, reg);
+            cs.Iop = signExtend ? INSTR.ldrsh_reg(szw == 8, cs.index, cs.Sextend & 7, cs.Sextend >> 3, cs.base, reg)
+                                : INSTR.ldrh_reg (szw == 8, cs.index, cs.Sextend & 7, cs.Sextend >> 3, cs.base, reg);
         else
             // the (szr == 4) case is handled when Sextend is UXTW or SXTW, (szr == 8) is LSL or SXTX
             cs.Iop = INSTR.ldr_reg_gen(szw == 8, cs.index, cs.Sextend & 7, cs.Sextend >> 3, cs.base, reg);
