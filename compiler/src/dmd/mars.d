@@ -1010,9 +1010,13 @@ bool parseCommandLine(const ref Strings arguments, const size_t argc, out Param 
         }
         else if (arg == "-m64") // https://dlang.org/dmd.html#switch-m64
         {
-            target.isAArch64 = false;
+            // 64 bit code for the host architecture, like LDC and GDC
+            version (AArch64)
+                target.isAArch64 = true;
+            else
+                target.isAArch64 = false;
             target.isX86     = false;
-            target.isX86_64  = true;
+            target.isX86_64  = !target.isAArch64;
         }
         else if (arg == "-m32mscoff") // https://dlang.org/dmd.html#switch-m32mscoff
         {

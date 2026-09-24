@@ -369,6 +369,7 @@ unittest
 void setTriple(ref Target target, const ref Triple triple) @safe
 {
     target.cpu     = triple.cpu;
+    target.isAArch64 = false;       // only x86 triples are recognized
     target.isX86_64 = triple.isX86_64;
     target.isX86    = !target.isX86_64;
     target.isLP64  = triple.isLP64;
