@@ -15,9 +15,9 @@ import core.atomic : has128BitCAS, MemoryOrder;
 version (DigitalMars)
 version (AArch64)
 {
-    /* These functions are all stubbed out. They await someone who knows what
-       they are doing with AArch64 atomics.
-       TODO AArch64
+    /* These functions have the right semantics but are not atomic, so they
+       are only correct for single threaded programs.
+       TODO AArch64: implement with LDAXR/STLXR or LSE instructions
      */
     enum IsAtomicLockFree(T) = T.sizeof <= size_t.sizeof * 2;
 
@@ -36,7 +36,9 @@ version (AArch64)
     T atomicFetchAdd(MemoryOrder order = MemoryOrder.seq, bool result = true, T)(T* dest, T value) pure nothrow @nogc @trusted
         if (is(T : ulong))
     {
-	    return *dest + value;
+        T old = *dest;
+        *dest = cast(T)(old + value);
+        return old;
     }
 
     T atomicFetchSub(MemoryOrder order = MemoryOrder.seq, bool result = true, T)(T* dest, T value) pure nothrow @nogc @trusted
@@ -48,8 +50,9 @@ version (AArch64)
     T atomicExchange(MemoryOrder order = MemoryOrder.seq, bool result = true, T)(T* dest, T value) pure nothrow @nogc @trusted
     if (CanCAS!T)
     {
-        size_t storage = void;
-        return *cast(T*)&storage;
+        T old = *dest;
+        *dest = value;
+        return old;
     }
 
     alias atomicCompareExchangeWeak = atomicCompareExchangeStrong;
