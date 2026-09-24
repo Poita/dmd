@@ -255,6 +255,7 @@ struct INSTR
      */
     static uint log_imm(uint sf, uint opc, uint N, uint immr, uint imms, ubyte Rn, ubyte Rd)
     {
+        assert(sf || N == 0, "N must be 0 for 32 bit logical immediates");
         return (sf   << 31) |
                (opc  << 29) |
                (0x24 << 23) |
