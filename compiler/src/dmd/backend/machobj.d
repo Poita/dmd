@@ -871,6 +871,11 @@ void MachObj_term(const(char)[] objfilename)
         foreach (i; 0 .. table.length)
             table[i] = cast(int)i;
 
+    // Inverse of table[]: maps a segment number to its section number in the object file
+    int[] segToSect = (cast(int*)mem_malloc(SegData.length * int.sizeof))[0 .. SegData.length];
+    foreach (i, seg; table)
+        segToSect[seg] = cast(int)i;
+
     if (I64)
     {
         segment_cmd64.vmsize = vmaddr;
@@ -987,7 +992,7 @@ void MachObj_term(const(char)[] objfilename)
                             }
                             else
                             {
-                                rel.r_symbolnum = table[s.Sseg];
+                                rel.r_symbolnum = segToSect[s.Sseg];
                                 assert(rel.r_symbolnum < SegData.length);
                             }
                             machobj.fobjbuf.write(&rel, rel.sizeof);
@@ -1020,23 +1025,18 @@ void MachObj_term(const(char)[] objfilename)
                                         rel.r_type = ARM64_RELOC_BRANCHY26;
                                         rel.r_pcrel = 1;
                                     }
-                                    else if (s.Sfl == FL.unde ||   // special case for __chkstk_darwin, need to research what PAGEOFF12 really means
-                                             s.Sfl == FL.extern_ ||
-                                             (s.Sclass == SC.extern_ && s.Sfl == FL.func) ||
-                                             //(s.Sclass == SC.static_ && s.Sfl == FL.data) ||
-                                             s.Sfl == FL.tlsdata)
-                                    {
-                                        rel.r_type = r.rtype == REL.add ? ARM64_RELOC_GOT_LOAD_PAGEOFF12 : ARM64_RELOC_GOT_LOAD_PAGE21;
-                                        if (s.Sfl == FL.tlsdata ||
-                                            (s.Sfl == FL.data || s.Sfl == FL.extern_) && (s.ty() & mTYLINK) == mTYthread)
-                                            rel.r_type = r.rtype == REL.add ? ARM64_RELOC_TLVP_LOAD_PAGEOFF12 : ARM64_RELOC_TLVP_LOAD_PAGE21;
-                                        rel.r_pcrel = r.rtype == REL.add ? 0 : 1;
-                                    }
                                     else
                                     {
-                                        // BUG AArch64: failing test20050.d, should pick RELOC_PAGEOFF12 ??!!
-                                        //rel.r_type = r.rtype == REL.add ? ARM64_RELOC_GOT_LOAD_PAGEOFF12 : ARM64_RELOC_GOT_LOAD_PAGE21;
-                                        rel.r_type = r.rtype == REL.add ? ARM64_RELOC_PAGEOFF12 : ARM64_RELOC_PAGE21;
+                                        const tls = s.Sfl == FL.tlsdata ||
+                                            (s.Sfl == FL.data || s.Sfl == FL.extern_) && (s.ty() & mTYLINK) == mTYthread;
+                                        // Whether to go through the GOT is decided by the instruction the
+                                        // code generator emitted, as the symbol may have become extern since
+                                        if (tls)
+                                            rel.r_type = r.rtype == REL.add ? ARM64_RELOC_TLVP_LOAD_PAGEOFF12 : ARM64_RELOC_TLVP_LOAD_PAGE21;
+                                        else if (pageOffIsLdr(seg, r))
+                                            rel.r_type = r.rtype == REL.add ? ARM64_RELOC_GOT_LOAD_PAGEOFF12 : ARM64_RELOC_GOT_LOAD_PAGE21;
+                                        else
+                                            rel.r_type = r.rtype == REL.add ? ARM64_RELOC_PAGEOFF12 : ARM64_RELOC_PAGE21;
                                         rel.r_pcrel = r.rtype == REL.add ? 0 : 1;
                                     }
                                     if (s.Sfl == FL.tlsdata && s.Sclass == SC.comdat)
@@ -1055,8 +1055,8 @@ void MachObj_term(const(char)[] objfilename)
                                     if (/*s.Sfl == FL.func &&*/ r.rtype == REL.rel26)
                                         goto case SC.extern_;
                                     rel.r_type = r.rtype == REL.add ? ARM64_RELOC_PAGEOFF12 : ARM64_RELOC_PAGE21;
-                                    //rel.r_type = r.rtype == REL.add ? ARM64_RELOC_GOT_LOAD_PAGEOFF12 : ARM64_RELOC_GOT_LOAD_PAGE21;
-                                    //rel.r_type = r.rtype == REL.add ? ARM64_RELOC_PAGEOFF12 : ARM64_RELOC_PAGE21;
+                                    if (pageOffIsLdr(seg, r))
+                                        rel.r_type = r.rtype == REL.add ? ARM64_RELOC_GOT_LOAD_PAGEOFF12 : ARM64_RELOC_GOT_LOAD_PAGE21;
                                     if (s.Sfl == FL.tlsdata || s.Sfl == FL.data && (s.ty() & mTYLINK) == mTYthread)
                                         rel.r_type = r.rtype == REL.add ? ARM64_RELOC_TLVP_LOAD_PAGEOFF12 : ARM64_RELOC_TLVP_LOAD_PAGE21;
 
@@ -1156,7 +1156,9 @@ static if (0)
                                     rel.r_length = 3;
                                 }
                                 rel.r_extern = 1;
-                                rel.r_type = ARM64_RELOC_UNSIGNED; // RELOC_POINTER_TO_GOT?
+                                // A pc-relative reference from data to an external symbol goes through the GOT,
+                                // e.g. DW_EH_PE_indirect|DW_EH_PE_pcrel type table entries in the LSDA
+                                rel.r_type = r.rtype == REL.rel ? ARM64_RELOC_POINTER_TO_GOT : ARM64_RELOC_UNSIGNED;
                                 machobj.fobjbuf.write(&rel, rel.sizeof);
                                 foffset += rel.sizeof;
                                 nreloc++;
@@ -1165,7 +1167,7 @@ static if (0)
                             else
                             {
                                 rel.r_address = cast(int)r.offset;
-                                rel.r_symbolnum = table[s.Sseg];
+                                rel.r_symbolnum = segToSect[s.Sseg];
                                 if (r.rtype == REL.rel)
                                 {
                                     rel.r_pcrel = 1;
@@ -1270,7 +1272,7 @@ static if (0)
                     {
                         //printf("rs: REL.%s r.targseg: %d r.offset: x%llx\n", rs, r.targseg, cast(long)r.offset);
                         rel.r_address = cast(int)r.offset;
-                        rel.r_symbolnum = table[r.targseg];
+                        rel.r_symbolnum = segToSect[r.targseg];
                         rel.r_pcrel = (r.rtype == REL.address) ? 0 : 1;
                         //printf("r_pcrel: %d\n", rel.r_pcrel);
                         rel.r_length = (r.rtype == REL.address) ? 3 : 2;
@@ -1411,7 +1413,7 @@ assert(rel.r_symbolnum);
                                 else
                                 {
                                     rel.r_address = cast(int)r.offset;
-                                    rel.r_symbolnum = table[s.Sseg];
+                                    rel.r_symbolnum = segToSect[s.Sseg];
 assert(rel.r_symbolnum);
                                     rel.r_pcrel = 1;
                                     rel.r_length = 2;
@@ -1458,7 +1460,7 @@ assert(rel.r_symbolnum);
                             else
                             {
                                 rel.r_address = cast(int)r.offset;
-                                rel.r_symbolnum = table[s.Sseg];
+                                rel.r_symbolnum = segToSect[s.Sseg];
 assert(rel.r_symbolnum);
                                 rel.r_pcrel = 0;
                                 rel.r_length = 2;
@@ -1568,7 +1570,7 @@ assert(rel.r_symbolnum);
                     {
                         //printf("r.rtype: %d r.targseg: %d r.offset: x%llx\n", r.rtype, r.targseg, cast(long)r.offset);
                         rel.r_address = cast(int)r.offset;
-                        rel.r_symbolnum = table[r.targseg];
+                        rel.r_symbolnum = segToSect[r.targseg];
 assert(rel.r_symbolnum);
                         rel.r_pcrel = (r.rtype == REL.address) ? 0 : 1;
                         rel.r_length = 2;
@@ -1650,14 +1652,7 @@ assert(rel.r_symbolnum);
 
     ubyte remap(uint seg)
     {
-        if (!machobj.AArch64)
-            return cast(ubyte)seg;
-        foreach (i; 0 .. table.length)
-        {
-            if (table[i] == seg)
-                return cast(ubyte)i;
-        }
-        assert(0);
+        return cast(ubyte)segToSect[seg];
     }
 
     foreach (s; machobj.localSymbols[])
@@ -1856,6 +1851,7 @@ assert(rel.r_symbolnum);
     machobj.fobjbuf.position(foffset, 0);
 
     mem_free(table.ptr);
+    mem_free(segToSect.ptr);
 
     /* Set Sxtrnnum to zero for symbols so we know they are not in the
      * object file's symbol table.
@@ -3314,7 +3310,8 @@ int MachObj_reftoidentAArch64(int seg, targ_size_t offset, Symbol* s, targ_size_
     }
     else
         buf.write64(val);
-    if (save > offset + retsize)
+    // position() truncated the buffer to offset, and the write may have been skipped
+    if (save > buf.length())
         buf.setsize(save);
 
     return retsize;
@@ -3445,6 +3442,43 @@ void MachObj_write_pointerRef(Symbol* s, uint off)
 }
 
 /******************************************
+ * Determine if an AArch64 ADRP/PAGEOFF12 reference to `s` goes through the GOT.
+ * The code generator must then use LDR (not ADD) for the PAGEOFF12 instruction.
+ */
+@trusted
+bool MachObj_isGOTRef(const Symbol* s)
+{
+    switch (s.Sclass)
+    {
+        case SC.extern_:
+        case SC.comdat:
+        case SC.comdef:
+        case SC.static_:
+            return s.Sfl == FL.unde ||   // special case for __chkstk_darwin
+                   s.Sfl == FL.extern_ ||
+                   (s.Sclass == SC.extern_ && s.Sfl == FL.func) ||
+                   s.Sfl == FL.tlsdata;
+        default:
+            return false;
+    }
+}
+
+/******************************************
+ * Determine if the PAGEOFF12 instruction paired with AArch64 fixup `r` is LDR Xt,[Xn,#imm],
+ * meaning the code generator loads the address from the GOT rather than computing it with ADD.
+ */
+@trusted
+private bool pageOffIsLdr(int seg, const ref Relocation r)
+{
+    OutBuffer* buf = SegData[seg].SDbuf;
+    const off = r.offset + (r.rtype == REL.add ? 0 : 4);   // ADRP is immediately followed by its PAGEOFF12 instruction
+    if (off + 4 > buf.length())
+        return false;
+    const ins = *cast(const uint*)(buf.buf + off);
+    return (ins & 0xFFC0_0000) == 0xF940_0000;
+}
+
+/******************************************
  * Generate fixup specific to .eh_frame and .gcc_except_table sections.
  * Params:
  *      seg = segment of where to write fixup
@@ -3459,7 +3493,7 @@ int mach_dwarf_reftoident(int seg, targ_size_t offset, Symbol* s, targ_size_t va
 {
     //printf("dwarf_reftoident(seg=%d offset=x%x s=%s val=x%x\n", seg, cast(int)offset, s.Sident.ptr, cast(int)val);
     if (machobj.AArch64)
-        MachObj_reftoident(seg, offset, s, val + 4, CF.selfrel);
+        MachObj_reftoident(seg, offset, s, val, CF.selfrel);    // AArch64 pc-relative fixups are relative to the fixup itself
     else
         MachObj_reftoident(seg, offset, s, val + 4, I64 ? CF.off : CF.indirect);
     return 4;

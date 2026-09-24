@@ -31,7 +31,7 @@ import dmd.backend.cc;
 import dmd.backend.cdef;
 import dmd.backend.cgcse;
 import dmd.backend.code;
-import dmd.backend.arm.cod1 : loadFromEA, storeToEA;
+import dmd.backend.arm.cod1 : getlvalue, loadFromEA, storeToEA;
 import dmd.backend.arm.disasmarm : encodeHFD;
 import dmd.backend.x86.cgcod : disassemble;
 import dmd.backend.x86.code_x86;
@@ -1236,7 +1236,7 @@ void cod3_thunk(Symbol* sthunk,Symbol* sfunc,uint p,tym_t thisty,
             cdb.append(c1);
         }
     }
-    cdb.gencs1(INSTR.bl(0),0,FL.func,sfunc); // BL sfunc // http://www.scs.stanford.edu/~zyedidia/arm64/bl.html
+    cdb.gencs1(INSTR.b_uncond(0),0,FL.func,sfunc); // B sfunc, a tail jump so sfunc returns to the thunk's caller
     cdb.last().Iflags |= (CF.selfrel26 | CF.off);
 
     thunkoffset = Offset(seg);

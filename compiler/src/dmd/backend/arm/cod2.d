@@ -2215,6 +2215,8 @@ static if (0)
             goto L4;
 
         case FL.extern_:
+            if (config.exe & EX_OSX64 && (e.Vsym.ty() & mTYthread))
+                goto case FL.tlsdata;           // TLV descriptor, same as for a local thread variable
             if (config.exe & EX_posix && (e.Vsym.ty() & mTYthread))
             {
                 if (log) printf("posix extern threaded\n");
@@ -2264,7 +2266,15 @@ static if (0)
                 uint ins = INSTR.adr(1,0,reg);                // ADRP reg,0<foo>
                 cdb.gencs1(ins,0,fl,e.Vsym);
 
-                ins = INSTR.addsub_imm(1,0,0,0,0,reg,reg); // ADD reg,reg,#0
+                import dmd.backend.machobj : MachObj_isGOTRef;
+                // A function may be defined in another object, so reference it through the GOT;
+                // the linker relaxes this when it turns out to be local
+                const Symbol* sv = e.Vsym;
+                const isFunc = tyfunc(sv.ty()) && (sv.Sclass == SC.global || sv.Sclass == SC.extern_ || sv.Sclass == SC.comdat);
+                if (config.objfmt == OBJ_MACH && (MachObj_isGOTRef(sv) || isFunc))
+                    ins = INSTR.ldr_imm_gen(1,reg,reg,0);      // LDR reg,[reg,#0<foo>@GOTPAGEOFF]
+                else
+                    ins = INSTR.addsub_imm(1,0,0,0,0,reg,reg); // ADD reg,reg,#0
                 cdb.gencs1(ins,0,fl,e.Vsym);
                 cdb.last.Iflags |= CF.add;
 
