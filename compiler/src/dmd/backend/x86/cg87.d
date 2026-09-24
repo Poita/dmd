@@ -3704,7 +3704,7 @@ void fixresult_complex87(ref CGstate cg,ref CodeBuilder cdb,elem* e,regm_t retre
         cdb.genfltreg(ESC(MFfloat,1),BX,0);     // FSTP floatreg+4
         genfwait(cdb);
         const reg = findreg(outretregs);
-        getregs(cdb,reg);
+        getregs(cdb,mask(reg));
         cdb.genfltreg(LOD, reg, 0);             // MOV ECX,floatreg
         code_orrex(cdb.last(), REX_W);          // extend to RCX
     }
