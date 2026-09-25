@@ -100,4 +100,15 @@ ifeq (,$(MODEL))
   endif
 endif
 
+# A 64 bit build on an arm64 host targets AArch64, also when MODEL is set explicitly
+ifeq (,$(ARCH))
+  ifeq (64,$(MODEL))
+    ifneq (windows,$(OS))
+      ifneq (,$(findstring $(shell uname -m),aarch64 arm64))
+        ARCH:=aarch64
+      endif
+    endif
+  endif
+endif
+
 MODEL_FLAG:=-m$(MODEL)
