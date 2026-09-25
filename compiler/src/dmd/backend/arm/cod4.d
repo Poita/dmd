@@ -244,7 +244,7 @@ void cdeq(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         if (cs.reg != NOREG)
             cs.reg = e1.Vsym.Sregmsw;   // register pair variable
         else
-            getlvalue_msw(cs);      // the MSW follows the LSW, at any offset
+            getlvalue_msw(cs, sz / 2);  // the MSW follows the LSW, at any offset
         storeToEA(cs, mswreg, sz / 2);
         cdb.gen(&cs);
     }
