@@ -102,15 +102,15 @@ version (AArch64)
         if (CanCAS!T)
     {
         static if (T.sizeof == 16)
-            _d_aarch64_store16(dest, &value);
+            _d_aarch64_store16(cast(void*) dest, &value);
         else
-            mixin("_d_aarch64_store" ~ T.sizeof.stringof[0 .. $ - 2])(dest, bitsOf(value));
+            mixin("_d_aarch64_store" ~ T.sizeof.stringof[0 .. $ - 2])(cast(void*) dest, bitsOf(value));
     }
 
     T atomicFetchAdd(MemoryOrder order = MemoryOrder.seq, bool result = true, T)(T* dest, T value) pure nothrow @nogc @trusted
         if (is(T : ulong))
     {
-        const old = mixin("_d_aarch64_fetchadd" ~ T.sizeof.stringof[0 .. $ - 2])(dest, bitsOf(value));
+        const old = mixin("_d_aarch64_fetchadd" ~ T.sizeof.stringof[0 .. $ - 2])(cast(void*) dest, bitsOf(value));
         return fromBits!(T)(old);
     }
 
@@ -131,7 +131,7 @@ version (AArch64)
         }
         else
         {
-            const old = mixin("_d_aarch64_exchange" ~ T.sizeof.stringof[0 .. $ - 2])(dest, bitsOf(value));
+            const old = mixin("_d_aarch64_exchange" ~ T.sizeof.stringof[0 .. $ - 2])(cast(void*) dest, bitsOf(value));
             return fromBits!(T)(old);
         }
     }
@@ -144,12 +144,12 @@ version (AArch64)
         static if (T.sizeof == 16)
         {
             const ulong[2] desired = *cast(ulong[2]*) &value;
-            return _d_aarch64_cas16(dest, compare, desired[0], desired[1]);
+            return _d_aarch64_cas16(cast(void*) dest, compare, desired[0], desired[1]);
         }
         else
         {
             const expected = bitsOf(*compare);
-            const old = mixin("_d_aarch64_cas" ~ T.sizeof.stringof[0 .. $ - 2])(dest, expected, bitsOf(value));
+            const old = mixin("_d_aarch64_cas" ~ T.sizeof.stringof[0 .. $ - 2])(cast(void*) dest, expected, bitsOf(value));
             if (old == expected)
                 return true;
             *compare = fromBits!(T)(old);
