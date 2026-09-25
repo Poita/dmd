@@ -73,6 +73,7 @@ struct MachObj
     Barray!(Symbol*)  localSymbols;
     Barray!(Symbol*) publicSymbols;
     Barray!(Symbol*) externSymbols;
+    Barray!(Symbol*) forwardedSymbols;  // externSymbols forwarded to a publicSymbol
 
     Barray!(Comdef) comdefs;
 
@@ -378,6 +379,7 @@ Obj MachObj_init(OutBuffer* objbuf, const(char)* filename, const(char)* csegname
     resetSymbols(machobj.externSymbols[]);
     machobj.externSymbols.setLength(SYM_TAB_INIT);       // reserve some space
     machobj.externSymbols.reset();
+    machobj.forwardedSymbols.reset();
 
     machobj.comdefs.setLength(SYM_TAB_INIT);       // reserve some space
     machobj.comdefs.reset();
@@ -561,6 +563,7 @@ int mach_numbersyms()
         {
             assert(sfwd.Sclass != SC.extern_);
             s.Sforward = sfwd;
+            machobj.forwardedSymbols.push(s);
             machobj.externSymbols.remove(i);    // remove s
             //printf("extern %p %s forwarded to %p %s %d\n", s, s.Sident.ptr, sfwd, sfwd.Sident.ptr, sfwd.Sxtrnnum);
             continue;
@@ -1865,8 +1868,16 @@ assert(rel.r_symbolnum);
      * object file's symbol table.
      */
     if (machobj.AArch64)
-    foreach (s; machobj.externSymbols[])
-        s.Sxtrnnum = 0;
+    {
+        foreach (s; machobj.externSymbols[])
+            s.Sxtrnnum = 0;
+        // the public symbol may be in a different object file next time
+        foreach (s; machobj.forwardedSymbols[])
+        {
+            s.Sforward = null;
+            s.Sxtrnnum = 0;
+        }
+    }
 }
 
 /*****************************
