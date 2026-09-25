@@ -439,6 +439,35 @@ void gentstreg(ref CodeBuilder cdb, reg_t reg, uint sf)
 // genshift
 
 /**************************
+ * Generate Rd = Rn + value for any 64 bit value.
+ * Uses R16 as a scratch register if value needs more than 24 bits.
+ */
+@trusted
+void genaddimm(ref CodeBuilder cdb, reg_t Rd, reg_t Rn, long value)
+{
+    const op = value < 0 ? 1 : 0;       // SUB for negative values
+    const ulong v = value < 0 ? -value : value;
+    if (v < 0x1000)
+    {
+        if (v || Rd != Rn)
+            cdb.gen1(INSTR.addsub_imm(1,op,0,0,cast(uint)v,Rn,Rd));      // ADD/SUB Rd,Rn,#v
+    }
+    else if (v < 0x100_0000)
+    {
+        cdb.gen1(INSTR.addsub_imm(1,op,0,1,cast(uint)(v >> 12),Rn,Rd));  // ADD/SUB Rd,Rn,#v>>12,LSL #12
+        if (v & 0xFFF)
+            cdb.gen1(INSTR.addsub_imm(1,op,0,0,cast(uint)(v & 0xFFF),Rd,Rd)); // ADD/SUB Rd,Rd,#v&0xFFF
+    }
+    else
+    {
+        enum reg_t R16 = 16;            // scratch register, not allocated
+        assert(Rn != INSTR.SP && Rd != INSTR.SP);
+        movregconstant(cdb,R16,value,1);                                  // MOV R16,#value
+        cdb.gen1(INSTR.addsub_shift(1,0,0,0,R16,0,Rn,Rd));                // ADD Rd,Rn,R16
+    }
+}
+
+/**************************
  * Generate a conditional branch (immediate) instruction.
  * https://www.scs.stanford.edu/~zyedidia/arm64/encodingindex.html#condbranch
  */
