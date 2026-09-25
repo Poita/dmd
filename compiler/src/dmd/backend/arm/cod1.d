@@ -2160,6 +2160,25 @@ void cdfunc(ref CGstate cg, ref CodeBuilder cdb, elem* e, ref regm_t pretregs)
     const numExplicitParams = osx_aapcs64 ? e.numParams : 0; // nonzero value means called function is variadic
 //printf("numExplicitParams: %d\n", numExplicitParams);
 
+    /* An aggregate argument the optimizer replaced with a plain value (a constant,
+     * a copy) gets its type back from the prototype, as that decides how it is passed.
+     * The declared parameters come first among the arguments.
+     */
+    if (e.E1.Eoper == OPvar && tyfunc(e.E1.Vsym.Stype.Tty) &&
+        e.E1.Vsym.Stype.Tparamtypes && !variadic(e.E1.Vsym.Stype))
+    {
+        foreach (i, ref pt; (*e.E1.Vsym.Stype.Tparamtypes)[])
+        {
+            if (i >= np)
+                break;
+            elem* ep = parameters[i].e;
+            type* t = pt.Ptype;
+            if (!ep.ET && t && tyaggregate(t.Tty) && !tyaggregate(ep.Ety) &&
+                _tysize[tybasic(ep.Ety)] >= type_size(t))
+                ep.ET = t;
+        }
+    }
+
     /* Determine properties of arguments, from left to right
      */
     {
