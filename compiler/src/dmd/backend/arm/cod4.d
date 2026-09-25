@@ -59,6 +59,7 @@ nothrow:
 @trusted
 void cdeq(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
 {
+
     //printf("cdeq(e = %p, pretregs = %s)\n",e,regm_str(pretregs));
     //elem_print(e);
 
@@ -240,7 +241,10 @@ void cdeq(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         reg_t mswreg = findreg(retregs & INSTR.MSW);
         assert(cs.index == NOREG);  // BUG AArch64 cannot add the '8' offset
         //assert(cs.base != NOREG);
-        getlvalue_msw(cs);          // the MSW follows the LSW, at any offset
+        if (cs.reg != NOREG)
+            cs.reg = e1.Vsym.Sregmsw;   // register pair variable
+        else
+            getlvalue_msw(cs);      // the MSW follows the LSW, at any offset
         storeToEA(cs, mswreg, sz / 2);
         cdb.gen(&cs);
     }
@@ -284,6 +288,7 @@ Lp:
 @trusted
 void cdaddass(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
 {
+
     //printf("cdaddass(e=%p, pretregs = %s)\n",e,regm_str(pretregs));
     //elem_print(e);
     OPER op = e.Eoper;
