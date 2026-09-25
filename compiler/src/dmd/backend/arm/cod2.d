@@ -670,7 +670,17 @@ void cdnot(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         sz = tysize(e.Ety);
         uint sf = sz == 8;
 
-        cdb.gen1(INSTR.cmp_imm(tysize(e.E1.Ety) == 8,0,0,R1));  // CMP R1,#0
+        if (tysize(e.E1.Ety) > REGSIZE)
+        {
+            // a register pair is zero only when both halves are
+            enum reg_t R17 = 17;
+            const reg_t lsw = findreg(retregs1 & INSTR.LSW);
+            const reg_t msw = findreg(retregs1 & INSTR.MSW);
+            cdb.gen1(INSTR.orr_shifted_register(1,0,msw,0,lsw,R17));   // ORR X17,lsw,msw
+            cdb.gen1(INSTR.cmp_imm(1,0,0,R17));                         // CMP X17,#0
+        }
+        else
+            cdb.gen1(INSTR.cmp_imm(tysize(e.E1.Ety) == 8,0,0,R1));  // CMP R1,#0
         COND cond = op == OPnot ? COND.ne : COND.eq;
         cdb.gen1(INSTR.cset(sf,cond,Rd));    // CSET Rd,EQ
 
