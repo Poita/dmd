@@ -6159,9 +6159,10 @@ elem* callfunc(Loc loc,
 
         if (tf.parameterList.varargs != VarArg.none)
         {
-            if (I64 && config.exe != EX_WIN64)
+            if (I64 && config.exe != EX_WIN64 && !target.isAArch64)
                 e.Eflags |= EFLAGS_variadic;
-            if (config.exe == EX_OSX64 && target.isAArch64)
+            // Only C style variadic arguments go on the stack; typesafe ones are a slice
+            if (config.exe == EX_OSX64 && target.isAArch64 && tf.parameterList.varargs != VarArg.typesafe)
             {
                 const length = tf.parameterList.length;
                 assert(length < ubyte.max); // 254 should be enough for anybody
