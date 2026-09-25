@@ -3597,10 +3597,31 @@ elem* elstruct(elem* e, Goal goal)
 
     if (ty == TYarray && sz && config.exe != EX_WIN64)
     {
-        argtypes(t, targ1, targ2);
-        if (!targ1)
-            goto Ldefault;
-        goto L1;
+        if (cgstate.AArch64)
+        {
+            /* The x86-64 classification does not apply; only a one element
+             * floating point array is a wrapper for its element type
+             */
+            import dmd.backend.arm.cod1 : aarch64Aggregate, AggregateABI;
+            const a = aarch64Aggregate(t);
+            if (a.kind == AggregateABI.Kind.byRef)
+                goto Ldefault;
+            if (a.kind == AggregateABI.Kind.hfa && a.nregs == 1)
+            {
+                targ1 = t;
+                while (tybasic(targ1.Tty) == TYarray)
+                    targ1 = targ1.Tnext;
+                if (tybasic(targ1.Tty) == TYstruct)
+                    targ1 = targ1.Ttag.Sstruct.Sarg1type;
+            }
+        }
+        else
+        {
+            argtypes(t, targ1, targ2);
+            if (!targ1)
+                goto Ldefault;
+            goto L1;
+        }
     }
     //if (targ1) { printf("targ1\n"); type_print(targ1); }
     //if (targ2) { printf("targ2\n"); type_print(targ2); }

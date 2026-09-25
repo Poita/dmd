@@ -1325,7 +1325,7 @@ static if (NTEXCEPTIONS)
             //printf("reg1: %d, reg2: %d\n", reg1, reg2);
             //printf("allocretregs e.Ety: %s returns %llx %s, reg1: %d reg2: %d\n", tym_str(e.Ety), retregs, regm_str(retregs), reg1, reg2);
 
-            if (AArch64 && tybasic(e.Ety) == TYstruct && retregs)
+            if (AArch64 && tyaggregate(e.Ety) && retregs)
             {
                 // AAPCS64 aggregate returned in several registers
                 import dmd.backend.arm.cod1 : aarch64Aggregate, aggregateAddress, loadAggregateRegs, AggregateABI;
@@ -1413,7 +1413,7 @@ static if (NTEXCEPTIONS)
                 if (reg1 != NOREG)
                     retregs = (mask(reg1) | mask(reg2)) & ~mask(NOREG);
                 import dmd.backend.arm.cod1 : holdsAggregate;
-                if (holdsAggregate(e.Ety, e.ET) && tybasic(e.Ety) != TYstruct)
+                if (holdsAggregate(e.Ety, e.ET) && !tyaggregate(e.Ety))
                 {
                     // a small HFA is returned in V registers, not in the X registers holding its value
                     import dmd.backend.arm.cod1 : aarch64Aggregate, gprToHfa, AggregateABI;
@@ -1702,7 +1702,7 @@ regm_t allocretregs(ref CGstate cg, const tym_t ty, type* t, const tym_t tyf, ou
         ty2 = TYdouble;
     }
 
-    if (tyb == TYstruct)
+    if (tyb == TYstruct || AArch64 && tyb == TYarray)
     {
         assert(t);
         ty1 = t.Tty;
@@ -4663,7 +4663,7 @@ void prolog_loadparams(ref CGstate cg, ref CodeBuilder cdb, tym_t tyf, bool push
 //        uint sz = cast(uint)type_size(s.Stype);
         reg_t preg = s.Spreg;
         //printf("Spreg: %d Spreg2: %d\n", preg, s.Spreg2);
-        if (AArch64 && tyb == TYstruct)
+        if (AArch64 && tyaggregate(tyb))
         {
             import dmd.backend.arm.cod1 : aarch64Aggregate, storeAggregateRegs, copyBytes, AggregateABI;
             import dmd.backend.arm.cod3 : genaddimm;

@@ -1806,7 +1806,13 @@ void cdstreq(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
 
     docommas(cdb,e2);
 
-    if (e2.Eoper == OPcall && tybasic(e2.Ety) == TYstruct)
+    /* The destination is written through its address, so it has to be allocated
+     * even if it is never read
+     */
+    if (e1.Eoper == OPvar)
+        e1.Vsym.Sflags |= SFLread;
+
+    if (e2.Eoper == OPcall && tyaggregate(e2.Ety))
     {
         import dmd.backend.arm.cod1 : aarch64Aggregate, aggregateRetRegs, storeAggregateRegs, AggregateABI;
         const a = aarch64Aggregate(e2.ET);
