@@ -40,7 +40,7 @@ import dmd.backend.ty;
 import dmd.backend.type;
 import dmd.backend.x86.xmm;
 import dmd.backend.arm.cod1 : loadFromEA, storeToEA, getlvalue, CLIB_A, callclib;
-import dmd.backend.arm.cod3 : conditionCode, genBranch, genCompBranch, gentstreg, movregconst,
+import dmd.backend.arm.cod3 : conditionCode, genaddimm, genBranch, genCompBranch, gentstreg, movregconst,
                         movregconstant, COND, loadFloatRegConst;
 import dmd.backend.arm.instr;
 
@@ -93,8 +93,8 @@ void cdorth(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
     }
 
     const ty = tybasic(e.Ety);
-    const ty1 = tybasic(e1.Ety);
-    const ty2 = tybasic(e2.Ety);
+    tym_t ty1 = tybasic(e1.Ety);
+    tym_t ty2 = tybasic(e2.Ety);
     const sz = _tysize[ty];
 
     regm_t posregs = tyfloating(ty1) ? INSTR.FLOATREGS : cg.allregs;
@@ -211,8 +211,34 @@ void cdorth(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
             uint op = e.Eoper == OPadd ? 0 : 1;
             uint S = PSW != 0;
             uint opt = 0;
-            uint option = tyToExtend(ty);
             uint imm3 = 0;
+            /* Only the second operand is extended, by its own type,
+             * so a narrower first operand has to be dealt with
+             */
+            if (_tysize[ty1] < sz && !tyfloating(ty1))
+            {
+                if (op == 0 && _tysize[ty2] == sz)
+                {
+                    const r = Rn; Rn = Rm; Rm = r;      // addition is commutative
+                    const t = cast(tym_t)ty1; ty1 = ty2; ty2 = t;
+                }
+                else
+                {
+                    // Widen Rn in place
+                    getregs(cdb, mask(Rn));
+                    const sz1 = _tysize[ty1];
+                    if (tyuns(ty1))
+                        cdb.gen1(INSTR.ubfm(1, 1, 0, sz1 * 8 - 1, Rn, Rn));  // UXTB/UXTH/UXTW Rn
+                    else if (sz1 == 1)
+                        cdb.gen1(INSTR.sxtb_sbfm(1, Rn, Rn));                 // SXTB Rn
+                    else if (sz1 == 2)
+                        cdb.gen1(INSTR.sxth_sbfm(1, Rn, Rn));                 // SXTH Rn
+                    else
+                        cdb.gen1(INSTR.sxtw_sbfm(Rn, Rn));                    // SXTW Rn
+                    ty1 = ty;
+                }
+            }
+            uint option = _tysize[ty2] < sz ? tyToExtend(ty2) : tyToExtend(ty);
             cdb.gen1(INSTR.addsub_ext(sf, op, S, opt, Rm, option, imm3, Rn, Rd));
             PSW = 0;
             pretregs &= ~mPSW;
@@ -2280,7 +2306,7 @@ static if (0)
                 cdb.last.Iflags |= CF.add;
 
                 if (e.Voffset)
-                    cdb.gen1(INSTR.addsub_imm(1,0,0,0,cast(uint)e.Voffset,reg,reg)); // ADD reg,reg,#Voffset
+                    genaddimm(cdb,reg,reg,e.Voffset);          // ADD reg,reg,#Voffset
             }
             break;
 
