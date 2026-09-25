@@ -44,7 +44,7 @@ import dmd.backend.symbol;
 import dmd.backend.ty;
 import dmd.backend.evalu8 : el_toreald;
 import dmd.backend.x86.xmm;
-import dmd.backend.arm.cod1 : getlvalue, loadFromEA, storeToEA,CLIB_A,callclib;
+import dmd.backend.arm.cod1 : getlvalue, getlvalue_msw, loadFromEA, storeToEA,CLIB_A,callclib;
 import dmd.backend.arm.cod2 : idxregm, tyToExtend;
 import dmd.backend.arm.cod3 : COND, conditionCode, gentstreg, loadFloatRegConst, genBranch;
 import dmd.backend.arm.instr;
@@ -239,7 +239,7 @@ void cdeq(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         reg_t mswreg = findreg(retregs & INSTR.MSW);
         assert(cs.index == NOREG);  // BUG AArch64 cannot add the '8' offset
         //assert(cs.base != NOREG);
-        cs.IEV1.Voffset = sz / 2;
+        getlvalue_msw(cs);          // the MSW follows the LSW, at any offset
         storeToEA(cs, mswreg, sz / 2);
         cdb.gen(&cs);
     }
