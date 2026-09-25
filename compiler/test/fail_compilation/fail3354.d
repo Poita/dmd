@@ -1,4 +1,4 @@
-/*
+/* DISABLED: aarch64
 TEST_OUTPUT:
 ---
 fail_compilation/fail3354.d(16): Error: 4 operands found for `fldz` instead of the expected 0

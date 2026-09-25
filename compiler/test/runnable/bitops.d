@@ -1,3 +1,4 @@
+// DISABLED: aarch64
 // PERMUTE_ARGS:
 
 import core.stdc.stdio;

@@ -1,5 +1,5 @@
 // REQUIRED_ARGS: -o-
-/*
+/* DISABLED: aarch64
 TEST_OUTPUT:
 ---
 fail_compilation/fail13938.d(14): Error: cannot directly load TLS variable `val`

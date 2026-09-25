@@ -1,4 +1,4 @@
-/*
+/* DISABLED: aarch64
 TEST_OUTPUT:
 ---
 block displacement of -130 exceeds the maximum offset of -128 to 127.

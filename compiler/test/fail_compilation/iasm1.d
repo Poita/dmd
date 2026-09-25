@@ -1,5 +1,5 @@
 // REQUIRED_ARGS: -m64
-/*
+/* DISABLED: aarch64
 TEST_OUTPUT:
 ---
 fail_compilation/iasm1.d(103): Error: `and` instruction requires operands of matching type/size

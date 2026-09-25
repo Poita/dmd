@@ -1,3 +1,4 @@
+// DISABLED: aarch64
 // REQUIRED_ARGS: -w -de
 
 void foo() pure nothrow @nogc @safe

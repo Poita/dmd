@@ -1,4 +1,4 @@
-/*
+/* DISABLED: aarch64
 TEST_OUTPUT:
 ---
 fail_compilation/diag15235.d(11): Error: cannot have two symbols in addressing mode

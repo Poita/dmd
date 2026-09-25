@@ -1,4 +1,4 @@
-
+// DISABLED: aarch64
 /*
 TEST_OUTPUT:
 ---

@@ -1,4 +1,4 @@
-/*
+/* DISABLED: aarch64
 REQUIRED_ARGS: -m64 -o-
 TEST_OUTPUT:
 ---

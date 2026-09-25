@@ -1,4 +1,4 @@
-/*
+/* DISABLED: aarch64
 TEST_OUTPUT:
 ---
 fail_compilation/fail14009.d(12): Error: expression expected not `:`

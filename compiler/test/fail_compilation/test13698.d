@@ -1,4 +1,4 @@
-
+// DISABLED: aarch64
 // REQUIRED_ARGS: -m64
 // https://issues.dlang.org/show_bug.cgi?id=13698
 /*

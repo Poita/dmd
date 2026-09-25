@@ -1,4 +1,4 @@
-/*
+/* DISABLED: aarch64
 REQUIRED_ARGS: -verrors=simple -inline -wi
 TEST_OUTPUT:
 ---

@@ -134,6 +134,7 @@ struct EnvData
     string ccompiler;            /// `CC`: host C compiler
     string cxxcompiler;          /// `CXX`: host C++ compiler
     string model;                /// `MODEL`: target model (`32` or `64`)
+    string arch;                 /// `ARCH`: target architecture (`x86_64`, `aarch64`, ...)
     string required_args;        /// `REQUIRED_ARGS`: flags added to the tests `REQUIRED_ARGS` parameter
     string cxxCompatFlags;       /// Additional flags passed to $(compiler) when `EXTRA_CPP_SOURCES` is present
     string[] picFlag;            /// Compiler flag for PIC (if requested from environment)
@@ -175,6 +176,7 @@ immutable(EnvData) processEnvironment()
     envData.ccompiler      = environment.get("CC");
     envData.cxxcompiler    = environment.get("CXX");
     envData.model          = envGetRequired("MODEL");
+    envData.arch           = environment.get("ARCH", hostArch);
     envData.required_args  = environment.get("REQUIRED_ARGS");
     envData.dobjc          = environment.get("D_OBJC") == "1";
     envData.coverage_build = environment.get("DMD_TEST_COVERAGE") == "1";
@@ -603,16 +605,29 @@ void replaceResultsDir(ref string arguments, const ref EnvData envData)
     arguments = replace(arguments, "${RESULTS_DIR}", envData.results_dir);
 }
 
+/// Architecture of the machine running the tests, the default target
+version (AArch64)
+    enum hostArch = "aarch64";
+else version (X86_64)
+    enum hostArch = "x86_64";
+else version (X86)
+    enum hostArch = "x86";
+else
+    enum hostArch = "";
+
 /// Returns: the reason why this test is disabled or null if it isn't skipped.
 string getDisabledReason(string[] disabledPlatforms, const ref EnvData envData)
 {
     if (disabledPlatforms.length == 0)
         return null;
 
-    const target = ((envData.os == "windows") ? "win" : envData.os) ~ envData.model;
+    const os = (envData.os == "windows") ? "win" : envData.os;
+    const target = os ~ envData.model;
+    // e.g. `osx_aarch64`, so `aarch64` disables a test on every AArch64 target
+    const archTarget = envData.arch.length ? os ~ "_" ~ envData.arch : null;
 
     // allow partial matching, e.g. `win` to disable both win32 and win64
-    const i = disabledPlatforms.countUntil!(p => target.canFind(p));
+    const i = disabledPlatforms.countUntil!(p => target.canFind(p) || archTarget.canFind(p));
     if (i != -1)
         return "on " ~ disabledPlatforms[i];
 
@@ -634,6 +649,18 @@ unittest
 
     assert(getDisabledReason([ "win32" ], win32) == "on win32");
     assert(getDisabledReason([ "win32" ], win64) is null);
+}
+
+unittest
+{
+    immutable EnvData osxArm = { os: "osx", model: "64", arch: "aarch64" };
+    immutable EnvData osxX86 = { os: "osx", model: "64", arch: "x86_64" };
+
+    assert(getDisabledReason([ "aarch64" ], osxArm) == "on aarch64");
+    assert(getDisabledReason([ "aarch64" ], osxX86) is null);
+    assert(getDisabledReason([ "linux_aarch64" ], osxArm) is null);
+    assert(getDisabledReason([ "osx_aarch64" ], osxArm) == "on osx_aarch64");
+    assert(getDisabledReason([ "osx64" ], osxArm) == "on osx64");
 }
 /**
  * Reads the test configuration from the source code (using `findTestParameter` and
@@ -740,7 +767,7 @@ bool gatherTestParameters(ref TestArgs testArgs, string input_dir, string input_
 
     findTestParameter(envData, file, "CXXFLAGS", testArgs.cxxflags);
     version (OSX) {
-        if (envData.compiler == "dmd")
+        if (envData.compiler == "dmd" && envData.arch == "x86_64")
             testArgs.cxxflags ~= " -arch x86_64";
     }
 

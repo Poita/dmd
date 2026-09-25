@@ -63,7 +63,7 @@ import dmd.backend.iasm;
  */
 public Statement inlineAsmAArch64Semantic(InlineAsmStatement s, Scope* sc)
 {
-    static if (1)
+    static if (0)
     {
         printf("InlineAsmAArch64Statement.semantic()\n");
         for (auto token = s.tokens; token; token = token.next)
@@ -80,7 +80,7 @@ public Statement inlineAsmAArch64Semantic(InlineAsmStatement s, Scope* sc)
     p.setTokenList(s.tokens, s.loc.linnum);
 
     int errors;
-    static if (1)
+    static if (0)
     {
         if (p.token.value == TOK.identifier)
         {

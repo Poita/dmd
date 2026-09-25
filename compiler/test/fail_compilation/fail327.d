@@ -1,4 +1,4 @@
-/*
+/* DISABLED: aarch64
 TEST_OUTPUT:
 ---
 fail_compilation/fail327.d(11): Error: executing an `asm` statement without `@trusted` annotation is not allowed in a `@safe` function

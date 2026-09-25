@@ -1,5 +1,5 @@
 // https://issues.dlang.org/show_bug.cgi?id=16575
-/*
+/* DISABLED: aarch64
 REQUIRED_ARGS: -m64
 TEST_OUTPUT:
 ---

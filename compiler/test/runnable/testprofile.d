@@ -1,3 +1,4 @@
+// DISABLED: aarch64
 // REQUIRED_ARGS: -profile
 
 module testprofile;

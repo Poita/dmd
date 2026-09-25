@@ -48,7 +48,7 @@ int main() {
 }
 EOF
 
-if [[ $OS == *"osx"* ]]; then
+if [[ $OS == *"osx"* && $(uname -m) == x86_64 ]]; then
     ${CC} -m${MODEL} -arch x86_64 -c -o ${C_FILE}${OBJ} $C_FILE
 else
     ${CC} -m${MODEL} -c -o ${C_FILE}${OBJ} $C_FILE
