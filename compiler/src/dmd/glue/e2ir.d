@@ -6640,7 +6640,7 @@ Lagain:
                 }
             }
 
-            if ((target.isX86_64 || target.isAArch64) && tybasic(evalue.Ety) == TYstruct && r != RTLSYM.MEMSETN)
+            if (target.isX86_64 && tybasic(evalue.Ety) == TYstruct && r != RTLSYM.MEMSETN)
             {
                 /* If this struct is in-memory only, i.e. cannot necessarily be passed as
                  * a gp register parameter.
