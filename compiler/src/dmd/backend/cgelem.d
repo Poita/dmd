@@ -4031,7 +4031,9 @@ static if (0)  // Doesn't work too well, removed
            /* Turned off for XMM registers because they don't play well with
             * int registers.
             */
-           !config.fpxmmregs)
+           !config.fpxmmregs &&
+           // AArch64 negates floats in place with FNEG
+           config.target_cpu != TARGET_AArch64)
         {
             tym_t ty;
             switch (tysize(e2.Ety))
