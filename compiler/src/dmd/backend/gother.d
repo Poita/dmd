@@ -394,8 +394,10 @@ private void constantPropagation(block* thisblock, ref EqRelInc eqrelinc, ref ui
             if (e)
             {
                 tym_t nty = n.Ety;
+                type* nt = n.ET;
                 el_copy(n,e);
                 n.Ety = nty;                       // retain original type
+                n.ET = nt;
             }
             rdl.dtor();
         }
