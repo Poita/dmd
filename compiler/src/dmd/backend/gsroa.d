@@ -143,7 +143,8 @@ private void sliceStructs_Gather(ref const symtab_t symtab, SymInfo[] sia, const
                                 sia[si].canSlice = false;
                                 return;
                             }
-                            if (config.fpxmmregs && tyxmmreg(e.Ety))
+                            if (config.fpxmmregs && tyxmmreg(e.Ety) ||
+                                config.target_cpu == TARGET_AArch64 && tyfloating(e.Ety))
                             {
                                 /* Too many issues with mixing XMM with non-XMM
                                  * One problem is an OPpair with one operand a long, the other XMM.
