@@ -588,7 +588,7 @@ void cdnot(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         sz = tysize(e.Ety);
         uint sf = sz == 8;
 
-        cdb.gen1(INSTR.cmp_imm(sf,0,0,R1));  // CMP R1,#0
+        cdb.gen1(INSTR.cmp_imm(tysize(e.E1.Ety) == 8,0,0,R1));  // CMP R1,#0
         COND cond = op == OPnot ? COND.ne : COND.eq;
         cdb.gen1(INSTR.cset(sf,cond,Rd));    // CSET Rd,EQ
 
