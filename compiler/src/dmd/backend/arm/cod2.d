@@ -2585,7 +2585,7 @@ void cdabs(ref CGstate cg, ref CodeBuilder cdb,elem* e, ref regm_t pretregs)
     op = 1;
     S = 0;
     uint Rm = Rn;
-    uint cond = 0xA ^ 1; // LT
+    uint cond = 0xA;     // GE, as CNEG Rd,Rn,lt is CSNEG Rd,Rn,Rn,ge
     uint o2 = 1;
     ins = (sf     << 31) |
           (op     << 30) |
