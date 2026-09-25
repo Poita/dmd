@@ -4729,7 +4729,14 @@ void prolog_loadparams(ref CGstate cg, ref CodeBuilder cdb, tym_t tyf, bool push
                             uint size, opc;
                             INSTR.szToSizeOpcStr(sz, size, opc);
                             imm /= sz;
-                            cdb.gen1(INSTR.str_imm_fpsimd(size,opc,imm,29,preg)); // https://www.scs.stanford.edu/~zyedidia/arm64/str_imm_fpsimd.html
+                            if (imm < 0x1000)
+                                cdb.gen1(INSTR.str_imm_fpsimd(size,opc,imm,29,preg)); // https://www.scs.stanford.edu/~zyedidia/arm64/str_imm_fpsimd.html
+                            else
+                            {
+                                import dmd.backend.arm.cod3 : genaddimm;
+                                genaddimm(cdb, 16, 29, imm * sz);                      // ADD X16,BP,#offset
+                                cdb.gen1(INSTR.str_imm_fpsimd(size,opc,0,16,preg));   // STR preg,[X16]
+                            }
                             if (tycomplex(t.Tty))
                             {
                                 /* want to add sz, not REGSIZE, for Spreg2
