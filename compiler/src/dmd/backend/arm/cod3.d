@@ -553,7 +553,12 @@ void prolog_saveregs(ref CGstate cg, ref CodeBuilder cdb, regm_t topush, int cfa
     //targ_size_t gpoffset = cg.pushoff + cg.BPoff + localsize;
     targ_size_t gpoffset = 8 + 8;   // skip over x29,x30
     reg_t fp;                       // frame pointer
-    if (!cg.hasframe || cg.enforcealign)
+    if (cg.hasframe && cg.enforcealign)
+    {
+        gpoffset = 0;       // the bottom of the locals, which are below the realigned frame record
+        fp = INSTR.SP;        // SP
+    }
+    else if (!cg.hasframe)
     {
         gpoffset += cg.EBPtoESP;
         fp = INSTR.SP;        // SP
@@ -604,7 +609,12 @@ private void epilog_restoreregs(ref CGstate cg, ref CodeBuilder cdb, regm_t topo
     targ_size_t gpoffset = 8 + 8; // skip over x29,x30
 
     reg_t fp;
-    if (!cg.hasframe || cg.enforcealign)
+    if (cg.hasframe && cg.enforcealign)
+    {
+        gpoffset = 0;       // the bottom of the locals, which are below the realigned frame record
+        fp = 31;        // SP
+    }
+    else if (!cg.hasframe)
     {
         gpoffset += cg.EBPtoESP;
         fp = 31;        // SP
@@ -1068,11 +1078,19 @@ void epilog(ref CGstate cg, block* b)
             else
             {
                 if (log) printf("epilog: mov sp,bp\n");
-                if (cg.setSPtoFPonEpilog)
+                if (cg.enforcealign)
+                {
+                    // the locals are below the frame record, whatever the alignment took
+                    genmovreg(cdbx,INSTR.SP,29);
+                    cdbx.gen1(INSTR.ldstpair_post(2, 0, 1, 16 / 8, 30, 31, 29));     // LDP x29,x30,[sp],#16
+                }
+                else if (cg.setSPtoFPonEpilog)
                 {
                     genmovreg(cdbx,INSTR.SP,29);
                 }
-                if (16 + xlocalsize < 512)     // the reach of the LDP immediate
+                if (cg.enforcealign)
+                { }
+                else if (16 + xlocalsize < 512)     // the reach of the LDP immediate
                     cdbx.gen1(INSTR.ldstpair_post(2, 0, 1, cast(uint)(16 + localsize) / 8, 30, 31, 29)); // LDP x29,x30,[sp],#16 + localsize
                 else
                 {
@@ -1804,11 +1822,19 @@ void assignaddrc(ref CGstate cg, code* c)
                         c.Iop = INSTR.add_addsub_imm(1,0,0,INSTR.BP,INSTR.SP); // MOV SP,x29
                         if (cg.enforcealign)
                         {
-                            code* cn = code_calloc();
+                            /* The locals are below the realigned frame record:
+                             *  SUB X16,x29,#xlocalsize
+                             *  AND SP,X16,#-STACKALIGN
+                             */
+                            enum reg_t R16 = 16;
+                            const uint xlocal = cast(uint)(cg.EBPtoESP - REGSIZE);
+                            assert(xlocal < 0x1000);
+                            c.Iop = INSTR.sub_addsub_imm(1,0,xlocal,INSTR.BP,R16);
 
+                            code* cn = code_calloc();
                             uint N,immr,imms;
                             if (!encodeNImmrImms(-cast(long)STACKALIGN,N,immr,imms)) assert(0);
-                            cn.Iop = INSTR.log_imm(1,0,N,immr,imms,SP,SP);      // AND SP,SP,#-STACKALIGN
+                            cn.Iop = INSTR.log_imm(1,0,N,immr,imms,R16,INSTR.SP);
 
                             cn.next = c.next;
                             c.next = cn;
@@ -1822,7 +1848,13 @@ void assignaddrc(ref CGstate cg, code* c)
                     reg_t reg = c.Irm;  // set by cod3.cdframeptr()
                     reg_t BPorSP = INSTR.BP;
                     uint imm12 = cast(uint)(REGSIZE*2 + localsize);
-                    if (!cg.hasframe || cg.enforcealign)
+                    if (cg.hasframe && cg.enforcealign)
+                    {
+                        // the top of the locals, which are below the realigned frame record
+                        BPorSP = INSTR.SP;
+                        imm12 = cast(uint)localsize;
+                    }
+                    else if (!cg.hasframe)
                     {
                         BPorSP = INSTR.SP;
                         imm12 += cg.EBPtoESP;
@@ -1979,9 +2011,22 @@ if ((ins & 0x9F00_0000) == 0x9000_0000)
             L2:
                 offset = cast(int)offset;       // sign extend
 //printf("offset: x%llx localsize: x%llxd REGSIZE*2: x%x\n", offset, localsize, REGSIZE*2);
-                if (cg.hasframe)
-                    offset += REGSIZE * 2;
-                offset += localsize;
+                if (cg.hasframe && cg.enforcealign)
+                {
+                    /* Parameters are above the frame record at x29, the locals
+                     * are below it, from the realigned SP
+                     */
+                    if (c.IFL1 == FL.para)
+                        offset += REGSIZE * 2;
+                    else
+                        offset += localsize;
+                }
+                else
+                {
+                    if (cg.hasframe)
+                        offset += REGSIZE * 2;
+                    offset += localsize;
+                }
 //printf("offset: x%llx\n", offset);
             L3:
                 /*
@@ -2006,7 +2051,7 @@ if ((ins & 0x9F00_0000) == 0x9000_0000)
 
                 reg_t Rn = cast(reg_t)field(ins,9,5);
                 reg_t Rt = cast(reg_t)field(ins,4,0);
-                if (Rn == 29 && !cg.hasframe || (cg.enforcealign && c.IFL1 != FL.para))
+                if (Rn == 29 && (!cg.hasframe || (cg.enforcealign && c.IFL1 != FL.para)))
                 {   /* Convert to SP relative address instead of BP */
                     //offset += cg.EBPtoESP;       // add difference in offset
                     Rn = 31;

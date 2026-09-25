@@ -3897,16 +3897,20 @@ void prolog_frame(ref CGstate cg, ref CodeBuilder cdb, bool farfunc, ref uint xl
         if (cg.AArch64)
         {
             if (log) printf("prolog_frame: stp\n");
-            if (16 + xlocalsize < 512)      // the reach of the LDP in the epilog
+            /* A realigned stack gets its locals below the frame record, after the
+             * alignment, from prolog_frameadj()
+             */
+            const uint frameLocals = cg.enforcealign ? 0 : xlocalsize;
+            if (16 + frameLocals < 512)      // the reach of the LDP in the epilog
                 // STP x29,x30,[sp,#-(16+localsize)]!
-                cdb.gen1(INSTR.ldstpair_pre(2, 0, 0, (-(16 + xlocalsize) / 8) & 127, 30, 31, 29));
+                cdb.gen1(INSTR.ldstpair_pre(2, 0, 0, (-(16 + frameLocals) / 8) & 127, 30, 31, 29));
             else
             {
                 /* SUB sp,sp,#16+xlocalsize
                  */
-                cod3_stackadj(cdb, 16 + xlocalsize);
+                cod3_stackadj(cdb, 16 + frameLocals);
 
-                assert((xlocalsize & 0xF) == 0); // 16 byte aligned
+                assert((frameLocals & 0xF) == 0); // 16 byte aligned
 
                 // https://www.scs.stanford.edu/~zyedidia/arm64/stp_gen.html
                 // STP x29,x30,[sp]
@@ -3959,7 +3963,7 @@ static if (NTEXCEPTIONS == 2)
         if (config.fulltypes == CVDWARF_C || config.fulltypes == CVDWARF_D ||
             config.ehmethod == EHmethod.EH_DWARF)
         {
-            dwarf_emit_eh_frame(cg.AArch64,xlocalsize,cfa_offset);
+            dwarf_emit_eh_frame(cg.AArch64,cg.AArch64 && cg.enforcealign ? 0 : xlocalsize,cfa_offset);
         }
         enter = false;              /* do not use ENTER instruction */
     }
@@ -3980,6 +3984,16 @@ void prolog_stackalign(ref CGstate cg, ref CodeBuilder cdb)
     if (!cg.enforcealign)
         return;
 
+    if (cg.AArch64)
+    {
+        // AND cannot take SP as its source register
+        enum reg_t R16 = 16;
+        uint N, immr, imms;
+        if (!encodeNImmrImms(-cast(long)STACKALIGN, N, immr, imms)) assert(0);
+        cdb.gen1(INSTR.add_addsub_imm(1, 0, 0, INSTR.SP, R16));               // MOV X16,SP
+        cdb.gen1(INSTR.log_imm(1, 0, N, immr, imms, R16, INSTR.SP));          // AND SP,X16,#-STACKALIGN
+        return;
+    }
     const offset = (cg.hasframe ? 2 : 1) * REGSIZE;   // 1 for the return address + 1 for the PUSH EBP
     if (offset & (STACKALIGN - 1) || TARGET_STACKALIGN < STACKALIGN)
         cod3_stackalign(cdb, STACKALIGN);
@@ -4042,6 +4056,8 @@ void prolog_frameadj(ref CGstate cg, ref CodeBuilder cdb, tym_t tyf, uint xlocal
     }
     else if (cg.AArch64)
     {
+        if (cg.enforcealign)
+            cod3_stackadj(cdb, xlocalsize);     // SUB SP,SP,#xlocalsize below the realigned SP
 static if (0)
 {
         if (log) printf("prolog_frameadj: sub/stp/add\n");
