@@ -4583,6 +4583,23 @@ void prolog_gen_win64_varargs(ref CodeBuilder cdb)
     return namedargs;
 }
 
+/*******************************
+ * AArch64: store general register `reg` to [Rbase + offset], through X16 when
+ * the offset does not fit the scaled 12 bit immediate.
+ */
+private void storeGpr(ref CodeBuilder cdb, reg_t reg, reg_t Rbase, uint offset, bool is64)
+{
+    const scale = is64 ? 8 : 4;
+    if (offset % scale == 0 && offset / scale < 0x1000)
+        cdb.gen1(INSTR.str_imm_gen(is64, reg, Rbase, offset));          // STR reg,[Rbase,#offset]
+    else
+    {
+        import dmd.backend.arm.cod3 : genaddimm;
+        genaddimm(cdb, 16, Rbase, offset);                              // ADD X16,Rbase,#offset
+        cdb.gen1(INSTR.str_imm_gen(is64, reg, 16, 0));                  // STR reg,[X16]
+    }
+}
+
 /************************************
  * Take the parameters passed in registers, and put them into the function's local
  * symbol table.
@@ -4760,8 +4777,7 @@ void prolog_loadparams(ref CGstate cg, ref CodeBuilder cdb, tym_t tyf, bool push
                             }
                         }
                         else
-                            // STR preg,bp,#offset
-                            cdb.gen1(INSTR.str_imm_gen(sz > 4, preg, 29, imm));
+                            storeGpr(cdb, preg, 29, imm, sz > 4);   // STR preg,[bp,#offset]
                     }
                     else
                     {
@@ -4796,7 +4812,7 @@ void prolog_loadparams(ref CGstate cg, ref CodeBuilder cdb, tym_t tyf, bool push
                             cdb.gen1(INSTR.str_imm_fpsimd(size,opc,imm,31,preg)); // https://www.scs.stanford.edu/~zyedidia/arm64/str_imm_fpsimd.html
                         }
                         else
-                            cdb.gen1(INSTR.str_imm_gen(sz > 4, preg, 31, imm));
+                            storeGpr(cdb, preg, 31, imm, sz > 4);   // STR preg,[sp,#offset]
                     }
                     else
                     {
