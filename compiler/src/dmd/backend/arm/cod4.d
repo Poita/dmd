@@ -2256,6 +2256,19 @@ void cdpopcnt(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
     fixresult(cg,cdb,e,retregs,pretregs);
 }
 
+/*****************************************
+ * Generate code for OPc_r and OPc_i, the real and imaginary parts of a complex
+ * value, which is in a register pair with the real part in the LSW.
+ */
+@trusted
+void cdconvt(ref CGstate cg, ref CodeBuilder cdb, elem* e, ref regm_t pretregs)
+{
+    regm_t retregs = INSTR.FLOATREGS;
+    codelem(cg,cdb,e.E1,retregs,false);
+    const reg = findreg(retregs & (e.Eoper == OPc_r ? INSTR.LSW : INSTR.MSW));
+    fixresult(cg,cdb,e,mask(reg),pretregs);
+}
+
 /*******************************************
  * Generate code for OPpair, OPrpair.
  */
