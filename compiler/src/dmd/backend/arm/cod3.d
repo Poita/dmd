@@ -1759,7 +1759,8 @@ void assignaddrc(ref CGstate cg, code* c)
                     //printf("fix ESP\n");
                     if (cg.hasframe)
                     {
-                        c.Iop = INSTR.sub_addsub_imm(1,0,cg.EBPtoESP,INSTR.SP,BP); // SUB SP,BP,#EBPtoESP
+                        // locals are above the frame pointer, which is SP when nothing is pushed
+                        c.Iop = INSTR.add_addsub_imm(1,0,0,INSTR.BP,INSTR.SP); // MOV SP,x29
                         if (cg.enforcealign)
                         {
                             code* cn = code_calloc();
