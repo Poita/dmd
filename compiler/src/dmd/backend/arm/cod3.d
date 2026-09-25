@@ -2071,15 +2071,24 @@ if ((ins & 0x9F00_0000) == 0x9000_0000)
                             // ldr Rt,[R16,#offset & 0xFFF] // https://www.scs.stanford.edu/~zyedidia/arm64/ldr_imm_gen.html
                             ins = setField(ins,9,5,R16);
                             const uint lo = cast(uint)(offset & 0xFFF);
-                            if (lo & ((1 << shift) - 1))
+                            if (!(lo & ((1 << shift) - 1)))
+                                ins = setField(ins,21,10,lo >> shift);
+                            else if (lo < 0x100)
                             {
                                 // misaligned, so use the unscaled 9 bit offset
-                                assert(lo < 0x100);
                                 ins = setField(ins,25,24,0);
                                 ins = setField(ins,21,10,lo << 2);
                             }
                             else
-                                ins = setField(ins,21,10,lo >> shift);
+                            {
+                                // misaligned and too far for the unscaled offset, so add it in
+                                code* c3 = code_calloc();
+                                c3.Iop = INSTR.add_addsub_imm(1,0,lo,R16,R16);  // ADD R16,R16,#lo
+                                c3.next = c.next;
+                                c.next = c3;
+                                c = c3;
+                                ins = setField(ins,21,10,0);
+                            }
 
                             code* c2 = code_calloc();
                             c2.Iop = ins;

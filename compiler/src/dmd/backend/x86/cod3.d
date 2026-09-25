@@ -4719,7 +4719,7 @@ void prolog_loadparams(ref CGstate cg, ref CodeBuilder cdb, tym_t tyf, bool push
                     if (AArch64)
                     {
                         uint imm = cast(uint)(offset + localsize + 16);
-                        if (tyfloating(t.Tty))
+                        if (tyfloating(t.Tty) && preg & 32)
                         {
                             if (tycomplex(t.Tty))
                             {
@@ -4750,7 +4750,14 @@ void prolog_loadparams(ref CGstate cg, ref CodeBuilder cdb, tym_t tyf, bool push
                             // a slice of an HFA that is not typed as floating point
                             uint size, opc;
                             INSTR.szToSizeOpcStr(sz, size, opc);
-                            cdb.gen1(INSTR.str_imm_fpsimd(size,opc,imm / sz,29,preg));   // STR preg,[bp,#offset]
+                            if (imm / sz < 0x1000)
+                                cdb.gen1(INSTR.str_imm_fpsimd(size,opc,imm / sz,29,preg));   // STR preg,[bp,#offset]
+                            else
+                            {
+                                import dmd.backend.arm.cod3 : genaddimm;
+                                genaddimm(cdb, 16, 29, imm);                        // ADD X16,BP,#offset
+                                cdb.gen1(INSTR.str_imm_fpsimd(size,opc,0,16,preg)); // STR preg,[X16]
+                            }
                         }
                         else
                             // STR preg,bp,#offset
