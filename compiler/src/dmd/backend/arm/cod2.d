@@ -1806,11 +1806,13 @@ void cdstreq(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
 
     docommas(cdb,e2);
 
-    /* The destination is written through its address, so it has to be allocated
-     * even if it is never read
+    /* The destination is written and the source read through their addresses,
+     * so both have to be allocated
      */
     if (e1.Eoper == OPvar)
         e1.Vsym.Sflags |= SFLread;
+    if (e2.Eoper == OPvar)
+        e2.Vsym.Sflags |= SFLread;
 
     if (OTcall(e2.Eoper) && tyaggregate(e2.Ety))
     {
