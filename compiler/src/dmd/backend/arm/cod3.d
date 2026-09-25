@@ -1037,39 +1037,26 @@ void epilog(ref CGstate cg, block* b)
         assert(cg.hasframe);
         if (xlocalsize || cg.enforcealign)
         {
-            if (config.flags2 & CFG2stomp)
-            {   /*   MOV  ECX,0xBEAF
+            if (config.flags2 & CFG2stomp && !cg.enforcealign && localsize)
+            {   /* Fill the locals with a value that stands out:
+                 *   MOV  w16,#0xBEAF
+                 *   ADD  x17,x29,#16
+                 *   ADD  x9,x29,#16+localsize
                  * L1:
-                 *   MOV  [ESP],ECX
-                 *   ADD  ESP,4
-                 *   CMP  EBP,ESP
-                 *   JNE  L1
-                 *   POP  EBP
+                 *   STR  w16,[x17],#4
+                 *   CMP  x17,x9
+                 *   B.NE L1
+                 * x9, x16 and x17 are scratch registers that don't hold a return value.
                  */
-                /* Value should be:
-                 * 1. != 0 (code checks for null pointers)
-                 * 2. be odd (to mess up alignment)
-                 * 3. fall in first 64K (likely marked as inaccessible)
-                 * 4. be a value that stands out in the debugger
-                 */
-                assert(I32 || I64);
-                targ_size_t value = 0x0000BEAF;
-                reg_t regcx = CX;
-                cg.mfuncreg &= ~mask(regcx);
-                uint grex = I64 ? REX_W << 16 : 0;
-                cdbx.genc2(0xC7,grex | modregrmx(3,0,regcx),value);   // MOV regcx,value
-                cdbx.gen2sib(0x89,grex | modregrm(0,regcx,4),modregrm(0,4,SP)); // MOV [ESP],regcx
+                movregconstant(cdbx, 16, 0xBEAF, 0);                        // MOV w16,#0xBEAF
+                genaddimm(cdbx, 17, 29, 16);                                // ADD x17,x29,#16
+                genaddimm(cdbx, 9, 29, 16 + localsize);                     // ADD x9,x29,#16+localsize
+                cdbx.gen1(INSTR.str_imm_gen_post_index(0, 4, 17, 16));      // STR w16,[x17],#4
                 code* c1 = cdbx.last();
-                cdbx.genc2(0x81,grex | modregrm(3,0,SP),REGSIZE);     // ADD ESP,REGSIZE
-                genregs(cdbx,0x39,SP,BP);                             // CMP EBP,ESP
-                if (I64)
-                    code_orrex(cdbx.last(),REX_W);
-                genjmp(cdbx,JNE,FL.code,cast(block*)c1);                  // JNE L1
-                // explicitly mark as short jump, needed for correct retsize calculation (Bugzilla 15779)
-                cdbx.last().Iflags &= ~CF.jmp16;
-                cdbx.gen1(0x58 + BP);                                 // POP BP
+                cdbx.gen1(INSTR.cmp_subs_addsub_shift(1, 9, 0, 0, 17));     // CMP x17,x9
+                genBranch(cdbx, COND.ne, FL.code, cast(block*)c1);          // B.NE L1
             }
-            else if (config.exe == EX_WIN64)
+            if (config.exe == EX_WIN64)
             {   // See https://msdn.microsoft.com/en-us/library/tawsa7cb%28v=vs.100%29.aspx
                 // LEA RSP,0[RBP]
                 cdbx.genc1(LEA,(REX_W<<16)|modregrm(2,SP,BPRM),FL.const_,0);
