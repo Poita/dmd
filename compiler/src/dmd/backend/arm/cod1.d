@@ -1742,17 +1742,18 @@ uint sizeOnStack(bool osx_aapcs64, uint stackalign, uint argSize)
 
 /***********************************
  * Whether an elem of type ty holds the aggregate t, either as the struct itself
- * or painted as a scalar covering it. A pointer elem can still carry the ET of
- * the struct it points to, and is not the aggregate.
+ * or painted as an integer covering it. A pointer elem can still carry the ET of
+ * the struct it points to, and is not the aggregate. An aggregate painted as a
+ * floating point type is passed and returned like that type.
  */
 @trusted
 bool holdsAggregate(tym_t ty, type* t)
 {
-    if (!t || tybasic(t.Tty) != TYstruct)
+    if (!t || !tyaggregate(t.Tty))
         return false;
-    if (tybasic(ty) == TYstruct)
+    if (tyaggregate(ty))
         return true;
-    return !typtr(ty) && _tysize[tybasic(ty)] >= type_size(t);
+    return !typtr(ty) && !tyfloating(ty) && _tysize[tybasic(ty)] >= type_size(t);
 }
 
 /***********************************
@@ -1778,11 +1779,56 @@ struct AggregateABI
 AggregateABI aarch64Aggregate(type* t)
 {
     AggregateABI a;
-    if (!t || tybasic(t.Tty) != TYstruct)
+    if (!t || !tyaggregate(t.Tty))
         return a;
     a.size = cast(uint)type_size(t);
     if (a.size == 0)
         return a;
+    if (tybasic(t.Tty) == TYarray)
+    {
+        // a static array is an HFA if its innermost element type is floating or an HFA
+        uint count = 1;
+        type* te = t;
+        while (tybasic(te.Tty) == TYarray)
+        {
+            count *= cast(uint)te.Tdim;
+            te = te.Tnext;
+        }
+        uint esz, nregs;
+        if (tybasic(te.Tty) == TYstruct)
+        {
+            const ae = aarch64Aggregate(te);
+            if (ae.kind == AggregateABI.Kind.hfa)
+            {
+                esz = ae.esz;
+                nregs = ae.nregs * count;
+            }
+        }
+        else if (tycomplex(te.Tty))
+        {
+            esz = cast(uint)type_size(te) / 2;
+            nregs = 2 * count;
+        }
+        else if (tyfloating(te.Tty) || tyvector(te.Tty))
+        {
+            esz = cast(uint)type_size(te);
+            nregs = count;
+        }
+        if (nregs >= 1 && nregs <= 4)
+        {
+            a.kind = AggregateABI.Kind.hfa;
+            a.esz = cast(ubyte)esz;
+            a.nregs = cast(ubyte)nregs;
+        }
+        else if (a.size <= 16)
+        {
+            a.kind = AggregateABI.Kind.gpr;
+            a.nregs = cast(ubyte)((a.size + 7) / 8);
+        }
+        else
+            a.kind = AggregateABI.Kind.byRef;
+        return a;
+    }
     /* Set by the front end's toArgTypes_aarch64(): floating point or vector
      * element type for an HFA/HVA, an integer type for other small aggregates,
      * none for aggregates passed by reference
@@ -2169,7 +2215,7 @@ void cdfunc(ref CGstate cg, ref CodeBuilder cdb, elem* e, ref regm_t pretregs)
     foreach_reverse (i; 0 .. np)
     {
         Parameter* p = &parameters[i];
-        if (p.reg == NOREG || tybasic(p.e.Ety) != TYstruct)
+        if (p.reg == NOREG || !tyaggregate(p.e.Ety))
             continue;
         const a = aarch64Aggregate(p.e.ET);
         if (a.kind != AggregateABI.Kind.byRef)
@@ -2280,7 +2326,7 @@ void cdfunc(ref CGstate cg, ref CodeBuilder cdb, elem* e, ref regm_t pretregs)
         {
             agg = aarch64Aggregate(ep.ET);
             // the glue has already replaced a large aggregate with a pointer to a copy
-            if (agg.kind == AggregateABI.Kind.byRef && tybasic(ep.Ety) != TYstruct)
+            if (agg.kind == AggregateABI.Kind.byRef && !tyaggregate(ep.Ety))
                 agg = AggregateABI.init;
         }
         const isByRef = preg != NOREG && agg.kind == AggregateABI.Kind.byRef;
@@ -2360,7 +2406,7 @@ void cdfunc(ref CGstate cg, ref CodeBuilder cdb, elem* e, ref regm_t pretregs)
                 gensaverestore(cg,tosave,cdbsave,cdbrestore);
             }
             cdb.append(cdbsave);
-            if (tybasic(ep.Ety) != TYstruct && agg.size <= 16)
+            if (!tyaggregate(ep.Ety) && agg.size <= 16)
             {
                 // the value is in X registers like an integer
                 regm_t xregs;
@@ -2868,7 +2914,7 @@ static if (0)
         }
     }
 
-    if (holdsAggregate(e.Ety, e.ET) && tybasic(e.Ety) != TYstruct)
+    if (holdsAggregate(e.Ety, e.ET) && !tyaggregate(e.Ety))
     {
         const a = aarch64Aggregate(e.ET);
         if (a.kind == AggregateABI.Kind.hfa && a.size <= 16)
@@ -2916,7 +2962,7 @@ private void movParams(ref CGstate cg, ref CodeBuilder cdb, elem* e, uint funcar
             break;
     }
     const tym_t tym = tybasic(e.Ety);
-    if (tym == TYstruct)
+    if (tyaggregate(tym))
     {
         // copy the aggregate to [SP + funcargtos]
         enum reg_t R16 = 16;
