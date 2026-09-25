@@ -2069,6 +2069,9 @@ L1:
                     return false;
                 if (n1.Vsym != n2.Vsym)
                     return false;
+                // an aggregate's type decides how it is passed and returned
+                if (n1.ET != n2.ET)
+                    return false;
                 break;
 
             case OPasm:
