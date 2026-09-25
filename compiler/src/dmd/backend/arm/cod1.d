@@ -2999,14 +2999,14 @@ private void movParams(ref CGstate cg, ref CodeBuilder cdb, elem* e, uint funcar
         cs.base = INSTR.SP;
         cs.index = NOREG;
         cs.IFL1 = FL.offset;
-        storeToEA(cs, rmsw, cast(uint)sz + szx);
-        cs.IEV1.Voffset = funcargtos;
+        storeToEA(cs, rmsw, szx);
+        cs.IEV1.Voffset = funcargtos + szx;
         cdb.gen(&cs);
 
         const reg_t rlsw = findreg(retregs & INSTR.LSW);
         cs.IFL1 = FL.offset;
         cs.IEV1.Voffset = 0;
-        storeToEA(cs, rlsw, cast(uint)sz);
+        storeToEA(cs, rlsw, szx);
         cs.IEV1.Voffset = funcargtos;
         cdb.gen(&cs);
     }
