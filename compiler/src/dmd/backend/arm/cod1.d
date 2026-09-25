@@ -2213,6 +2213,21 @@ void cdfunc(ref CGstate cg, ref CodeBuilder cdb, elem* e, ref regm_t pretregs)
             sz++;               // can't handle 0 length structs
 
         uint alignsize = el_alignsize(ep);
+        if (holdsAggregate(ep.Ety, ep.ET) && !tyaggregate(ep.Ety))
+        {
+            /* An aggregate painted as an integer takes the stack space of the aggregate:
+             * its own size and alignment on OSX, rounded up to 8 bytes by AAPCS64
+             */
+            sz = cast(uint)type_size(ep.ET);
+            alignsize = type_alignsize(ep.ET);
+            if (!osx_aapcs64)
+            {
+                sz = (sz + 7) & ~7;
+                if (alignsize < 8)
+                    alignsize = 8;
+            }
+            p.size = sz;
+        }
         if (alignsize > STACKALIGN)
             alignsize = STACKALIGN;         // no point if the stack is less aligned
 
@@ -2943,6 +2958,45 @@ static if (0)
 }
 
 /***************************
+ * Store the low `n` bytes of general register `reg` at [X16 + offset],
+ * shifting the rest down through X17.
+ */
+private void storeLowBytes(ref CodeBuilder cdb, reg_t reg, uint n, uint offset)
+{
+    assert(n >= 1 && n <= 8);
+    enum reg_t R16 = 16, R17 = 17;
+    if (n == 8)
+    {
+        cdb.gen1(INSTR.str_imm_gen(1, reg, R16, offset));              // STR reg,[X16,#offset]
+        return;
+    }
+    reg_t r = reg;
+    void shiftDown(uint bits)
+    {
+        cdb.gen1(INSTR.ubfm(1, 1, bits, 63, r, R17));                   // LSR X17,r,#bits
+        r = R17;
+    }
+    if (n >= 4)
+    {
+        cdb.gen1(INSTR.str_imm_gen(0, r, R16, offset));                // STR Wr,[X16,#offset]
+        n -= 4;
+        offset += 4;
+        if (n)
+            shiftDown(32);
+    }
+    if (n >= 2)
+    {
+        cdb.gen1(INSTR.strh_imm(r, R16, offset));                      // STRH Wr,[X16,#offset]
+        n -= 2;
+        offset += 2;
+        if (n)
+            shiftDown(16);
+    }
+    if (n)
+        cdb.gen1(INSTR.strb_imm(r, R16, offset));                      // STRB Wr,[X16,#offset]
+}
+
+/***************************
  * Generate code to move argument e on the argument stack.
  * Params:
  *      cg = code generator state
@@ -2990,6 +3044,21 @@ private void movParams(ref CGstate cg, ref CodeBuilder cdb, elem* e, uint funcar
     bool isPair = isRegisterPair(true, tym, 0);
     regm_t retregs = tyfloating(tym) ? INSTR.FLOATREGS : INSTR.ALLREGS;
     scodelem(cg,cdb, e, retregs, 0, true);
+    if (holdsAggregate(tym, e.ET) && !tyfloating(tym))
+    {
+        // store only the bytes of the aggregate the integer holds
+        uint nbytes = cast(uint)type_size(e.ET);
+        enum reg_t R16 = 16;
+        genaddimm(cdb, R16, INSTR.SP, funcargtos);                  // ADD X16,SP,#funcargtos
+        if (isPair)
+        {
+            storeLowBytes(cdb, findreg(retregs & INSTR.LSW), 8, 0);
+            storeLowBytes(cdb, findreg(retregs & INSTR.MSW), nbytes - 8, 8);
+        }
+        else
+            storeLowBytes(cdb, findreg(retregs), nbytes, 0);
+        return;
+    }
     if (isPair)
     {
         uint szx = cast(uint)tysize(tym) / 2;

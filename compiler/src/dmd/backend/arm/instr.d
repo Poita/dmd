@@ -1442,7 +1442,8 @@ struct INSTR
     {
         // STRH Rt,[Xn,#offset]
         uint size = 1;
-        uint imm12 = offset & 0xFFF;
+        assert((offset & 1) == 0 && (offset >> 1) < 0x1000);
+        uint imm12 = cast(uint)(offset >> 1);
         return ldst_pos(1, 0, 0, imm12, Rn, Rt);
     }
 
