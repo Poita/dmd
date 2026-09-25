@@ -300,7 +300,7 @@ COND conditionCode(elem* e)
     int i;
     if (tyfloating(tym))
     {
-        i = 0;
+        i = 2;
     }
     else if (tyuns(tym) || tyuns(e.E2.Ety))
         i = 1;
@@ -317,10 +317,14 @@ COND conditionCode(elem* e)
     COND jp;
     with (COND)
     {
-        immutable COND[6][2][2] jops =
+        /* A floating point comparison with an unordered operand sets C and V,
+         * so < and <= use conditions that are false for it
+         */
+        immutable COND[6][2][3] jops =
         [   /* <=   >   <   >=  ==  !=    <=0   >0  <0  >=0 ==0 !=0    */
            [ [ le, gt, lt,  ge, eq, ne], [ le,  gt, mi,  pl, eq, ne] ], /* signed   */
            [ [ ls, hi, cc,  cs, eq, ne], [ ls,  ne, nv,  al, eq, ne] ], /* uint */
+           [ [ ls, gt, mi,  ge, eq, ne], [ ls,  gt, mi,  ge, eq, ne] ], /* floating */
         ];
 
         jp = jops[i][zero][op - OPle];        /* table starts with OPle       */
