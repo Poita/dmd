@@ -6111,7 +6111,8 @@ beg:
                 if (e2.Eoper == op &&
                     e2.E2.Eoper == OPconst &&
                     tysize(e2.E1.Ety) == tysize(e2.E2.Ety) &&
-                    (!tyfloating(e1.Ety) || e1.Ety == e2.Ety)
+                    // Reordering floating point can change the semantics
+                    !tyfloating(e.Ety)
                    )
                 {
                   e.E1 = e2;
@@ -6136,7 +6137,8 @@ beg:
                     e2.Eoper == OPconst &&
                     e1.E2.Eoper == OPconst &&
                     e1.E1.Eoper != OPconst &&
-                    tysize(e2.Ety) == tysize(e1.E2.Ety))
+                    tysize(e2.Ety) == tysize(e1.E2.Ety) &&
+                    !tyfloating(e.Ety))
                 {
                     e.E1 = e1.E1;
                     e1.E1 = e2;
