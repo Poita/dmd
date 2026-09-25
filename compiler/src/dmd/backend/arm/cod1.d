@@ -3005,6 +3005,16 @@ static if (0)
             hfaToGpr(cdb, a, 32, 0);
         }
     }
+    else if (retregs == mask(0) && tyintegral(e.Ety) && _tysize[tybasic(e.Ety)] < 4)
+    {
+        /* The callee extends a narrow result by its own view of the type,
+         * which differs for C's signed char and D's char
+         */
+        const tyr = tybasic(e.Ety);
+        const imms = _tysize[tyr] == 1 ? 7 : 15;
+        cdb.gen1(tyuns(tyr) ? INSTR.ubfm(0,0,0,imms,0,0)     // UXTB/UXTH w0,w0
+                            : INSTR.sbfm(0,0,0,imms,0,0));   // SXTB/SXTH w0,w0
+    }
     fixresult(cg, cdb, e, retregs, pretregs);
 }
 
