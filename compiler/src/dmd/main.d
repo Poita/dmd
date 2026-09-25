@@ -1077,6 +1077,9 @@ void reconcileCommands(ref Param params, ref Target target, ErrorSink eSink)
             eSink.error(Loc.initial, "`-m32` is not supported on DragonFlyBSD, it is 64-bit only");
     }
 
+    if (target.isAArch64 && driverParams.ibt)
+        eSink.error(Loc.initial, "`-fIBT` is only supported for x86 targets");
+
     if (target.os & (Target.OS.linux | Target.OS.FreeBSD | Target.OS.OpenBSD | Target.OS.Solaris | Target.OS.DragonFlyBSD | Target.OS.Hurd))
     {
         if (driverParams.lib && driverParams.dll)
