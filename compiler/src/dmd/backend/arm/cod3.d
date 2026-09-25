@@ -374,7 +374,10 @@ void gen_storecse(ref CodeBuilder cdb, tym_t tym, reg_t reg, size_t slot)
     cs.Sextend = 0;
     cs.IEV1.Vsym = null;
     cs.IEV1.Voffset = slot;
-    storeToEA(cs, reg, tysize(tym));
+    uint sz = tysize(tym);
+    if (isRegisterPair(true, tybasic(tym), 0))
+        sz /= 2;                // each register of a pair is saved in its own slot
+    storeToEA(cs, reg, sz);
     assert(cs.Iop);
     cdb.gen(&cs);
 }
@@ -402,8 +405,8 @@ void gen_loadcse(ref CodeBuilder cdb, tym_t tym, reg_t reg, size_t slot)
     cs.IEV1.Vsym = null;
     cs.IEV1.Voffset = slot;
     uint szr = tysize(tym);
-    if (szr > 8)
-        szr = 8;
+    if (isRegisterPair(true, tybasic(tym), 0))
+        szr /= 2;               // each register of a pair is saved in its own slot
     uint szw = szr == 8 ? 8 : 4;
     loadFromEA(cs, reg, szw, szr);
     cdb.gen(&cs);
