@@ -474,6 +474,22 @@ void cddiv(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         return;
     }
 
+    if (tycomplex(e.Ety))
+    {
+        // widen a real or imaginary operand to complex with a zero part
+        static elem* widen(elem* ex, tym_t tyc)
+        {
+            if (tycomplex(ex.Ety))
+                return ex;
+            Vconst zero;
+            elem* ez = el_const(_tysize[tybasic(ex.Ety)] == 4 ? TYfloat : TYdouble, zero);
+            return tyimaginary(ex.Ety) ? el_bin(OPpair, tyc, ez, ex)
+                                       : el_bin(OPpair, tyc, ex, ez);
+        }
+        e.E1 = e1 = widen(e1, e.Ety);
+        e.E2 = e2 = widen(e2, e.Ety);
+    }
+
     const ty = tybasic(e.Ety);
     const ty1 = tybasic(e1.Ety);
     const ty2 = tybasic(e2.Ety);
