@@ -3084,6 +3084,8 @@ private void movParams(ref CGstate cg, ref CodeBuilder cdb, elem* e, uint funcar
             assert(0);
 
         case OPstrpar:
+            if (type_size(e.ET))
+                break;          // an aggregate built in place, copied below
             assert(sz <= 16);   // a zero-sized struct, but still occupies aligned space on stack
             regm_t retregs0 = 0;
             scodelem(cg,cdb, e.E1, retregs0, 0, false);
