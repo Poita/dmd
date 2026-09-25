@@ -1273,7 +1273,13 @@ elem* el_convfloat(ref GlobalOptimizer go, elem* e)
              */
             p = buffer.ptr;
             memset(buffer.ptr, 0, sz);                      // ensure padding is 0
-            memcpy(buffer.ptr, &e.Vreal, 10);
+            if (sz == 8)
+            {
+                const double d = cast(double)e.Vreal;       // the target's real is a double
+                memcpy(buffer.ptr, &d, 8);
+            }
+            else
+                memcpy(buffer.ptr, &e.Vreal, 10);
             break;
 
         case TYcfloat:
@@ -1345,7 +1351,13 @@ elem* el_convreal(ref GlobalOptimizer go, elem* e)
             p = buffer.ptr;
             // TODO AArch64 these are supposed to be 128 bit floats, not 80 bit
             memset(buffer.ptr, 0, sz);                      // ensure padding is 0
-            memcpy(buffer.ptr, &e.Vreal, 10);
+            if (sz == 8)
+            {
+                const double d = cast(double)e.Vreal;       // the target's real is a double
+                memcpy(buffer.ptr, &d, 8);
+            }
+            else
+                memcpy(buffer.ptr, &e.Vreal, 10);
             break;
 
         case TYcreal:
