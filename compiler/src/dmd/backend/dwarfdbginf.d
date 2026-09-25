@@ -2097,7 +2097,19 @@ static if (1)
                         if (sa.Sfl == FL.reg || sa.Sclass == SC.pseudo)
                         {
                             // BUG: register pairs not supported in Dwarf?
-                            debug_info.buf.writeByte(cast(ubyte)(DW_OP_reg0 + sa.Sreglsw));
+                            if (config.target_cpu == TARGET_AArch64)
+                            {
+                                const dwreg = dwarf_regno(sa.Sreglsw);
+                                if (dwreg < 32)
+                                    debug_info.buf.writeByte(cast(ubyte)(DW_OP_reg0 + dwreg));
+                                else
+                                {
+                                    debug_info.buf.writeByte(DW_OP_regx);
+                                    debug_info.buf.writeuLEB128(dwreg);
+                                }
+                            }
+                            else
+                                debug_info.buf.writeByte(cast(ubyte)(DW_OP_reg0 + sa.Sreglsw));
                         }
                         else if (sa.Sscope && vcode == variablecode)
                         {
@@ -2123,10 +2135,33 @@ static if (1)
                             //    sa.Sident.ptr, sa.Sscope.Sident.ptr, closptr_off, memb_off);
 
                             debug_info.buf.writeByte(DW_OP_fbreg);
-                            debug_info.buf.writesLEB128(cast(uint)(cgstate.Auto.size + cgstate.BPoff - cgstate.Para.size + closptr_off)); // closure pointer offset from frame base
+                            const paraBias = config.target_cpu == TARGET_AArch64 ? 0 : cgstate.Para.size;
+                            debug_info.buf.writesLEB128(cast(uint)(cgstate.Auto.size + cgstate.BPoff - paraBias + closptr_off)); // closure pointer offset from frame base
                             debug_info.buf.writeByte(DW_OP_deref);
                             debug_info.buf.writeByte(DW_OP_plus_uconst);
                             debug_info.buf.writeuLEB128(cast(uint)memb_off); // closure variable offset
+                        }
+                        else if (config.target_cpu == TARGET_AArch64)
+                        {
+                            /* The frame base is the top of the locals. Parameters on the
+                             * stack are above the frame record at x29, the entry SP.
+                             */
+                            if (sa.Sclass == SC.regpar || sa.Sclass == SC.parameter)
+                            {
+                                debug_info.buf.writeByte(DW_OP_breg0 + 29);
+                                debug_info.buf.writesLEB128(cast(int)(2 * REGSIZE +
+                                    (cgstate.enforcealign ? 0 : localsize) + sa.Soffset));
+                            }
+                            else
+                            {
+                                debug_info.buf.writeByte(DW_OP_fbreg);
+                                if (sa.Sclass == SC.fastpar)
+                                    debug_info.buf.writesLEB128(cast(int)(cgstate.Fast.size + cgstate.BPoff + sa.Soffset));
+                                else if (sa.Sclass == SC.bprel)
+                                    debug_info.buf.writesLEB128(cast(int)sa.Soffset);
+                                else
+                                    debug_info.buf.writesLEB128(cast(int)(cgstate.Auto.size + cgstate.BPoff + sa.Soffset));
+                            }
                         }
                         else
                         {
@@ -2183,6 +2218,31 @@ static if (1)
         dwarf_appreladdr(debug_ranges.seg, debug_ranges.buf, seg, cgstate.funcoffset + sfunc.Ssize);
 
         /* ============= debug_loc =========================== */
+
+        if (config.target_cpu == TARGET_AArch64)
+        {
+            /* One entry for the whole function: the top of the locals, above the
+             * frame record at x29, or from the realigned SP
+             */
+            dwarf_appreladdr(debug_loc.seg, debug_loc.buf, seg, cgstate.funcoffset);
+            dwarf_appreladdr(debug_loc.seg, debug_loc.buf, seg, cgstate.funcoffset + sfunc.Ssize);
+            OutBuffer expr;
+            if (cgstate.enforcealign)
+            {
+                expr.writeByte(DW_OP_breg0 + 31);
+                expr.writesLEB128(cast(int)localsize);
+            }
+            else
+            {
+                expr.writeByte(DW_OP_breg0 + 29);
+                expr.writesLEB128(cast(int)(2 * REGSIZE + localsize));
+            }
+            debug_loc.buf.write16(cast(ushort)expr.length());
+            debug_loc.buf.write(expr[]);
+            append_addr(debug_loc.buf, 0);
+            append_addr(debug_loc.buf, 0);
+            return;
+        }
 
         assert(cgstate.Para.size >= 2 * REGSIZE);
         assert(cgstate.Para.size < 63); // avoid sLEB128 encoding
