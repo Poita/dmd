@@ -1205,6 +1205,15 @@ void cdcmp(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
             {
                 reg = findreg(retregs);                     // get reg that e1 is in
                 rreg = findreg(rretregs);
+                if (sz < 4)
+                {
+                    // bits above a narrow value may be set, so extend both operands
+                    getregs(cdb, mask(reg) | mask(rreg));
+                    const imms = sz == 1 ? 7 : 15;
+                    foreach (r; [reg, rreg])
+                        cdb.gen1(tyuns(tym) ? INSTR.ubfm(0,0,0,imms,r,r)     // UXTB/UXTH
+                                            : INSTR.sbfm(0,0,0,imms,r,r));   // SXTB/SXTH
+                }
                 uint ins;
                 uint sf = sz == 8;
                 if (reverse)
