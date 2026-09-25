@@ -6584,12 +6584,13 @@ Lagain:
     RTLSYM r;
     switch (tb2.ty)
     {
+        // where real is double, the double versions fit
         case Tfloat80:
         case Timaginary80:
-            r = RTLSYM.MEMSET80;
+            r = target.realsize == 8 ? RTLSYM.MEMSETDOUBLE : RTLSYM.MEMSET80;
             break;
         case Tcomplex80:
-            r = RTLSYM.MEMSET160;
+            r = target.realsize == 8 ? RTLSYM.MEMSET128 : RTLSYM.MEMSET160;
             break;
         case Tcomplex64:
             r = RTLSYM.MEMSET128;
