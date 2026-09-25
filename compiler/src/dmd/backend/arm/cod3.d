@@ -2060,16 +2060,26 @@ if ((ins & 0x9F00_0000) == 0x9000_0000)
                         Lextra:
                             // insert extra instruction to load the offset using scratch register R16
                             enum R16 = 16;              // scratch register
-                            // add R16,Rn,(imm12 >> 12) << 12 // https://www.scs.stanford.edu/~zyedidia/arm64/add_addsub_imm.html
+                            // add R16,Rn,(offset >> 12) << 12 // https://www.scs.stanford.edu/~zyedidia/arm64/add_addsub_imm.html
                             const reg_t Rn2 = cast(reg_t)field(ins,9,5);
-                            uint ins2 = INSTR.add_addsub_imm(1,1,imm12>>12,Rn2,R16);
+                            assert((offset >> 12) < 0x1000);
+                            uint ins2 = INSTR.add_addsub_imm(1,1,cast(uint)(offset >> 12),Rn2,R16);
                             c.Iop = ins2;
                             c.IFL1 = FL.unde;
                             c.IEV1.Vpointer = 0;
 
-                            // ldr Rt,[R16,#imm12 & 0xFFF] // https://www.scs.stanford.edu/~zyedidia/arm64/ldr_imm_gen.html
+                            // ldr Rt,[R16,#offset & 0xFFF] // https://www.scs.stanford.edu/~zyedidia/arm64/ldr_imm_gen.html
                             ins = setField(ins,9,5,R16);
-                            ins = setField(ins,21,10,imm12 & 0xFFF);
+                            const uint lo = cast(uint)(offset & 0xFFF);
+                            if (lo & ((1 << shift) - 1))
+                            {
+                                // misaligned, so use the unscaled 9 bit offset
+                                assert(lo < 0x100);
+                                ins = setField(ins,25,24,0);
+                                ins = setField(ins,21,10,lo << 2);
+                            }
+                            else
+                                ins = setField(ins,21,10,lo >> shift);
 
                             code* c2 = code_calloc();
                             c2.Iop = ins;

@@ -1240,7 +1240,7 @@ struct INSTR
     static uint str_imm_fpsimd(uint size, uint opc, uint imm9, reg_t Rn, reg_t Vt)
     {
         assert(Vt & 32);
-        assert(imm9 < 0x200);
+        assert(imm9 < 0x1000);          // unsigned scaled 12 bit offset
         assert(size < 4);
         assert(opc  < 4);
         return ldst_pos(size,1,opc,imm9,Rn,Vt);
@@ -1252,7 +1252,7 @@ struct INSTR
     static uint ldr_imm_fpsimd(uint size, uint opc, uint imm9, reg_t Rn, reg_t Vt)
     {
         assert(Vt & 32);
-        assert(imm9 < 0x200);
+        assert(imm9 < 0x1000);          // unsigned scaled 12 bit offset
         assert(size < 4);
         assert(opc  < 4);
         return ldst_pos(size,1,opc | 1,imm9,Rn,Vt);
