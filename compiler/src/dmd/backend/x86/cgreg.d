@@ -51,6 +51,25 @@ private __gshared
 @trusted
 ref int WEIGHTS(int bi, int si) { return weights[bi * globsym.length + si]; }
 
+/*****************************
+ * Returns: true if a floating point variable of type `ty` can be held in an
+ * AArch64 floating point register: a scalar float or double.
+ */
+private bool aarch64FloatRegCand(tym_t ty)
+{
+    switch (tybasic(ty))
+    {
+        case TYfloat:
+        case TYdouble:
+        case TYdouble_alias:
+        case TYifloat:
+        case TYidouble:
+            return true;
+        default:
+            return false;
+    }
+}
+
 /******************************************
  */
 
@@ -93,7 +112,8 @@ void cgreg_init()
             (sz = cast(uint)type_size(s.Stype)) == 0 ||
             (tysize(s.ty()) == -1) ||
             (I16 && sz > REGSIZE) ||
-            (tyfloating(s.ty()) && !(config.fpxmmregs && tyxmmreg(s.ty())))
+            (tyfloating(s.ty()) && !(cgstate.AArch64 ? aarch64FloatRegCand(s.ty())
+                                                      : config.fpxmmregs && tyxmmreg(s.ty())))
            )
         {
             debug if (debugr)

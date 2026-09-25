@@ -98,6 +98,7 @@ void loadFromEA(ref code cs, reg_t reg, uint szw, uint szr)
                     cs.Iop = INSTR.fmov(ftype,cs.reg,reg);  // FMOV reg,cs.reg
                 }
             }
+            cs.IFL1 = FL.unde;      // no memory operand
         }
         else if (cs.base != NOREG)
         {
@@ -1227,8 +1228,8 @@ void getlvalue(ref CGstate cg,ref CodeBuilder cdb,ref code pcs,elem* e,regm_t ke
                  * the opcode. The only way to deal with this is to prevent enregistering
                  * such variables.
                  */
-                if (tyxmmreg(ty) && !(s.Sregm & XMMREGS) ||
-                    !tyxmmreg(ty) && (s.Sregm & XMMREGS))       // TODO AArch64
+                if (tyfloating(ty) && !(s.Sregm & INSTR.FLOATREGS) ||
+                    !tyfloating(ty) && (s.Sregm & INSTR.FLOATREGS))
                     cgreg_unregister(cg,s.Sregm);
 
                 if (
