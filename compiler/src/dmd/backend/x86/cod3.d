@@ -1325,6 +1325,21 @@ static if (NTEXCEPTIONS)
             //printf("reg1: %d, reg2: %d\n", reg1, reg2);
             //printf("allocretregs e.Ety: %s returns %llx %s, reg1: %d reg2: %d\n", tym_str(e.Ety), retregs, regm_str(retregs), reg1, reg2);
 
+            if (AArch64 && tybasic(e.Ety) == TYstruct && retregs)
+            {
+                // AAPCS64 aggregate returned in several registers
+                import dmd.backend.arm.cod1 : aarch64Aggregate, aggregateAddress, loadAggregateRegs, AggregateABI;
+                const a = aarch64Aggregate(e.ET);
+                if (e.Eoper == OPcall)
+                    gencodelem(cdb,e,retregs,true);     // already in the return registers
+                else
+                {
+                    const Rbase = aggregateAddress(cg, cdb, e, retregs);
+                    getregs(cdb, retregs);
+                    loadAggregateRegs(cdb, a, Rbase, a.kind == AggregateABI.Kind.hfa ? 32 : 0);
+                }
+                goto L4;
+            }
             if (AArch64)
             {
                 reg_t lreg = NOREG;
@@ -1397,6 +1412,19 @@ static if (NTEXCEPTIONS)
                 }
                 if (reg1 != NOREG)
                     retregs = (mask(reg1) | mask(reg2)) & ~mask(NOREG);
+                import dmd.backend.arm.cod1 : holdsAggregate;
+                if (holdsAggregate(e.Ety, e.ET) && tybasic(e.Ety) != TYstruct)
+                {
+                    // a small HFA is returned in V registers, not in the X registers holding its value
+                    import dmd.backend.arm.cod1 : aarch64Aggregate, gprToHfa, AggregateABI;
+                    const a = aarch64Aggregate(e.ET);
+                    if (a.kind == AggregateABI.Kind.hfa && a.size <= 16)
+                    {
+                        gprToHfa(cdb, a, 0, 32);
+                        foreach (k; 0 .. a.nregs)
+                            retregs |= mask(cast(reg_t)(32 + k));
+                    }
+                }
                 goto L4;
             }
             else // X86_64
@@ -1678,6 +1706,20 @@ regm_t allocretregs(ref CGstate cg, const tym_t ty, type* t, const tym_t tyf, ou
     {
         assert(t);
         ty1 = t.Tty;
+        if (AArch64)
+        {
+            // AAPCS64: HFAs in V0..V3, small aggregates in X0,X1, others via X8
+            import dmd.backend.arm.cod1 : aarch64Aggregate, aggregateRetRegs, AggregateABI;
+            const a = aarch64Aggregate(t);
+            const regs = aggregateRetRegs(a);
+            if (regs)
+            {
+                const reg_t r0 = a.kind == AggregateABI.Kind.hfa ? 32 : 0;
+                reg1 = r0;
+                reg2 = a.nregs > 1 ? cast(reg_t)(r0 + 1) : NOREG;
+            }
+            return regs;
+        }
     }
 
     const tyfb = tybasic(tyf);
@@ -4621,6 +4663,33 @@ void prolog_loadparams(ref CGstate cg, ref CodeBuilder cdb, tym_t tyf, bool push
 //        uint sz = cast(uint)type_size(s.Stype);
         reg_t preg = s.Spreg;
         //printf("Spreg: %d Spreg2: %d\n", preg, s.Spreg2);
+        if (AArch64 && tyb == TYstruct)
+        {
+            import dmd.backend.arm.cod1 : aarch64Aggregate, storeAggregateRegs, copyBytes, AggregateABI;
+            import dmd.backend.arm.cod3 : genaddimm;
+            const a = aarch64Aggregate(s.Stype);
+            if (a.kind != AggregateABI.Kind.none)
+            {
+                // X16 = address of the parameter's home, then store or copy the aggregate there
+                enum reg_t R16 = 16;
+                if (cg.hasframe && (!cg.enforcealign || s.Sclass == SC.shadowreg))
+                    genaddimm(cdb, R16, 29, offset + localsize + 16);
+                else
+                    genaddimm(cdb, R16, INSTR.SP, offset);
+                if (a.kind == AggregateABI.Kind.byRef)
+                {
+                    copyBytes(cdb, preg, R16, a.size);      // preg points to the caller's copy
+                    shadowregm |= mask(preg);
+                }
+                else
+                {
+                    storeAggregateRegs(cdb, a, R16, preg);
+                    foreach (k; 0 .. a.nregs)
+                        shadowregm |= mask(cast(reg_t)(preg + k));
+                }
+                continue;
+            }
+        }
         foreach (i; 0 .. 2)     // twice, once for each possible parameter register
         {
             //printf("i: %d t: %s offset: %d\n", i, tym_str(t.Tty), cast(int)offset);

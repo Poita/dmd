@@ -70,6 +70,7 @@ enum
     NFLli     = 1,     // loop invariant
     NFLnogoal = 2,     // evaluate elem for side effects only
     NFLassign = 8,     // unambiguous assignment elem
+    NFLhidden = 0x10,  // OPcall: the last argument is the hidden pointer to where a struct is returned
     NFLdelcse = 0x40,  // this is not the generating CSE
     NFLtouns  = 0x80,  // relational operator was changed from signed to unsigned
 }

@@ -2250,8 +2250,8 @@ void cdpair(ref CGstate cg, ref CodeBuilder cdb, elem* e, ref regm_t pretregs)
     }
     //printf("1: regs1 = %s, regs2 = %s\n", regm_str(regs1), regm_str(regs2));
 
-    codelem(cg,cdb,e.E1, regs1, false);
-    scodelem(cg,cdb,e.E2, regs2, regs1, false);
+    pairOperand(cg,cdb,e.E1, regs1, 0);
+    pairOperand(cg,cdb,e.E2, regs2, regs1);
 
     if (e.E1.Ecount)
         getregs(cdb,regs1);
@@ -2259,6 +2259,26 @@ void cdpair(ref CGstate cg, ref CodeBuilder cdb, elem* e, ref regm_t pretregs)
         getregs(cdb,regs2);
 
     fixresult(cg,cdb,e,regs1 | regs2,pretregs);
+}
+
+/*****************************
+ * Evaluate one half of a pair into regs, which may be X registers even
+ * when the half is floating point, as for a small HFA held as an integer.
+ */
+@trusted
+private void pairOperand(ref CGstate cg, ref CodeBuilder cdb, elem* e, ref regm_t regs, regm_t keepmsk)
+{
+    if (!tyfloating(e.Ety) || regs & INSTR.FLOATREGS)
+    {
+        scodelem(cg,cdb,e,regs,keepmsk,false);
+        return;
+    }
+    regm_t vregs = INSTR.FLOATREGS;
+    scodelem(cg,cdb,e,vregs,keepmsk,false);
+    const Vn = findreg(vregs);
+    const Rd = allocreg(cdb,regs,TYllong);
+    const sf = tysize(e.Ety) == 8;
+    cdb.gen1(INSTR.fmov_float_gen(sf,sf,0,6,Vn,Rd));    // FMOV Rd,Vn
 }
 
 // cdcmpxchg

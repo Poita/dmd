@@ -43,7 +43,7 @@ import dmd.backend.machobj  : MachObj_getChkstkSym;
 import dmd.backend.arm.cod2 : tyToExtend;
 import dmd.backend.arm.cod3 : COND, genBranch, conditionCode, gentstreg;
 import dmd.backend.arm.instr;
-import dmd.backend.arm.cod3 : loadFloatRegConst;
+import dmd.backend.arm.cod3 : loadFloatRegConst, genaddimm;
 import dmd.backend.x86.cod1 : cdisscaledindex, ssindex_array;
 
 import dmd.backend.cg : segfl, stackfl;
@@ -1740,6 +1740,292 @@ uint sizeOnStack(bool osx_aapcs64, uint stackalign, uint argSize)
  * https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms
  */
 
+/***********************************
+ * Whether an elem of type ty holds the aggregate t, either as the struct itself
+ * or painted as a scalar covering it. A pointer elem can still carry the ET of
+ * the struct it points to, and is not the aggregate.
+ */
+@trusted
+bool holdsAggregate(tym_t ty, type* t)
+{
+    if (!t || tybasic(t.Tty) != TYstruct)
+        return false;
+    if (tybasic(ty) == TYstruct)
+        return true;
+    return !typtr(ty) && _tysize[tybasic(ty)] >= type_size(t);
+}
+
+/***********************************
+ * How an aggregate is passed and returned under AAPCS64.
+ */
+struct AggregateABI
+{
+    enum Kind : ubyte
+    {
+        none,       // not an aggregate handled here
+        hfa,        // homogeneous floating point aggregate, in nregs FP registers
+        gpr,        // in nregs general purpose registers
+        byRef,      // passed as a pointer to a copy, returned via x8
+    }
+    Kind kind;
+    ubyte nregs;    // number of registers for hfa and gpr
+    ubyte esz;      // size of each hfa element
+    uint size;      // size of the aggregate
+}
+
+/// ditto
+@trusted
+AggregateABI aarch64Aggregate(type* t)
+{
+    AggregateABI a;
+    if (!t || tybasic(t.Tty) != TYstruct)
+        return a;
+    a.size = cast(uint)type_size(t);
+    if (a.size == 0)
+        return a;
+    /* Set by the front end's toArgTypes_aarch64(): floating point or vector
+     * element type for an HFA/HVA, an integer type for other small aggregates,
+     * none for aggregates passed by reference
+     */
+    type* targ1 = t.Ttag.Sstruct.Sarg1type;
+    if (!targ1)
+        a.kind = AggregateABI.Kind.byRef;
+    else if (tyfloating(targ1.Tty) || tyvector(targ1.Tty))
+    {
+        a.kind = AggregateABI.Kind.hfa;
+        a.esz = cast(ubyte)type_size(targ1);
+        a.nregs = cast(ubyte)(a.size / a.esz);
+        assert(a.nregs >= 1 && a.nregs <= 4);
+    }
+    else
+    {
+        a.kind = AggregateABI.Kind.gpr;
+        a.nregs = cast(ubyte)((a.size + 7) / 8);
+    }
+    return a;
+}
+
+/***********************************
+ * Get the address of aggregate e into a register.
+ * Params:
+ *      cg = code generator state
+ *      cdb = code sink
+ *      e = aggregate lvalue (OPvar or OPind), OPcomma of one
+ *      keepmsk = registers not to disturb
+ * Returns:
+ *      register holding the address
+ */
+@trusted
+reg_t aggregateAddress(ref CGstate cg, ref CodeBuilder cdb, elem* e, regm_t keepmsk)
+{
+    while (true)
+    {
+        if (e.Eoper == OPcomma)
+        {
+            regm_t r = 0;
+            scodelem(cg, cdb, e.E1, r, keepmsk, false);
+            elem* e2 = e.E2;
+            freenode(e);
+            e = e2;
+        }
+        else if (e.Eoper == OPstrpar)
+        {
+            elem* e1 = e.E1;
+            freenode(e);
+            e = e1;
+        }
+        else
+            break;
+    }
+    regm_t regs = cg.allregs & ~keepmsk;
+    if (e.Eoper == OPind)
+    {
+        scodelem(cg, cdb, e.E1, regs, keepmsk, false);
+        freenode(e);
+    }
+    else if (tyaggregate(e.Ety) == 0 && _tysize[tybasic(e.Ety)] == REGSIZE && e.Eoper != OPvar)
+    {
+        // the argument is already the address of the aggregate, e.g. &tmp
+        scodelem(cg, cdb, e, regs, keepmsk, false);
+    }
+    else if (e.Eoper == OPvar)
+    {
+        assert(e.Vsym.Sfl != FL.reg, "AArch64: aggregate in register variable");
+        e.Vsym.Sflags |= SFLread;      // the aggregate is read through the address
+        cdrelconst(cg, cdb, e, regs);
+        freenode(e);
+    }
+    else
+        assert(0, "AArch64: address of aggregate rvalue");
+    return findreg(regs);
+}
+
+/***********************************
+ * Load an aggregate at [Rbase] into consecutive registers.
+ * FP registers get HFA elements, GP registers 8 byte chunks (a short last chunk
+ * is loaded without reading past the aggregate).
+ */
+@trusted
+void loadAggregateRegs(ref CodeBuilder cdb, const ref AggregateABI a, reg_t Rbase, reg_t reg)
+{
+    enum reg_t R17 = 17;    // scratch
+    foreach (k; 0 .. a.nregs)
+    {
+        const r = cast(reg_t)(reg + k);
+        if (a.kind == AggregateABI.Kind.hfa)
+        {
+            uint size, opc;
+            INSTR.szToSizeOpcLdr(a.esz, size, opc);
+            cdb.gen1(INSTR.ldr_imm_fpsimd(size, opc, k, Rbase, r));     // LDR r,[Rbase,#k*esz]
+            continue;
+        }
+        const off = k * 8;
+        const n = a.size - off < 8 ? a.size - off : 8;
+        if (n == 8)
+            cdb.gen1(INSTR.ldr_imm_gen(1, r, Rbase, off));               // LDR Xr,[Rbase,#off]
+        else if (n == 4)
+            cdb.gen1(INSTR.ldr_imm_gen(0, r, Rbase, off));               // LDR Wr,[Rbase,#off]
+        else
+        {
+            // assemble the bytes from the highest down
+            cdb.gen1(INSTR.ldrb_imm(0, r, Rbase, off + n - 1));          // LDRB Wr,[Rbase,#off+n-1]
+            foreach_reverse (b; 0 .. n - 1)
+            {
+                cdb.gen1(INSTR.ldrb_imm(0, R17, Rbase, off + b));        // LDRB W17,[Rbase,#off+b]
+                cdb.gen1(INSTR.orr_shifted_register(1, 0, r, 8, R17, r));  // ORR Xr,X17,Xr,LSL #8
+            }
+        }
+    }
+}
+
+/***********************************
+ * Store consecutive registers into an aggregate at [Rbase], the inverse of loadAggregateRegs().
+ */
+@trusted
+void storeAggregateRegs(ref CodeBuilder cdb, const ref AggregateABI a, reg_t Rbase, reg_t reg)
+{
+    enum reg_t R17 = 17;    // scratch
+    foreach (k; 0 .. a.nregs)
+    {
+        const r = cast(reg_t)(reg + k);
+        if (a.kind == AggregateABI.Kind.hfa)
+        {
+            uint size, opc;
+            INSTR.szToSizeOpcStr(a.esz, size, opc);
+            cdb.gen1(INSTR.str_imm_fpsimd(size, opc, k, Rbase, r));     // STR r,[Rbase,#k*esz]
+            continue;
+        }
+        const off = k * 8;
+        const n = a.size - off < 8 ? a.size - off : 8;
+        if (n == 8)
+            cdb.gen1(INSTR.str_imm_gen(1, r, Rbase, off));               // STR Xr,[Rbase,#off]
+        else if (n == 4)
+            cdb.gen1(INSTR.str_imm_gen(0, r, Rbase, off));               // STR Wr,[Rbase,#off]
+        else
+        {
+            cdb.gen1(INSTR.mov_register(1, r, R17));                     // MOV X17,Xr
+            foreach (b; 0 .. n)
+            {
+                cdb.gen1(INSTR.strb_imm(R17, Rbase, off + b));           // STRB W17,[Rbase,#off+b]
+                if (b + 1 < n)
+                    cdb.gen1(INSTR.ubfm(1, 1, 8, 63, R17, R17));         // LSR X17,X17,#8
+            }
+        }
+    }
+}
+
+/***********************************
+ * Copy size bytes from [Rs] to [Rd], using X17 as scratch.
+ */
+@trusted
+void copyBytes(ref CodeBuilder cdb, reg_t Rs, reg_t Rd, uint size)
+{
+    enum reg_t R17 = 17;
+    assert(size < 0x8000);
+    uint off = 0;
+    for (; off + 8 <= size; off += 8)
+    {
+        cdb.gen1(INSTR.ldr_imm_gen(1, R17, Rs, off));   // LDR X17,[Rs,#off]
+        cdb.gen1(INSTR.str_imm_gen(1, R17, Rd, off));   // STR X17,[Rd,#off]
+    }
+    if (off + 4 <= size)
+    {
+        cdb.gen1(INSTR.ldr_imm_gen(0, R17, Rs, off));   // LDR W17,[Rs,#off]
+        cdb.gen1(INSTR.str_imm_gen(0, R17, Rd, off));   // STR W17,[Rd,#off]
+        off += 4;
+    }
+    for (; off < size; ++off)
+    {
+        cdb.gen1(INSTR.ldrb_imm(0, R17, Rs, off));      // LDRB W17,[Rs,#off]
+        cdb.gen1(INSTR.strb_imm(R17, Rd, off));         // STRB W17,[Rd,#off]
+    }
+}
+
+/***********************************
+ * A small aggregate's value is held in X registers like an integer (TYucent etc.),
+ * but an HFA is passed and returned in V registers. Convert between the two:
+ * doubles take one X register each, floats two per X register.
+ * Params:
+ *      cdb = code sink
+ *      a = HFA
+ *      rx = first X register
+ *      rv = first V register
+ */
+@trusted
+void hfaToGpr(ref CodeBuilder cdb, const ref AggregateABI a, reg_t rv, reg_t rx)
+{
+    enum reg_t R17 = 17;    // scratch
+    assert(a.kind == AggregateABI.Kind.hfa && a.size <= 16);
+    foreach (k; 0 .. a.nregs)
+    {
+        const v = cast(reg_t)(rv + k);
+        if (a.esz == 8)
+            cdb.gen1(INSTR.fmov_float_gen(1,1,0,6,v,cast(reg_t)(rx + k)));      // FMOV Xk,Dk
+        else if (k & 1)
+        {
+            const x = cast(reg_t)(rx + k / 2);
+            cdb.gen1(INSTR.fmov_float_gen(0,0,0,6,v,R17));                      // FMOV W17,Sk
+            cdb.gen1(INSTR.orr_shifted_register(1,0,R17,32,x,x));               // ORR Xk/2,Xk/2,X17,LSL #32
+        }
+        else
+            cdb.gen1(INSTR.fmov_float_gen(0,0,0,6,v,cast(reg_t)(rx + k / 2)));  // FMOV Wk/2,Sk
+    }
+}
+
+/// ditto
+@trusted
+void gprToHfa(ref CodeBuilder cdb, const ref AggregateABI a, reg_t rx, reg_t rv)
+{
+    enum reg_t R17 = 17;    // scratch
+    assert(a.kind == AggregateABI.Kind.hfa && a.size <= 16);
+    foreach (k; 0 .. a.nregs)
+    {
+        const v = cast(reg_t)(rv + k);
+        if (a.esz == 8)
+            cdb.gen1(INSTR.fmov_float_gen(1,1,0,7,cast(reg_t)(rx + k),v));      // FMOV Dk,Xk
+        else if (k & 1)
+        {
+            cdb.gen1(INSTR.ubfm(1,1,32,63,cast(reg_t)(rx + k / 2),R17));         // LSR X17,Xk/2,#32
+            cdb.gen1(INSTR.fmov_float_gen(0,0,0,7,R17,v));                      // FMOV Sk,W17
+        }
+        else
+            cdb.gen1(INSTR.fmov_float_gen(0,0,0,7,cast(reg_t)(rx + k / 2),v));  // FMOV Sk,Wk/2
+    }
+}
+
+/// Returns: the registers an aggregate is returned in
+regm_t aggregateRetRegs(const ref AggregateABI a)
+{
+    regm_t regs = 0;
+    if (a.kind == AggregateABI.Kind.hfa || a.kind == AggregateABI.Kind.gpr)
+    {
+        const reg_t r0 = a.kind == AggregateABI.Kind.hfa ? 32 : 0;
+        foreach (k; 0 .. a.nregs)
+            regs |= mask(cast(reg_t)(r0 + k));
+    }
+    return regs;
+}
+
 @trusted
 void cdfunc(ref CGstate cg, ref CodeBuilder cdb, elem* e, ref regm_t pretregs)
 {
@@ -1805,14 +2091,23 @@ void cdfunc(ref CGstate cg, ref CodeBuilder cdb, elem* e, ref regm_t pretregs)
     {
         FuncParamRegs fpr = FuncParamRegs_create(tyf);
         int apIdx = -1;
+
+        // An aggregate returned in memory has its address passed as the last argument, in x8
+        const hiddenIdx = e.Nflags & NFLhidden ? np - 1 : -1;
         for (int i = np; --i >= 0;)
         {
             Parameter* p = &parameters[i];
             elem* ep = p.e;
             p.reg = NOREG;
+            p.reg2 = NOREG;
             p.isVariadic = numExplicitParams && np - i + 1 > numExplicitParams;
             if (p.isVariadic)      // osx_aapcs64 does not pass variadic args in registers
                 continue;
+            if (i == hiddenIdx)
+            {
+                p.reg = 8;          // AAPCS64 indirect result location register
+                continue;
+            }
             if (FuncParamRegs_alloc(cg, fpr, ep.ET, ep.Ety, p.reg, p.reg2))
                 continue;        // argument is passed in register
             /* The rightmost stack allocated argument, excluding variadics and enregisterd ones,
@@ -1869,6 +2164,22 @@ void cdfunc(ref CGstate cg, ref CodeBuilder cdb, elem* e, ref regm_t pretregs)
         //printf("[%d] param offset =  x%x, alignsize = %d\n", i, cast(int) numpara, cast(int) alignsize);
         numpara += sz;
     }
+
+    // Copies of aggregates passed by reference go above the stack arguments
+    foreach_reverse (i; 0 .. np)
+    {
+        Parameter* p = &parameters[i];
+        if (p.reg == NOREG || tybasic(p.e.Ety) != TYstruct)
+            continue;
+        const a = aarch64Aggregate(p.e.ET);
+        if (a.kind != AggregateABI.Kind.byRef)
+            continue;
+        numpara = (numpara + 15) & ~15;
+        p.offset = numpara;
+        p.size = a.size;
+        numpara += a.size;
+    }
+    numpara = (numpara + REGSIZE - 1) & ~(REGSIZE - 1);
 
     //printf("numpara: %d STACKALIGN: %d\n", numpara, STACKALIGN);
 
@@ -1964,7 +2275,16 @@ void cdfunc(ref CGstate cg, ref CodeBuilder cdb, elem* e, ref regm_t pretregs)
         elem* ep = p.e;
         reg_t preg = p.reg;
         //printf("\nparameter[%d]: %s\n", i, regm_str(mask(preg)));
-        if (preg == NOREG)
+        AggregateABI agg;
+        if (preg != 8 && holdsAggregate(ep.Ety, ep.ET))
+        {
+            agg = aarch64Aggregate(ep.ET);
+            // the glue has already replaced a large aggregate with a pointer to a copy
+            if (agg.kind == AggregateABI.Kind.byRef && tybasic(ep.Ety) != TYstruct)
+                agg = AggregateABI.init;
+        }
+        const isByRef = preg != NOREG && agg.kind == AggregateABI.Kind.byRef;
+        if (preg == NOREG || isByRef)
         {
             //elem_print(ep);
             /* Move parameter on stack, but keep track of registers used
@@ -2007,6 +2327,82 @@ void cdfunc(ref CGstate cg, ref CodeBuilder cdb, elem* e, ref regm_t pretregs)
 
             cdb.append(cdbsave);
             cdb.append(cdbparams);
+
+            if (isByRef)
+            {
+                // pass the address of the copy
+                getregs(cdb, mask(preg));
+                genaddimm(cdb, preg, INSTR.SP, p.offset);      // ADD preg,SP,#offset
+                keepmsk |= mask(preg);
+            }
+        }
+        else if (preg == 8)
+        {
+            // x8 is not allocatable, so compute the address elsewhere and move it in
+            regm_t retregs = cg.allregs & ~keepmsk;
+            scodelem(cg, cdb, ep, retregs, keepmsk, false);
+            genmovreg(cdb, 8, findreg(retregs));
+            keepmsk |= mask(8);
+        }
+        else if (agg.kind == AggregateABI.Kind.hfa || agg.kind == AggregateABI.Kind.gpr)
+        {
+            // Aggregate in consecutive registers starting at preg
+            regm_t regs = 0;
+            foreach (k; 0 .. agg.nregs)
+                regs |= mask(cast(reg_t)(preg + k));
+            CodeBuilder cdbsave;
+            cdbsave.ctor();
+            if (keepmsk & regs)
+            {
+                regm_t tosave = keepmsk & regs;
+                saved |= tosave;
+                keepmsk &= ~tosave;
+                gensaverestore(cg,tosave,cdbsave,cdbrestore);
+            }
+            cdb.append(cdbsave);
+            if (tybasic(ep.Ety) != TYstruct && agg.size <= 16)
+            {
+                // the value is in X registers like an integer
+                regm_t xregs;
+                if (agg.kind == AggregateABI.Kind.gpr && (agg.nregs == 1 || !(preg & 1)))
+                    xregs = regs;
+                else
+                {
+                    // consecutive X registers for the value, LSW even and MSW odd
+                    xregs = agg.size > 8 ? mask(10) | mask(11) : mask(10);
+                    assert(!(xregs & keepmsk));
+                }
+                scodelem(cg, cdb, ep, xregs, keepmsk, false);
+                if (agg.kind == AggregateABI.Kind.hfa)
+                {
+                    getregs(cdb, regs);
+                    gprToHfa(cdb, agg, 10, preg);
+                }
+                else if (xregs != regs)
+                {
+                    getregs(cdb, regs);
+                    genmovreg(cdb, preg, 10, TYnptr);
+                    genmovreg(cdb, cast(reg_t)(preg + 1), 11, TYnptr);
+                }
+            }
+            else if (ep.Eoper == OPcall)
+            {
+                // the value comes back in the return registers, move it into place
+                regm_t rregs = aggregateRetRegs(agg);
+                scodelem(cg, cdb, ep, rregs, keepmsk, false);
+                getregs(cdb, regs);
+                const reg_t r0 = agg.kind == AggregateABI.Kind.hfa ? 32 : 0;
+                foreach (k; 0 .. agg.nregs)
+                    genmovreg(cdb, cast(reg_t)(preg + k), cast(reg_t)(r0 + k),
+                              agg.kind == AggregateABI.Kind.hfa ? (agg.esz == 4 ? TYfloat : TYdouble) : TYnptr);
+            }
+            else
+            {
+                const Rbase = aggregateAddress(cg, cdb, ep, keepmsk | regs);
+                getregs(cdb, regs);
+                loadAggregateRegs(cdb, agg, Rbase, preg);
+            }
+            keepmsk |= regs;
         }
         else
         {
@@ -2472,6 +2868,15 @@ static if (0)
         }
     }
 
+    if (holdsAggregate(e.Ety, e.ET) && tybasic(e.Ety) != TYstruct)
+    {
+        const a = aarch64Aggregate(e.ET);
+        if (a.kind == AggregateABI.Kind.hfa && a.size <= 16)
+        {
+            getregs(cdb, retregs);
+            hfaToGpr(cdb, a, 32, 0);
+        }
+    }
     fixresult(cg, cdb, e, retregs, pretregs);
 }
 
@@ -2511,6 +2916,15 @@ private void movParams(ref CGstate cg, ref CodeBuilder cdb, elem* e, uint funcar
             break;
     }
     const tym_t tym = tybasic(e.Ety);
+    if (tym == TYstruct)
+    {
+        // copy the aggregate to [SP + funcargtos]
+        enum reg_t R16 = 16;
+        const Rs = aggregateAddress(cg, cdb, e, 0);
+        genaddimm(cdb, R16, INSTR.SP, funcargtos);                  // ADD X16,SP,#funcargtos
+        copyBytes(cdb, Rs, R16, cast(uint)type_size(e.ET));
+        return;
+    }
     bool isPair = isRegisterPair(true, tym, 0);
     regm_t retregs = tyfloating(tym) ? INSTR.FLOATREGS : INSTR.ALLREGS;
     scodelem(cg,cdb, e, retregs, 0, true);

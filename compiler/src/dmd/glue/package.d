@@ -776,6 +776,15 @@ void FuncDeclaration_toObjFile(FuncDeclaration fd, bool multiobj)
 
         foreach (sp; params[0 .. pi])
         {
+            if (target.isAArch64 && sp == shidden)
+            {
+                // AAPCS64 indirect result location register
+                sp.Spreg = 8;
+                sp.Spreg2 = NOREG;
+                sp.Sclass = SC.fastpar;
+                sp.Sfl = FL.fast;
+                continue;
+            }
             if (fpr.alloc(sp.Stype, sp.Stype.Tty, sp.Spreg, sp.Spreg2))
             {
                 // successful allocation
