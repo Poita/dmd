@@ -2775,7 +2775,7 @@ void cdpost(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         }
 
         /* If lvalue is a register variable, we must mark it as modified */
-        getregs(cdb,mask(reg));
+        getregs(cdb,mask(reg) | (cs.reg != NOREG ? mask(cs.reg) : 0));
 
         const n = e2.Vint;
         uint opx = e.Eoper == OPpostinc ? 0 : 1;
