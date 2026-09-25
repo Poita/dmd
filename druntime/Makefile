@@ -395,7 +395,7 @@ OBJS:=$(ROOT)/errno_c$(DOTOBJ)
 ifneq (windows,$(OS))
     OBJS+=$(ROOT)/threadasm$(DOTOBJ) $(ROOT)/valgrind$(DOTOBJ)
     ifeq (aarch64,$(ARCH))
-        OBJS+=$(ROOT)/atomicasm$(DOTOBJ)
+        OBJS+=$(ROOT)/atomicasm$(DOTOBJ) $(ROOT)/fpuasm$(DOTOBJ)
     endif
 endif
 
@@ -412,6 +412,10 @@ $(ROOT)/threadasm$(DOTOBJ) : src/core/thread/fiber/switch_context_asm.S
 	$(CC) -c $(CFLAGS) $< -o$@
 
 $(ROOT)/atomicasm$(DOTOBJ) : src/core/internal/atomic_aarch64.S
+	@mkdir -p $(dir $@)
+	$(CC) -c $(CFLAGS) $< -o$@
+
+$(ROOT)/fpuasm$(DOTOBJ) : src/core/internal/fpu_aarch64.S
 	@mkdir -p $(dir $@)
 	$(CC) -c $(CFLAGS) $< -o$@
 
