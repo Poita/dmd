@@ -15,30 +15,103 @@ import core.atomic : has128BitCAS, MemoryOrder;
 version (DigitalMars)
 version (AArch64)
 {
-    /* These functions have the right semantics but are not atomic, so they
-       are only correct for single threaded programs.
-       TODO AArch64: implement with LDAXR/STLXR or LSE instructions
+    /* DMD has no AArch64 inline assembler, so the operations are in
+       atomic_aarch64.S. They are all sequentially consistent.
      */
-    enum IsAtomicLockFree(T) = T.sizeof <= size_t.sizeof * 2;
+    enum IsAtomicLockFree(T) = T.sizeof <= 8 || T.sizeof == 16;
+
+    private
+    {
+        template SizedUint(size_t size)
+        {
+            static if (size == 1)
+                alias SizedUint = ubyte;
+            else static if (size == 2)
+                alias SizedUint = ushort;
+            else static if (size == 4)
+                alias SizedUint = uint;
+            else static if (size == 8)
+                alias SizedUint = ulong;
+            else
+                static assert(0, "no atomic operations for a size of " ~ size.stringof);
+        }
+
+        extern (C) pure nothrow @nogc @trusted
+        {
+            ubyte  _d_aarch64_load1(const(void)* p);
+            ushort _d_aarch64_load2(const(void)* p);
+            uint   _d_aarch64_load4(const(void)* p);
+            ulong  _d_aarch64_load8(const(void)* p);
+            void   _d_aarch64_load16(const(void)* p, void* result);
+
+            void _d_aarch64_store1(void* p, ubyte value);
+            void _d_aarch64_store2(void* p, ushort value);
+            void _d_aarch64_store4(void* p, uint value);
+            void _d_aarch64_store8(void* p, ulong value);
+            void _d_aarch64_store16(void* p, const(void)* value);
+
+            ubyte  _d_aarch64_fetchadd1(void* p, ubyte value);
+            ushort _d_aarch64_fetchadd2(void* p, ushort value);
+            uint   _d_aarch64_fetchadd4(void* p, uint value);
+            ulong  _d_aarch64_fetchadd8(void* p, ulong value);
+
+            ubyte  _d_aarch64_exchange1(void* p, ubyte value);
+            ushort _d_aarch64_exchange2(void* p, ushort value);
+            uint   _d_aarch64_exchange4(void* p, uint value);
+            ulong  _d_aarch64_exchange8(void* p, ulong value);
+
+            ubyte  _d_aarch64_cas1(void* p, ubyte expected, ubyte desired);
+            ushort _d_aarch64_cas2(void* p, ushort expected, ushort desired);
+            uint   _d_aarch64_cas4(void* p, uint expected, uint desired);
+            ulong  _d_aarch64_cas8(void* p, ulong expected, ulong desired);
+            bool   _d_aarch64_cas16(void* p, void* expected, ulong desiredLo, ulong desiredHi);
+
+            void _d_aarch64_fence();
+            void _d_aarch64_pause();
+        }
+
+        // Reinterpret the bits of a value as an unsigned integer of the same size
+        SizedUint!(T.sizeof) bitsOf(T)(ref const T value) pure nothrow @nogc @trusted
+        {
+            return *cast(SizedUint!(T.sizeof)*) &value;
+        }
+
+        T fromBits(T, U)(U bits) pure nothrow @nogc @trusted
+        {
+            return *cast(T*) &bits;
+        }
+    }
 
     inout(T) atomicLoad(MemoryOrder order = MemoryOrder.seq, T)(inout(T)* src) pure nothrow @nogc @trusted
         if (CanCAS!T)
     {
-        return *src;
+        static if (T.sizeof == 16)
+        {
+            T result = void;
+            _d_aarch64_load16(cast(const void*) src, &result);
+            return cast(inout(T)) result;
+        }
+        else
+        {
+            const bits = mixin("_d_aarch64_load" ~ T.sizeof.stringof[0 .. $ - 2])(cast(const void*) src);
+            return cast(inout(T)) fromBits!(T)(bits);
+        }
     }
 
     void atomicStore(MemoryOrder order = MemoryOrder.seq, T)(T* dest, T value) pure nothrow @nogc @trusted
         if (CanCAS!T)
     {
-        *dest = value;
+        static if (T.sizeof == 16)
+            _d_aarch64_store16(dest, &value);
+        else
+            mixin("_d_aarch64_store" ~ T.sizeof.stringof[0 .. $ - 2])(dest, bitsOf(value));
     }
 
     T atomicFetchAdd(MemoryOrder order = MemoryOrder.seq, bool result = true, T)(T* dest, T value) pure nothrow @nogc @trusted
         if (is(T : ulong))
     {
-        T old = *dest;
-        *dest = cast(T)(old + value);
-        return old;
+        const old = mixin("_d_aarch64_fetchadd" ~ T.sizeof.stringof[0 .. $ - 2])(dest, bitsOf(value));
+        return fromBits!(T)(old);
     }
 
     T atomicFetchSub(MemoryOrder order = MemoryOrder.seq, bool result = true, T)(T* dest, T value) pure nothrow @nogc @trusted
@@ -50,9 +123,17 @@ version (AArch64)
     T atomicExchange(MemoryOrder order = MemoryOrder.seq, bool result = true, T)(T* dest, T value) pure nothrow @nogc @trusted
     if (CanCAS!T)
     {
-        T old = *dest;
-        *dest = value;
-        return old;
+        static if (T.sizeof == 16)
+        {
+            T old = atomicLoad(dest);
+            while (!atomicCompareExchangeStrong(dest, &old, value)) {}
+            return old;
+        }
+        else
+        {
+            const old = mixin("_d_aarch64_exchange" ~ T.sizeof.stringof[0 .. $ - 2])(dest, bitsOf(value));
+            return fromBits!(T)(old);
+        }
     }
 
     alias atomicCompareExchangeWeak = atomicCompareExchangeStrong;
@@ -60,13 +141,20 @@ version (AArch64)
     bool atomicCompareExchangeStrong(MemoryOrder succ = MemoryOrder.seq, MemoryOrder fail = MemoryOrder.seq, T)(T* dest, T* compare, T value) pure nothrow @nogc @trusted
         if (CanCAS!T)
     {
-        if (*dest != *compare)
+        static if (T.sizeof == 16)
         {
-            *compare = *dest;
+            const ulong[2] desired = *cast(ulong[2]*) &value;
+            return _d_aarch64_cas16(dest, compare, desired[0], desired[1]);
+        }
+        else
+        {
+            const expected = bitsOf(*compare);
+            const old = mixin("_d_aarch64_cas" ~ T.sizeof.stringof[0 .. $ - 2])(dest, expected, bitsOf(value));
+            if (old == expected)
+                return true;
+            *compare = fromBits!(T)(old);
             return false;
         }
-        *dest = value;
-        return true;
     }
 
     alias atomicCompareExchangeWeakNoResult = atomicCompareExchangeStrongNoResult;
@@ -74,14 +162,13 @@ version (AArch64)
     bool atomicCompareExchangeStrongNoResult(MemoryOrder succ = MemoryOrder.seq, MemoryOrder fail = MemoryOrder.seq, T)(T* dest, const T compare, T value) pure nothrow @nogc @trusted
         if (CanCAS!T)
     {
-        if (*dest != compare)
-            return false;
-        *dest = value;
-        return true;
+        T expected = cast(T) compare;
+        return atomicCompareExchangeStrong!(succ, fail)(dest, &expected, value);
     }
 
     void atomicFence(MemoryOrder order = MemoryOrder.seq)() pure nothrow @nogc @trusted
     {
+        _d_aarch64_fence();
     }
 
     void atomicSignalFence(MemoryOrder order = MemoryOrder.seq)() pure nothrow @nogc @trusted
@@ -91,6 +178,7 @@ version (AArch64)
 
     void pause() pure nothrow @nogc @trusted
     {
+        _d_aarch64_pause();
     }
 }
 else // X86 and X86_64
