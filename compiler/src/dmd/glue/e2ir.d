@@ -218,7 +218,14 @@ package(dmd.glue)
 Symbol* toStringSymbol(const(char)* str, size_t len, size_t sz)
 {
     //printf("toStringSymbol() %s\n", str);
-    auto sv = stringTab.update(str, len * sz);
+    /* The key is prefixed with the code unit size, as literals with the same bytes
+     * but different code unit sizes get different sized terminators
+     */
+    import dmd.common.outbuffer : OutBuffer;
+    OutBuffer key;
+    key.writeByte(cast(ubyte)sz);
+    key.write(str[0 .. len * sz]);
+    auto sv = stringTab.update(key[]);
     if (sv.value)
         return sv.value;
 
@@ -248,7 +255,6 @@ Symbol* toStringSymbol(const(char)* str, size_t len, size_t sz)
      * But the checksum algorithm is unknown. Just invent our own.
      */
 
-    import dmd.common.outbuffer : OutBuffer;
     OutBuffer buf;
     buf.writestring("__");
 
