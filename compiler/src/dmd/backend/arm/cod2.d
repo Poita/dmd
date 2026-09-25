@@ -1896,7 +1896,7 @@ void cdstreq(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         {
             // the struct is returned in registers, store them into the destination
             codelem(cg,cdb,e2,rregs,false);
-            regm_t dstregs = cg.allregs & ~rregs;
+            regm_t dstregs = cg.allregs & ~(rregs | cg.regcon.mvar);
             if (e1.Eoper == OPind)
                 scodelem(cg,cdb,e1.E1,dstregs,rregs,false);
             else
@@ -1912,10 +1912,15 @@ void cdstreq(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         }
     }
 
+    /* The address registers and the copy register are scratch,
+     * so they must not be register variables
+     */
+    const regm_t scratch = cg.allregs & ~cg.regcon.mvar;
+
     // load pointer to rvalue into source register
-    regm_t srcregs = cg.allregs & ~pretregs;
+    regm_t srcregs = scratch & ~pretregs;
     if (!srcregs)
-        srcregs = cg.allregs;
+        srcregs = scratch;
     if (e2.Eoper == OPind)             // if (.. = *p)
     {
         codelem(cg,cdb,e2.E1,srcregs,false);
@@ -1932,9 +1937,9 @@ void cdstreq(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
     }
 
     // load pointer to lvalue (destination), keeping the source pointer
-    regm_t dstregs = cg.allregs & ~(pretregs | srcregs);
+    regm_t dstregs = scratch & ~(pretregs | srcregs);
     if (!dstregs)
-        dstregs = cg.allregs & ~srcregs;
+        dstregs = scratch & ~srcregs;
     if (e1.Eoper == OPind)               // if (*p = ..)
     {
         scodelem(cg,cdb,e1.E1,dstregs,srcregs,false);
@@ -1943,7 +1948,7 @@ void cdstreq(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         cdrelconst(cg,cdb,e1,dstregs);
     freenode(e1);
 
-    regm_t regm = cg.allregs & ~(srcregs | dstregs);
+    regm_t regm = scratch & ~(srcregs | dstregs);
     allocreg(cdb, regm, TYint);
     reg_t Rv = findreg(regm);
 
