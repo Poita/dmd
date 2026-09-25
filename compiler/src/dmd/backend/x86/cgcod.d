@@ -2478,7 +2478,8 @@ private void comsub(ref CodeBuilder cdb,elem* e, ref regm_t pretregs)
         }
 
         /* Look for right vals in any regs      */
-        regm_t regm = pretregs & xMSW;
+        // on AArch64 the MSW mask also covers mPSW
+        regm_t regm = pretregs & xMSW & (AArch64 ? xALLREGS : ~0UL);
         if (emask & regm)
             msreg = findreg(emask & regm);
         else if (emask & xMSW)
@@ -2491,7 +2492,7 @@ private void comsub(ref CodeBuilder cdb,elem* e, ref regm_t pretregs)
             loadcse(cdb,e,msreg,xMSW);
         }
 
-        regm = pretregs & xLSW;
+        regm = pretregs & xLSW & (AArch64 ? xALLREGS : ~0UL);
         if (emask & regm)
             lsreg = findreg(emask & regm);
         else if (emask & xLSW)
