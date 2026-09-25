@@ -51,6 +51,17 @@ import dmd.backend.cg : segfl, stackfl;
 nothrow:
 @safe:
 
+/*************************************
+ * Determine if a load of `sz` bytes from parameter `s` can use the register
+ * the parameter was passed in. Loads narrower than 32 bits need the value
+ * extended, which the register only holds when the parameter itself is that
+ * narrow scalar (the caller extends it to 32 bits).
+ */
+private bool pregHoldsLoad(ref const Symbol s, uint sz)
+{
+    return sz >= 4 || (!tyaggregate(s.Stype.Tty) && sz == type_size(s.Stype));
+}
+
 /************************************
  * Given cs which has the Effective Address encoded into it,
  * create a load instruction to reg, and write it to cs.Iop
@@ -1109,7 +1120,7 @@ void getlvalue(ref CGstate cg,ref CodeBuilder cdb,ref code pcs,elem* e,regm_t ke
                     if (rm == RM.load && !cg.anyiasm)
                     {
                         auto voffset = e.Voffset;
-                        if (sz <= REGSIZE)
+                        if (sz <= REGSIZE && pregHoldsLoad(*s, cast(uint)sz))
                         {
                             const reg_t preg = (voffset >= REGSIZE) ? s.Spreg2 : s.Spreg;
                             if (voffset >= REGSIZE)
@@ -3269,7 +3280,8 @@ void loaddata(ref CGstate cg, ref CodeBuilder cdb, elem* e, ref regm_t outretreg
             !cg.anyiasm &&   // may have written to the memory for the parameter
             (cg.regcon.params & mask(e.Vsym.Spreg) && e.Voffset == 0 ||
              cg.regcon.params & mask(e.Vsym.Spreg2) && e.Voffset == REGSIZE) &&
-            sz <= REGSIZE)                  // make sure no 'paint' to a larger size happened
+            sz <= REGSIZE &&                // make sure no 'paint' to a larger size happened
+            pregHoldsLoad(*e.Vsym, cast(uint)sz))
         {
             const reg_t preg = e.Voffset ? e.Vsym.Spreg2 : e.Vsym.Spreg;
             const regm_t pregm = mask(preg);
