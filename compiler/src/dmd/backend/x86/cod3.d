@@ -4738,6 +4738,13 @@ void prolog_loadparams(ref CGstate cg, ref CodeBuilder cdb, tym_t tyf, bool push
                                 offset += sz - REGSIZE;
                             }
                         }
+                        else if (preg & 32)
+                        {
+                            // a slice of an HFA that is not typed as floating point
+                            uint size, opc;
+                            INSTR.szToSizeOpcStr(sz, size, opc);
+                            cdb.gen1(INSTR.str_imm_fpsimd(size,opc,imm / sz,29,preg));   // STR preg,[bp,#offset]
+                        }
                         else
                             // STR preg,bp,#offset
                             cdb.gen1(INSTR.str_imm_gen(sz > 4, preg, 29, imm));

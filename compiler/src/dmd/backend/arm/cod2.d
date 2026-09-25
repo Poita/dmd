@@ -1754,32 +1754,23 @@ private void cdmemsetn(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pr
     uint S = 0;                 // don't set flags
     uint opt = 0;
     uint option = tyToExtend(enelems.Ety);
-    uint opc;
-    uint imm3;
-    INSTR.szToSizeOpcStr(szv,imm3,opc);    // shift 0..4
-    int is64 = szv == REGSIZE * 2;
-    if (is64)
-    {
-        imm3 = 3;
-        opc = 0;
-    }
+    const uint imm3 = szv == 2 ? 1 : szv == 4 ? 2 : szv == 8 ? 3 : 4;   // log2(szv), the scale of Rc
     cdb.gen1(INSTR.addsub_ext(1,op,S,opt,Rc,option,imm3,Rd,Rl));
 
     if (Rp != Rd)
         genmovreg(cdb,Rp,Rd);
 
-    if (szv == 2)
-    {
-        cdb.gen1(INSTR.str_imm_gen_post_index(is64,szv,Rp,Rv));   // STRH Rv,[Rp],#2
-    }
-    else
-    {
-        assert(szv == 4 || szv == 8);
-        cdb.gen1(INSTR.str_imm_gen_post_index(is64,szv,Rp,Rv));   // L2: STR  Rv,[Rp],#szv    // *Rp++ = Rv
-    }
+    /* STRH/STR Rv,[Rp],#size    // *Rp++ = Rv
+     * A 16 byte element is stored as two 8 byte halves
+     */
+    assert(szv == 2 || szv == 4 || szv == 8 || szv == 16);
+    const uint stsz = szv == 16 ? 8 : szv;
+    const uint size = stsz == 2 ? 1 : stsz == 4 ? 2 : 3;
+    uint strPost(reg_t Rt) { return INSTR.ldst_immpost(size,0,0,stsz,Rp,Rt); }
+    cdb.gen1(strPost(Rv));                                            // L2: STR Rv,[Rp],#stsz
     code* L2 = cdb.last();
-    if (szv == REGSIZE * 2)
-        cdb.gen1(INSTR.str_imm_gen_post_index(is64,szv,Rp,Rvhi)); // L2: STR  Rvhi,[Rp],#szv  // *Rp++ = Rvhi
+    if (szv == 16)
+        cdb.gen1(strPost(Rvhi));                                      // STR Rvhi,[Rp],#8
     cdb.gen1(INSTR.cmp_subs_addsub_shift(1,Rl,0,0,Rp));           // CMP Rp,Rl
     genBranch(cdb,COND.ne,FL.code,cast(block*)L2);                // b.ne L2
     cdb.append(c1);
