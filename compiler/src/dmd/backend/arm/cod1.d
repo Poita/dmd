@@ -2180,8 +2180,8 @@ void cdfunc(ref CGstate cg, ref CodeBuilder cdb, elem* e, ref regm_t pretregs)
              */
             apIdx = i;
         }
-        if (apIdx >= 0)
-            parameters[apIdx].isAp = true;  // used for va_start()
+        if (apIdx >= 0 && numExplicitParams)
+            parameters[apIdx].isAp = true;  // used for va_start() of a variadic function
 
         /* Print what we have discovered
          */
