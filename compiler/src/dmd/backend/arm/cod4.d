@@ -1571,10 +1571,10 @@ void cdcnvt(ref CGstate cg, ref CodeBuilder cdb,elem* e, ref regm_t pretregs)
     {
         case OPd_s16:                               // fcvtzs w0,d31  // sxth w0,w0
         case OPd_s32: ftype = 1; sf = 0; goto L2;   // fcvtzs w0,d31
-        case OPd_s64: ftype = 1; sf = 1; goto L2;   // fcvtzs d31,d31 // fmov x0,d31
+        case OPd_s64: ftype = 1; sf = 1; goto L2;   // fcvtzs x0,d31
         case OPd_u16:                               // fcvtzu w0,d31  // and w0,w0,#0xFFFF
         case OPd_u32:                               // fcvtzu w0,d31
-        case OPd_u64:                               // fcvtzu d31,d31 // fmov x0,d31
+        case OPd_u64:                               // fcvtzu x0,d31
         L2:
             regm_t retregs1 = INSTR.FLOATREGS;
             codelem(cg,cdb,e.E1,retregs1,false);
@@ -1596,8 +1596,7 @@ void cdcnvt(ref CGstate cg, ref CodeBuilder cdb,elem* e, ref regm_t pretregs)
                     cdb.gen1(INSTR.fcvtzs(0,1,V1,Rd));                  // fcvtzs Rd,V1
                     break;
                 case OPd_s64:
-                    cdb.gen1(INSTR.fcvtzs_asisdmisc(1,V1,V1));          // fcvtzs V1,V1
-                    cdb.gen1(INSTR.fmov_float_gen(1,1,0,6,V1,Rd));      // fmov Rd,V1
+                    cdb.gen1(INSTR.fcvtzs(1,1,V1,Rd));                  // fcvtzs Rd,V1
                     break;
                 case OPd_u16:
                     cdb.gen1(INSTR.fcvtzu(0,ftype,V1,Rd));              // fcvtzu Rd,V1
@@ -1609,8 +1608,7 @@ void cdcnvt(ref CGstate cg, ref CodeBuilder cdb,elem* e, ref regm_t pretregs)
                     cdb.gen1(INSTR.fcvtzu(0,1,V1,Rd));                  // fcvtzu Rd,V1
                     break;
                 case OPd_u64:
-                    cdb.gen1(INSTR.fcvtzu_asisdmisc(1,V1,V1));          // fcvtzu V1,V1
-                    cdb.gen1(INSTR.fmov_float_gen(1,1,0,6,V1,Rd));      // fmov Rd,V1
+                    cdb.gen1(INSTR.fcvtzu(1,1,V1,Rd));                  // fcvtzu Rd,V1
                     break;
                 default:
                     assert(0);
