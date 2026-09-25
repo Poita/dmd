@@ -600,6 +600,9 @@ void loadea(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref code cs,uint op,reg_
 
     getlvalue(cg, cdb, cs, e, keepmsk, rmx);
     cs.IEV1.Voffset += offset;
+    // the high half of a register variable pair is its own register
+    if (offset && cs.reg != NOREG && e.Eoper == OPvar && e.Vsym.Sfl == FL.reg && e.Vsym.Sregmsw != NOREG)
+        cs.reg = e.Vsym.Sregmsw;
 
     //printf("loadea() sz: %d Voffset: %d loadea.offset: %d\n", sz, cast(int)cs.IEV1.Voffset, cast(int)offset);
     assert(op != LEA);                  // AArch64 does not have LEA
