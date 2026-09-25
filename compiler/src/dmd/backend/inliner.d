@@ -419,7 +419,7 @@ private elem* inlineCall(elem* e,Symbol* sfunc)
      */
     if (e.Eoper == OPcall)
     {
-        elem* eargs = initializeParamsWithArgs(e.E2, sistart, globsym.length);
+        elem* eargs = initializeParamsWithArgs(e.E2, sistart, globsym.length, (e.Nflags & NFLhidden) != 0);
         ec = el_combine(eargs,ec);
     }
 
@@ -448,7 +448,7 @@ private elem* inlineCall(elem* e,Symbol* sfunc)
  *      expression representing the argument list
  */
 @trusted
-private elem* initializeParamsWithArgs(elem* eargs, SYMIDX sistart, SYMIDX siend)
+private elem* initializeParamsWithArgs(elem* eargs, SYMIDX sistart, SYMIDX siend, bool hiddenLast)
 {
     /* Create args[] and fill it with the arguments
      */
@@ -457,6 +457,31 @@ private elem* initializeParamsWithArgs(elem* eargs, SYMIDX sistart, SYMIDX siend
     elem*[] args = (cast(elem**)malloc(nargs * (elem*).sizeof))[0 .. nargs];
     elem** tmp = args.ptr;
     el_paramArray(&tmp, eargs);
+
+    /* The hidden pointer argument comes last in the call, but the parameters
+     * are matched to the arguments from the end in the order of the function's
+     * parameter symbols, so move it to the place of the hidden parameter
+     */
+    if (hiddenLast && nargs)
+    {
+        size_t p;               // index of the hidden parameter among the parameters
+        foreach (s; globsym[sistart .. siend])
+        {
+            if (!(s.Sclass == SC.register || s.Sclass == SC.auto_))
+                continue;
+            if (s.Sflags & SFLhidden)
+                break;
+            ++p;
+        }
+        if (p < nargs)
+        {
+            const to = nargs - 1 - p;
+            elem* eh = args[nargs - 1];
+            foreach_reverse (k; to .. nargs - 1)
+                args[k + 1] = args[k];
+            args[to] = eh;
+        }
+    }
 
     elem* ecopy;
 
