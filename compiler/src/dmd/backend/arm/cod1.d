@@ -1864,25 +1864,7 @@ AggregateABI aarch64Aggregate(type* t)
 @trusted
 reg_t aggregateAddress(ref CGstate cg, ref CodeBuilder cdb, elem* e, regm_t keepmsk)
 {
-    while (true)
-    {
-        if (e.Eoper == OPcomma)
-        {
-            regm_t r = 0;
-            scodelem(cg, cdb, e.E1, r, keepmsk, false);
-            elem* e2 = e.E2;
-            freenode(e);
-            e = e2;
-        }
-        else if (e.Eoper == OPstrpar)
-        {
-            elem* e1 = e.E1;
-            freenode(e);
-            e = e1;
-        }
-        else
-            break;
-    }
+    e = evalToAggregate(cg, cdb, e, keepmsk);
     regm_t regs = cg.allregs & ~keepmsk;
     if (e.Eoper == OPind)
     {
@@ -1904,6 +1886,40 @@ reg_t aggregateAddress(ref CGstate cg, ref CodeBuilder cdb, elem* e, regm_t keep
     else
         assert(0, "AArch64: address of aggregate rvalue");
     return findreg(regs);
+}
+
+/***********************************
+ * Generate the side effects of commas around an aggregate, and look through OPstrpar.
+ * Params:
+ *      cg = code generator state
+ *      cdb = code sink
+ *      e = aggregate expression
+ *      keepmsk = registers not to disturb
+ * Returns:
+ *      the aggregate itself
+ */
+@trusted
+elem* evalToAggregate(ref CGstate cg, ref CodeBuilder cdb, elem* e, regm_t keepmsk)
+{
+    while (true)
+    {
+        if (e.Eoper == OPcomma)
+        {
+            regm_t r = 0;
+            scodelem(cg, cdb, e.E1, r, keepmsk, false);
+            elem* e2 = e.E2;
+            freenode(e);
+            e = e2;
+        }
+        else if (e.Eoper == OPstrpar)
+        {
+            elem* e1 = e.E1;
+            freenode(e);
+            e = e1;
+        }
+        else
+            return e;
+    }
 }
 
 /***********************************
@@ -2431,7 +2447,7 @@ void cdfunc(ref CGstate cg, ref CodeBuilder cdb, elem* e, ref regm_t pretregs)
                     genmovreg(cdb, cast(reg_t)(preg + 1), 11, TYnptr);
                 }
             }
-            else if (ep.Eoper == OPcall)
+            else if (OTcall((ep = evalToAggregate(cg, cdb, ep, keepmsk | regs)).Eoper))
             {
                 // the value comes back in the return registers, move it into place
                 regm_t rregs = aggregateRetRegs(agg);
