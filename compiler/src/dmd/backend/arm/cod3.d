@@ -1486,7 +1486,12 @@ void genmovreg(ref CodeBuilder cdb, reg_t to, reg_t from, tym_t ty = TYMAX)
 {
     if (to != from)
     {
-        if (!((to | from) & 32)) // both are gp registers
+        if (to == INSTR.SP || from == INSTR.SP)
+        {
+            // the ORR form reads register 31 as XZR, so use ADD
+            cdb.gen1(INSTR.add_addsub_imm(1,0,0,from,to)); // MOV SP,gp or MOV gp,SP https://www.scs.stanford.edu/~zyedidia/arm64/mov_add_addsub_imm.html
+        }
+        else if (!((to | from) & 32)) // both are gp registers
         {
             // integer
             const uint sf = ty == TYMAX || _tysize[ty] == 8;

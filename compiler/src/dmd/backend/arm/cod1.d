@@ -2647,8 +2647,9 @@ private void funccall(ref CGstate cg, ref CodeBuilder cdb, elem* e, uint numpara
             FL fl = schkstk.Sfl;
 
             enum reg_t R9 = 9;                  // argument to __chkstk_darwin
-            regm_t maskR9 = mask(R9);
-            codelem(cg,cdbe,e.E2,maskR9,0);            // R9 = e2
+            // cdfunc() has already evaluated the size into the argument register X0
+            getregs(cdbe, mask(R9));
+            genmovreg(cdbe, R9, 0);                     // MOV R9,X0
 
             cdbe.gen1(INSTR.add_addsub_imm(1,0,0xF,R9,R9)); // ADD R9,R9,#0xF
 
