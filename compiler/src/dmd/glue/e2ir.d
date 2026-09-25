@@ -1925,7 +1925,9 @@ elem* toElem(Expression e, ref IRState irs)
                 default: rtlsym = RTLSYM.FMODL; break;  // real
             }
 
-            e = el_bin(OPcall,tym,el_var(getRtlsym(rtlsym)),el_param(el, er));
+            // el = fmod(el, er)
+            elem* ecall = el_bin(OPcall,tym,el_var(getRtlsym(rtlsym)),el_param(er, el_copytree(el)));
+            e = el_bin(OPeq, tym, el, ecall);
         }
         else
         {
@@ -2041,7 +2043,7 @@ elem* toElem(Expression e, ref IRState irs)
             }
 
             tym_t tym = totym(e.type);
-            elem* eresult = el_bin(OPcall,tym,el_var(getRtlsym(rtlsym)),el_param(el, er));
+            elem* eresult = el_bin(OPcall,tym,el_var(getRtlsym(rtlsym)),el_param(er, el));    // fmod(el, er)
             elem_setLoc(eresult, e.loc);
             return eresult;
         }
