@@ -26,3 +26,12 @@ void main()
 
 cdouble widen(cfloat c) { return c; }
 cfloat narrow(cdouble c) { return c; }
+
+cdouble realImag(double x, idouble y) { return x + y; }
+cdouble imagReal(idouble y, double x) { return y - x; }
+
+static this()
+{
+    assert(realImag(1, 2i) == 1 + 2i);
+    assert(imagReal(2i, 1) == -1 + 2i);
+}
