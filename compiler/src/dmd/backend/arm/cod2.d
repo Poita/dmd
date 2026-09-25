@@ -1916,6 +1916,7 @@ void cdstreq(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         cdb.gen1(INSTR.add_addsub_imm(1,0,8,Ri,Ri));    // add  Ri,Ri,#0x8 https://www.scs.stanford.edu/~zyedidia/arm64/add_addsub_imm.html
         cdb.gen1(INSTR.cmp_subs_addsub_shift(0,Rc,0,0,Ri));         // cmp  Ri,Rc
         genBranch(cdb,COND.ne,FL.code,cast(block*)L2);  // b.ne L2
+        cg.regcon.immed.mval &= ~mask(Ri);              // Ri no longer holds 0
 
         uint offset = 0;
         if (remainder & 4)
