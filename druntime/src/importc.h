@@ -224,6 +224,21 @@ typedef struct {} __SVFloat64_t;
 #undef __SIZEOF_INT128__
 #endif
 
+#if __aarch64__
+/* ImportC compiles neither GCC inline assembly nor ARM intrinsics, so hide the
+ * instruction set extensions C code tests to select them
+ */
+#undef __ARM_FEATURE_AES
+#undef __ARM_FEATURE_CRC32
+#undef __ARM_FEATURE_CRYPTO
+#undef __ARM_FEATURE_SHA2
+#undef __ARM_FEATURE_SHA3
+#undef __ARM_FEATURE_SHA512
+#undef __ARM_NEON
+#undef __ARM_NEON__
+#undef __ARM_NEON_FP
+#endif
+
 #if __ANDROID__
 #undef __SIZEOF_INT128__
 #define __GNUC_VA_LIST
