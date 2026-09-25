@@ -883,6 +883,8 @@ struct INSTR
      */
     static uint fmov_float_gen(uint sf, uint ftype, uint rmode, uint opcode, reg_t Rn, reg_t Rd)
     {
+        // single precision moves use W registers, double precision X registers
+        assert(rmode || (ftype == 0 && sf == 0) || (ftype == 1 && sf == 1) || ftype == 3);
         if (opcode == 7)
         {
             assert(Rd & 32);
