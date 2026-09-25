@@ -1608,7 +1608,7 @@ void cdcnvt(ref CGstate cg, ref CodeBuilder cdb,elem* e, ref regm_t pretregs)
                 case OPd_u16:
                     cdb.gen1(INSTR.fcvtzu(0,ftype,V1,Rd));              // fcvtzu Rd,V1
                     uint N,immr,imms;
-                    assert(encodeNImmrImms(0xFFFF,N,immr,imms));
+                    if (!encodeNImmrImms(0xFFFF,N,immr,imms)) assert(0);
                     cdb.gen1(INSTR.log_imm(0,0,0,immr,imms,Rd,Rd));     // and Rd,Rd,#0xFFFF
                     break;
                 case OPd_u32:
@@ -1653,7 +1653,7 @@ void cdcnvt(ref CGstate cg, ref CodeBuilder cdb,elem* e, ref regm_t pretregs)
                 case OPu16_d:
                     /* not executed because OPu16_d was converted to OPu16_32 then OP32_d */
                     uint N,immr,imms;
-                    assert(encodeNImmrImms(0xFFFF,N,immr,imms));
+                    if (!encodeNImmrImms(0xFFFF,N,immr,imms)) assert(0);
                     cdb.gen1(INSTR.log_imm(0,0,0,immr,imms,Rn,Rn)); // and w0,w0,#0xFFFF
                     cdb.gen1(INSTR.ucvtf_float_int(0,1,Rn,Vd));     // ucvtf d31,w0
                     break;
@@ -1840,7 +1840,7 @@ void cdshtlng(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
             {
                 //    INSTR.log_imm(sf,opc,N,immr,imms,Rn,Rd)
                 uint N,immr,imms;
-                assert(encodeNImmrImms(0xFF,N,immr,imms));
+                if (!encodeNImmrImms(0xFF,N,immr,imms)) assert(0);
                 uint ins = INSTR.log_imm(0,0,0,immr,imms,cs.reg,reg); // AND reg,cs.reg,#0xFF (N is 0 for 32 bit patterns)
                 cdb.gen1(ins);
             }
@@ -1882,7 +1882,7 @@ void cdshtlng(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
                     if (cs.reg != NOREG)
                     {
                         uint N,immr,imms;
-                        assert(encodeNImmrImms(0xFFFF,N,immr,imms));
+                        if (!encodeNImmrImms(0xFFFF,N,immr,imms)) assert(0);
                         uint ins = INSTR.log_imm(0,0,0,immr,imms,cs.reg,reg); // AND Xreg,Xcsreg,#0xFFFF
                         cdb.gen1(ins);
                     }
@@ -1925,7 +1925,7 @@ void cdshtlng(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
             if (op == OPu16_32)
             {
                 uint N,immr,imms;
-                assert(encodeNImmrImms(0xFFFF,N,immr,imms));
+                if (!encodeNImmrImms(0xFFFF,N,immr,imms)) assert(0);
                 uint ins = INSTR.log_imm(0,0,0,immr,imms,reg,reg); // AND reg,reg,#0xFFFF
                 cdb.gen1(ins);
             }
@@ -2063,7 +2063,7 @@ void cdbyteint(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         else
         {
             uint N,immr,imms;
-            assert(encodeNImmrImms(0xFF,N,immr,imms));
+            if (!encodeNImmrImms(0xFF,N,immr,imms)) assert(0);
             uint opc = (pretregs & mPSW) ? 3 : 0;
             if (sz < 8)
                 N = 0;

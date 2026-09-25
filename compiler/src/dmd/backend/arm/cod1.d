@@ -2701,7 +2701,7 @@ private void funccall(ref CGstate cg, ref CodeBuilder cdb, elem* e, uint numpara
             cdbe.gen1(INSTR.add_addsub_imm(1,0,0xF,R9,R9)); // ADD R9,R9,#0xF
 
             uint N,immr,imms;
-            assert(encodeNImmrImms(0xFFFF_FFFF_FFFF_FFF0,N,immr,imms));
+            if (!encodeNImmrImms(0xFFFF_FFFF_FFFF_FFF0,N,immr,imms)) assert(0);
             cdbe.gen1(INSTR.log_imm(1,0,N,immr,imms,R9,R9));    // AND R9,R9,#0xFFFF_FFFF_FFFF_FFF0
 
             //cg.Alloca.size = REGSIZE;

@@ -648,7 +648,7 @@ void cdnot(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         sz = tysize(e.Ety);
         cdb.gen1(INSTR.cset(sz == 8,cond,Rd));          // CSET Rd,eq
         uint N,immr,imms;
-        assert(encodeNImmrImms(0xFF,N,immr,imms));
+        if (!encodeNImmrImms(0xFF,N,immr,imms)) assert(0);
         cdb.gen1(INSTR.log_imm(0,0,0,immr,imms,Rd,Rd)); // AND Rd,Rd,#0xFF
         pretregs &= ~mPSW;                              // flags already set
         fixresult(cg,cdb,e,retregs,pretregs);
@@ -685,7 +685,7 @@ void cdnot(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         cdb.gen1(INSTR.cset(sf,cond,Rd));    // CSET Rd,EQ
 
         uint N,immr,imms;
-        assert(encodeNImmrImms(0xFF,N,immr,imms));
+        if (!encodeNImmrImms(0xFF,N,immr,imms)) assert(0);
         cdb.gen1(INSTR.log_imm(0,0,0,immr,imms,Rd,Rd)); // AND Rd,Rd,#0xFF
 
         fixresult(cg,cdb,e,retregs,pretregs);
@@ -2554,7 +2554,7 @@ void cdneg(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
             // https://www.scs.stanford.edu/~zyedidia/arm64/fmov_float_gen.html
             cdb.gen1(INSTR.fmov_float_gen(1,2,1,6,Vn,Xn)); // Top half of 128-bit to 64-bit
             uint N, immr, imms;
-            assert(encodeNImmrImms(0x8000_0000_0000_0000,N,immr,imms));
+            if (!encodeNImmrImms(0x8000_0000_0000_0000,N,immr,imms)) assert(0);
             uint sf = 1, opc = 2;
             cdb.gen1(INSTR.log_imm(sf,opc,N,immr,imms,Xn,Xn)); // https://www.scs.stanford.edu/~zyedidia/arm64/eor_log_imm.html
             cdb.gen1(INSTR.fmov_float_gen(1,2,1,7,Xn,Vn)); // 64-bit to top half of 128-bit
@@ -2631,7 +2631,7 @@ void cdabs(ref CGstate cg, ref CodeBuilder cdb,elem* e, ref regm_t pretregs)
             // https://www.scs.stanford.edu/~zyedidia/arm64/fmov_float_gen.html
             cdb.gen1(INSTR.fmov_float_gen(1,2,1,6,Vn,Xn)); // Top half of 128-bit to 64-bit
             uint N, immr, imms;
-            assert(encodeNImmrImms(0x7FFF_FFFF_FFFF_FFFF,N,immr,imms));
+            if (!encodeNImmrImms(0x7FFF_FFFF_FFFF_FFFF,N,immr,imms)) assert(0);
             uint sf = 1, opc = 0;
             cdb.gen1(INSTR.log_imm(sf,opc,N,immr,imms,Xn,Xn)); // https://www.scs.stanford.edu/~zyedidia/arm64/eor_log_imm.html
             cdb.gen1(INSTR.fmov_float_gen(1,2,1,7,Xn,Vn)); // 64-bit to top half of 128-bit

@@ -1807,7 +1807,7 @@ void assignaddrc(ref CGstate cg, code* c)
                             code* cn = code_calloc();
 
                             uint N,immr,imms;
-                            assert(encodeNImmrImms(-cast(long)STACKALIGN,N,immr,imms));
+                            if (!encodeNImmrImms(-cast(long)STACKALIGN,N,immr,imms)) assert(0);
                             cn.Iop = INSTR.log_imm(1,0,N,immr,imms,SP,SP);      // AND SP,SP,#-STACKALIGN
 
                             cn.next = c.next;
