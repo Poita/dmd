@@ -705,6 +705,17 @@ void floatOpAss(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
             case OPdivass:
                 clib = sz1 == 8 ? CLIB_A.divdc3 : CLIB_A.divsc3;
             Lclib:
+                if (!regvar)
+                {
+                    // the library function takes the imaginary part of e1 too
+                    code csi = cs;
+                    if (csi.reg == NOREG)
+                        csi.IEV1.Voffset += sz1;
+                    else
+                        csi.reg = e1.Vsym.Sregmsw;
+                    loadFromEA(csi,findreg(retregs & INSTR.MSW),sz1,sz1);
+                    cdb.gen(&csi);
+                }
                 regm_t idxregs = idxregm(cs);
                 callclib(cg,cdb,e,clib,pretregs,idxregs);
                 if (!regvar)
@@ -713,6 +724,7 @@ void floatOpAss(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
                     cdb.gen(&cs);
                     cs.IEV1.Voffset += sz1;
                 }
+                reg = findreg(retregs & INSTR.MSW);     // the imaginary part is stored below
                 break;
 
             default:
