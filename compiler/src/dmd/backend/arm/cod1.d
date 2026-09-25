@@ -600,8 +600,9 @@ void loadea(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref code cs,uint op,reg_
                 if (cg.regcon.cse.value[i] == e) // if register has elem
                 {
                     getregs(cdb, desmsk);
-                    if (i != reg)
-                        cdb.gen1(INSTR.mov_register(sz == 8,cast(reg_t)i,reg));  // MOV reg,i
+                    const tym_t tymov = mask(i) & INSTR.FLOATREGS ? (sz == 4 ? TYfloat : TYdouble)
+                                                                  : (sz == 8 ? TYllong : TYint);
+                    genmovreg(cdb, reg, cast(reg_t)i, tymov);   // MOV/FMOV reg,i
                     return;
                 }
                 rm &= ~mask(i);

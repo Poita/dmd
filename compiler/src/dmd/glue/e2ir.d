@@ -204,6 +204,31 @@ elem* elAssign(elem* e1, elem* e2, Type t, type* tx)
     return e;
 }
 
+/*****************************************
+ * Complex modulo for targets without an x87 FPREM: each part of the complex `ec`
+ * is taken modulo the real or imaginary value `ey`, using fmod().
+ * Params:
+ *      ec = complex dividend
+ *      ey = real or imaginary divisor
+ *      tym = complex result type
+ * Returns:
+ *      the complex result
+ */
+private elem* complexMod(elem* ec, elem* ey, tym_t tym)
+{
+    const tym_t tpart = _tysize[tybasic(tym)] == 8 ? TYfloat : TYdouble;
+    const RTLSYM rtlsym = tpart == TYfloat ? RTLSYM.FMODF : RTLSYM.FMOD;
+    if (tycomplex(ey.Ety))
+        ey = el_una(OPc_r, tpart, ey);
+    else
+        ey.Ety = tpart;                 // an imaginary divisor is used by its value
+    elem* ec2 = el_same(ec);
+    elem* ey2 = el_same(ey);
+    elem* re = el_bin(OPcall, tpart, el_var(getRtlsym(rtlsym)), el_param(ey, el_una(OPc_r, tpart, ec)));
+    elem* im = el_bin(OPcall, tpart, el_var(getRtlsym(rtlsym)), el_param(ey2, el_una(OPc_i, tpart, ec2)));
+    return el_bin(OPpair, tym, re, im);
+}
+
 /*******************************************************
  * Write read-only string to object file, create a local symbol for it.
  * Makes a copy of str's contents, does not keep a reference to it.
@@ -1867,6 +1892,29 @@ elem* toElem(Expression e, ref IRState irs)
 
         tym_t tym = totym(be.type);
 
+        if (op == OPmodass && target.isAArch64 && isComplex(be.e1.type))
+        {
+            /* v = cast(V)(cast(T)v % e2), with v's address evaluated once,
+             * where the cast to the operation type T may be implicit
+             */
+            Expression ev1 = be.e1;
+            while (auto ce = ev1.isCastExp())
+                ev1 = ce.e1;
+            const tym_t tyv = totym(ev1.type);
+            const tym_t tyop = totym(be.e1.type);
+            elem* ea = addressElem(toElem(ev1, irs), ev1.type.pointerTo());
+            elem* ea2 = el_same(ea);
+            elem* ex = el_una(OPind, tyv, ea2);
+            if (tyv != tyop)
+                ex = el_una(_tysize[tybasic(tyv)] < _tysize[tybasic(tyop)] ? OPf_d : OPd_f, tyop, ex);
+            ex = complexMod(ex, toElem(be.e2, irs), tyop);
+            if (tyv != tyop)
+                ex = el_una(_tysize[tybasic(tyv)] < _tysize[tybasic(tyop)] ? OPd_f : OPf_d, tyv, ex);
+            elem* e = el_bin(OPeq, tyv, el_una(OPind, tyv, ea), ex);
+            elem_setLoc(e, be.loc);
+            return e;
+        }
+
         elem* el;
         elem* ev;
         if (be.e1.op == EXP.cast_)
@@ -1922,7 +1970,6 @@ elem* toElem(Expression e, ref IRState irs)
             target.isAArch64 &&                 // x87 has FPREM instruction, others use fmod()
             isFloating(be.type))
         {
-            assert(!isComplex(be.type));
 
             tym_t tym1 = tybasic(typemask(el));
             RTLSYM rtlsym;
@@ -2034,10 +2081,15 @@ elem* toElem(Expression e, ref IRState irs)
 
     elem* visitMod(ModExp e)
     {
+        if (target.isAArch64 && isComplex(e.type))
+        {
+            elem* eresult = complexMod(toElem(e.e1, irs), toElem(e.e2, irs), totym(e.type));
+            elem_setLoc(eresult, e.loc);
+            return eresult;
+        }
         if (target.isAArch64 &&                 // x87 has FPREM instruction, others use fmod()
             isFloating(e.type))
         {
-            assert(!isComplex(e.type));
             elem* el = toElem(e.e1, irs);
             elem* er = toElem(e.e2, irs);
 
