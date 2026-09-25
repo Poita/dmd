@@ -955,6 +955,10 @@ struct INSTR
      */
     static uint fneg_float(uint ftype, reg_t Vn, reg_t Vd) { return floatdp1(0,0,ftype,2,Vn & 31,Vd & 31); }
 
+    /* FSQRT fpreg,fpreg https://www.scs.stanford.edu/~zyedidia/arm64/fsqrt_float.html
+     */
+    static uint fsqrt_float(uint ftype, reg_t Vn, reg_t Vd) { return floatdp1(0,0,ftype,3,Vn & 31,Vd & 31); }
+
     /* Floating-point compare https://www.scs.stanford.edu/~zyedidia/arm64/encodingindex.html#floatcmp
      */
     static uint floatcmp(uint M, uint S, uint ftype, reg_t Rm, uint op, reg_t Rn, uint opcode2)

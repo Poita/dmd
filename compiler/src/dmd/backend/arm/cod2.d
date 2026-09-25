@@ -2402,7 +2402,7 @@ static if (0)
 }
 
 /******************
- * OPneg, not OPsqrt OPsin OPcos OPrint
+ * OPneg, OPsqrt
  */
 
 @trusted
@@ -2428,7 +2428,13 @@ void cdneg(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         codelem(cg,cdb,e.E1,retregs,false);
         getregs(cdb,retregs);               // retregs will be destroyed
 
-        if (isPair)
+        if (e.Eoper == OPsqrt)
+        {
+            assert(!isPair && sz <= 8);
+            const Vn = findreg(retregs);
+            cdb.gen1(INSTR.fsqrt_float(INSTR.szToFtype(sz), Vn, Vn));   // FSQRT Vn,Vn
+        }
+        else if (isPair)
         {
             const szx = sz / 2;
             assert(szx != 16);              // TODO AArch64 128 bit floats
