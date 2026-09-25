@@ -608,9 +608,29 @@ private elem* initializeParamsWithArgs(elem* eargs, SYMIDX sistart, SYMIDX siend
         // s = e;
         elem* evar = el_var(s);
         elem* ex = el_copytree(e);
+        elem* eprep = null;         // evaluated before the assignment
         auto ty = tybasic(ex.Ety);
         if (szs == 3)
         {
+            ty = TYstruct;
+        }
+        else if (szs < sze && tyaggregate(s.Stype.Tty))
+        {
+            /* An aggregate argument held in a wider integer: copy only the
+             * bytes of the parameter, from memory
+             */
+            if (ex.Eoper != OPvar)
+            {
+                elem* ec = exp2_copytotemp(ex);
+                eprep = ec.E1;
+                ex = ec.E2;
+                ex.Vsym.Sfl = FL.auto_;
+                ec.E1 = null;
+                ec.E2 = null;
+                el_free(ec);
+            }
+            ex.Ety = TYstruct;
+            ex.ET = s.Stype;
             ty = TYstruct;
         }
         else if (szs < sze && sze == 4)
@@ -634,7 +654,7 @@ private elem* initializeParamsWithArgs(elem* eargs, SYMIDX sistart, SYMIDX siend
         }
         //el_settype(evar,ecopy.ET);
 
-        ecopy = el_combine(eeq, ecopy);
+        ecopy = el_combine(el_combine(eprep, eeq), ecopy);
         continue;
     }
     free(args.ptr);
