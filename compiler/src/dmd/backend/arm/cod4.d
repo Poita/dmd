@@ -515,6 +515,17 @@ void floatOpAss(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
     if (isPair)
         sz1 /= 2;
 
+    /* complex += real or imaginary: widen the right operand to a complex pair
+     * with zero for the missing part
+     */
+    if (isPair && (e.Eoper == OPaddass || e.Eoper == OPminass) && !tycomplex(e.E2.Ety))
+    {
+        Vconst zero;
+        elem* ez = el_const(sz1 == 8 ? TYdouble : TYfloat, zero);
+        e.E2 = tyimaginary(e.E2.Ety) ? el_bin(OPpair, ty1, ez, e.E2)
+                                     : el_bin(OPpair, ty1, e.E2, ez);
+    }
+
     if (e.Eoper == OPnegass)
     {
         bool regvar;
@@ -642,7 +653,7 @@ void floatOpAss(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         allocreg(cdb,retregs,ty1);
         reg = findreg(isPair ? retregs & INSTR.LSW : retregs);
         if (isPair)
-            loadFromEA(cs,reg,sz1 / 2,sz1 / 2);
+            loadFromEA(cs,reg,sz1,sz1);
         else
             loadFromEA(cs,reg,sz1,sz1);
         cdb.gen(&cs);
