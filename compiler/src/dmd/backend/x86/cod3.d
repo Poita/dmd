@@ -1412,6 +1412,14 @@ static if (NTEXCEPTIONS)
                 }
                 if (reg1 != NOREG)
                     retregs = (mask(reg1) | mask(reg2)) & ~mask(NOREG);
+                const tyr = tybasic(e.Ety);
+                if (reg1 < 32 && reg2 == NOREG && tyintegral(tyr) && _tysize[tyr] < 4)
+                {
+                    // Apple's ABI has the callee extend a narrow return value to 32 bits
+                    const imms = _tysize[tyr] == 1 ? 7 : 15;
+                    cdb.gen1(tyuns(tyr) ? INSTR.ubfm(0,0,0,imms,reg1,reg1)     // UXTB/UXTH
+                                        : INSTR.sbfm(0,0,0,imms,reg1,reg1));   // SXTB/SXTH
+                }
                 import dmd.backend.arm.cod1 : holdsAggregate;
                 if (holdsAggregate(e.Ety, e.ET) && !tyaggregate(e.Ety))
                 {

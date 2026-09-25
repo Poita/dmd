@@ -1728,7 +1728,8 @@ private elem* elor(elem* e, Goal goal)
     elem* e1 = e.E1;
     elem* e2 = e.E2;
     uint sz = tysize(e.Ety);
-    if (sz <= REGSIZE)
+    // AArch64 only rotates 32 and 64 bit registers
+    if (sz <= REGSIZE && !(config.target_cpu == TARGET_AArch64 && sz < 4))
     {
         elem* rol()
         {

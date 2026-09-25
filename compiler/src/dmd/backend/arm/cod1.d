@@ -1231,6 +1231,8 @@ void getlvalue(ref CGstate cg,ref CodeBuilder cdb,ref code pcs,elem* e,regm_t ke
                     off = tysize(ty) / 2;
                 if (e.Voffset == off && sz == off)
                     pcs.reg = s.Sregmsw;
+                if (!tyfloating(ty))
+                    pcs.Sextend = cast(ubyte)tyToExtend(ty);  // sign or zero extension
 
                 break;
             }
