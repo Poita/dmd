@@ -3847,7 +3847,7 @@ void prolog_frame(ref CGstate cg, ref CodeBuilder cdb, bool farfunc, ref uint xl
         if (cg.AArch64)
         {
             if (log) printf("prolog_frame: stp\n");
-            if (16 + xlocalsize <= 512)
+            if (16 + xlocalsize < 512)      // the reach of the LDP in the epilog
                 // STP x29,x30,[sp,#-(16+localsize)]!
                 cdb.gen1(INSTR.ldstpair_pre(2, 0, 0, (-(16 + xlocalsize) / 8) & 127, 30, 31, 29));
             else
