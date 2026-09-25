@@ -151,7 +151,7 @@ void cdeq(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
                 reg_t r = allocreg(cdb, m, tyml);
                 const p = cast(targ_size_t*) &(e2.EV);
                 if (r >= 32)
-                    loadFloatRegConst(cdb,r,e2.EV.Vdouble,sz);
+                    loadFloatRegConst(cdb,r,sz == 4 ? e2.EV.Vfloat : e2.EV.Vdouble,sz);
                 else
                     movregconst(cg,cdb,r,*p,(sz == 8) ? 64 : 0);
                 storeToEA(cs,r,sz);
