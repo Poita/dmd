@@ -80,7 +80,7 @@ public Statement inlineAsmAArch64Semantic(InlineAsmStatement s, Scope* sc)
     p.setTokenList(s.tokens, s.loc.linnum);
 
     int errors;
-    static if (0)
+    static if (1)
     {
         if (p.token.value == TOK.identifier)
         {
