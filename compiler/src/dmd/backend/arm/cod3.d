@@ -1068,7 +1068,7 @@ void epilog(ref CGstate cg, block* b)
                 {
                     genmovreg(cdbx,INSTR.SP,29);
                 }
-                if (16 + xlocalsize <= 512) // or localsize??
+                if (16 + xlocalsize < 512)     // the reach of the LDP immediate
                     cdbx.gen1(INSTR.ldstpair_post(2, 0, 1, cast(uint)(16 + localsize) / 8, 30, 31, 29)); // LDP x29,x30,[sp],#16 + localsize
                 else
                 {
