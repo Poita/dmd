@@ -1806,6 +1806,31 @@ void cdstreq(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
 
     docommas(cdb,e2);
 
+    if (e2.Eoper == OPcall && tybasic(e2.Ety) == TYstruct)
+    {
+        import dmd.backend.arm.cod1 : aarch64Aggregate, aggregateRetRegs, storeAggregateRegs, AggregateABI;
+        const a = aarch64Aggregate(e2.ET);
+        regm_t rregs = aggregateRetRegs(a);
+        if (rregs)
+        {
+            // the struct is returned in registers, store them into the destination
+            codelem(cg,cdb,e2,rregs,false);
+            regm_t dstregs = cg.allregs & ~rregs;
+            if (e1.Eoper == OPind)
+                scodelem(cg,cdb,e1.E1,dstregs,rregs,false);
+            else
+                cdrelconst(cg,cdb,e1,dstregs);
+            freenode(e1);
+            storeAggregateRegs(cdb, a, findreg(dstregs), a.kind == AggregateABI.Kind.hfa ? 32 : 0);
+            if (pretregs)
+            {
+                // the value of the assignment is the address of the destination
+                fixresult(cg,cdb,e,dstregs,pretregs);
+            }
+            return;
+        }
+    }
+
     // load pointer to rvalue into source register
     regm_t srcregs = cg.allregs & ~pretregs;
     if (!srcregs)
@@ -1874,7 +1899,7 @@ void cdstreq(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
             loadFromEA(csrc,Rv,4,4);
             cdb.genc1(csrc.Iop,0,FL.offset,offset);
             storeToEA(cdst,Rv,4);
-            cdb.genc1(csrc.Iop,0,FL.offset,offset);
+            cdb.genc1(cdst.Iop,0,FL.offset,offset);
             offset += 4;
             numbytes -= 4;
         }
@@ -1884,7 +1909,7 @@ void cdstreq(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
             loadFromEA(csrc,Rv,4,2);
             cdb.genc1(csrc.Iop,0,FL.offset,offset);
             storeToEA(cdst,Rv,2);
-            cdb.genc1(csrc.Iop,0,FL.offset,offset);
+            cdb.genc1(cdst.Iop,0,FL.offset,offset);
             offset += 2;
             numbytes -= 2;
         }
@@ -1894,7 +1919,7 @@ void cdstreq(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
             loadFromEA(csrc,Rv,4,1);
             cdb.genc1(csrc.Iop,0,FL.offset,offset);
             storeToEA(cdst,Rv,1);
-            cdb.genc1(csrc.Iop,0,FL.offset,offset);
+            cdb.genc1(cdst.Iop,0,FL.offset,offset);
         }
     }
     else

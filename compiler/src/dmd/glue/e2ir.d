@@ -5930,9 +5930,9 @@ elem* callfunc(Loc loc,
             ehidden = el_ptr(stmp);
             eresult = ehidden;
         }
-        if (irs.target.isPOSIX && tf.linkage != LINK.d)
+        if (irs.target.isPOSIX && tf.linkage != LINK.d || irs.target.isAArch64)
         {
-                // ehidden goes last on Linux/OSX C++
+                // ehidden goes last on Linux/OSX C++, and on AArch64 where it is passed in x8
         }
         else
         {
@@ -6031,6 +6031,7 @@ elem* callfunc(Loc loc,
     }
 
     ep = el_param(ep, ethis2 ? ethis2 : ethis);
+    const hiddenLast = ehidden !is null;
     if (ehidden)
         ep = el_param(ep, ehidden);     // if ehidden goes last
 
@@ -6153,6 +6154,8 @@ elem* callfunc(Loc loc,
             e = el_bin(OPcall, tyret, ec, ep);
         else
             e = el_una(OPucall, tyret, ec);
+        if (hiddenLast && irs.target.isAArch64)
+            e.Nflags |= NFLhidden;
 
         if (tf.parameterList.varargs != VarArg.none)
         {
@@ -7782,5 +7785,7 @@ elem* useOPstrpar(elem* e)
  */
 bool passTypeByRef(ref const Target target, Type t)
 {
-    return (target.isAArch64 && t.size(Loc.initial) > 16);
+    import dmd.argtypes_aarch64 : isHFVA;
+    // B.4 applies after B.2, which keeps an HFA or HVA in SIMD registers
+    return target.isAArch64 && t.size(Loc.initial) > 16 && !isHFVA(t);
 }

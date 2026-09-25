@@ -3105,6 +3105,47 @@ bool FuncParamRegs_alloc(ref CGstate cg, ref FuncParamRegs fpr, type* t, tym_t t
 
     ++fpr.i;
 
+    if (cg.AArch64 && holdsAggregate(ty, t))
+    {
+        // AAPCS64 rules for aggregates, preg1 is the first of consecutive registers.
+        // A small struct can have an integer type, and its value is in general registers
+        const a = aarch64Aggregate(t);
+        final switch (a.kind)
+        {
+            case AggregateABI.Kind.none:
+                break;
+
+            case AggregateABI.Kind.hfa:
+                if (fpr.xmmcnt + a.nregs <= fpr.numfloatregs)
+                {
+                    preg1 = fpr.floatregs[fpr.xmmcnt];
+                    if (a.nregs > 1)
+                        preg2 = fpr.floatregs[fpr.xmmcnt + 1];
+                    fpr.xmmcnt += a.nregs;
+                    return true;
+                }
+                fpr.xmmcnt = fpr.numfloatregs;  // no later argument goes in an FP register
+                return false;
+
+            case AggregateABI.Kind.gpr:
+                if (fpr.regcnt + a.nregs <= fpr.numintegerregs)
+                {
+                    preg1 = fpr.argregs[fpr.regcnt];
+                    if (a.nregs > 1)
+                        preg2 = fpr.argregs[fpr.regcnt + 1];
+                    fpr.regcnt += a.nregs;
+                    return true;
+                }
+                fpr.regcnt = fpr.numintegerregs;
+                return false;
+
+            case AggregateABI.Kind.byRef:
+                assert(fpr.regcnt < fpr.numintegerregs, "AArch64: aggregate passed by reference on the stack");
+                preg1 = fpr.argregs[fpr.regcnt++];     // pointer to a copy
+                return true;
+        }
+    }
+
     // If struct or array
     if (tyaggregate(ty))
     {

@@ -3662,7 +3662,24 @@ elem* elstruct(elem* e, Goal goal)
             goto Ldefault;
 
         L1:
-            if (ty == TYstruct || ty == TYarray)
+            if (cgstate.AArch64 && (ty == TYstruct || ty == TYarray))
+            {
+                /* The code generator passes and returns HFAs in V registers from
+                 * this X register image, which must hold all of the struct
+                 */
+                if (!targ1 && !targ2)
+                    goto Ldefault;              // passed by reference
+                if (targ1 && !targ2 && tysize(targ1.Tty) == sz)
+                    tym = targ1.Tty;            // a wrapper for a scalar
+                else if (sz <= 8)
+                {
+                    if (tym == ~0)
+                        tym = TYllong;
+                }
+                else
+                    tym = TYucent;
+            }
+            else if (ty == TYstruct || ty == TYarray)
             {
                 // This needs to match what TypeFunction::retStyle() does
                 if (config.exe == EX_WIN64)
