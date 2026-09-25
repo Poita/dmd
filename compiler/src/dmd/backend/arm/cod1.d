@@ -1472,9 +1472,10 @@ void fixresult(ref CGstate cg, ref CodeBuilder cdb, elem* e, regm_t retregs, ref
         }
         else
         {
-            reg_t reg = findreg(retregs & INSTR.ALLREGS);
+            // an integer may be wanted in a floating point register, e.g. a float's bits
+            reg_t reg = findreg(retregs & (INSTR.ALLREGS | INSTR.FLOATREGS));
             reg_t rreg = allocreg(cdb, outretregs, tym);     // allocate return regs
-            cdb.gen1(INSTR.mov_register(sz == 8,reg,rreg));  // MOV rreg,reg
+            genmovreg(cdb, rreg, reg, sz == 8 ? TYllong : TYint);  // MOV/FMOV rreg,reg
         }
         cssave(e,retregs | outretregs,false);
         // Commented out due to Bugzilla 8840

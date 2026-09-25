@@ -229,8 +229,9 @@ void cdeq(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
 
     getregs(cdb,varregm);
 
-    // A register variable may be in a register of the other kind, e.g. a double in a GP register
-    reg = findreg(retregs & (isPair ? INSTR.LSW : regvar ? INSTR.ALLREGS | INSTR.FLOATREGS : allregs));
+    // The value may be in a register of the other kind, e.g. a double in a GP register
+    // or a float's bits as an integer in a floating point register
+    reg = findreg(retregs & (isPair ? INSTR.LSW : INSTR.ALLREGS | INSTR.FLOATREGS));
     IopSave = cs.Iop;
     storeToEA(cs,reg,isPair ? sz / 2 : sz);
     cdb.gen(&cs);
