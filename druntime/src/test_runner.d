@@ -1,6 +1,13 @@
 import core.runtime, core.time : MonoTime;
 import core.stdc.stdio : printf;
 
+version (DigitalMars) version (AArch64)
+{
+    // DMD has no AArch64 inline assembler
+    extern (C) nothrow @nogc uint _d_aarch64_get_fpcr();
+    extern (C) nothrow @nogc void _d_aarch64_set_fpcr(uint value);
+}
+
 version (ARM)     version = ARM_Any;
 version (AArch64) version = ARM_Any;
 
@@ -139,6 +146,9 @@ void disableFPUFastMode()
     }
     else version (AArch64)
     {
+        version (DigitalMars)
+            _d_aarch64_set_fpcr(_d_aarch64_get_fpcr() & ~(1 << 25));
+        else
         asm
         {
             "mrs %0, fpcr
@@ -166,6 +176,9 @@ void restoreFPUMode()
     }
     else version (AArch64)
     {
+        version (DigitalMars)
+            _d_aarch64_set_fpcr(_d_aarch64_get_fpcr() | (1 << 25));
+        else
         asm
         {
             "mrs %0, fpcr
