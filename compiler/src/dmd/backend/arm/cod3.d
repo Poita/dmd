@@ -1720,7 +1720,7 @@ void movregconstant(ref CodeBuilder cdb,reg_t reg,ulong value,uint sf)
     {
         // Check for ORR one instruction solution
         uint N, immr, imms;
-        if (orr_solution(value2, N, immr, imms)) // TODO AArch64 not implemented yet
+        if (orr_solution(value, sf, N, immr, imms))
         {
             // MOV reg,#imm
             // http://www.scs.stanford.edu/~zyedidia/arm64/mov_orr_log_imm.html
@@ -1748,6 +1748,7 @@ void movregconstant(ref CodeBuilder cdb,reg_t reg,ulong value,uint sf)
  * See if we can do MOV (bitmask, immediate) out of value.
  * Params:
  *      value = value to set register to
+ *      sf = 1 for a 64 bit register, 0 for 32 bits
  *      N = N field
  *      immr = immr field
  *      imms = imms field
@@ -1759,10 +1760,11 @@ void movregconstant(ref CodeBuilder cdb,reg_t reg,ulong value,uint sf)
  *      . https://dinfuehr.github.io/blog/encoding-of-immediate-values-on-aarch64/
  *      . https://gist.github.com/dinfuehr/51a01ac58c0b23e4de9aac313ed6a06a
  */
-bool orr_solution(ulong value, out uint N, out uint immr, out uint imms)
+bool orr_solution(ulong value, uint sf, out uint N, out uint immr, out uint imms)
 {
-    // TODO AArch64
-    return false;
+    if (!sf)
+        value = (value & 0xFFFF_FFFF) | (value << 32);  // a 32 bit pattern repeats in both halves
+    return encodeNImmrImms(value, N, immr, imms) && (sf || N == 0);
 }
 
 /********************************************
