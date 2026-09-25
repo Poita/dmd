@@ -159,22 +159,6 @@ void outdata(Symbol* s)
                             assert(config.objfmt == OBJ_MACH && I64);
                             goto case;
                         case mTYthread:
-                        if (config.objfmt == OBJ_MACH && config.target_cpu == TARGET_AArch64)
-                        {
-                            // Special handling
-                            import dmd.backend.machobj : MachObj_thread_vars;
-                            targ_size_t offseti;
-                            int segi = MachObj_thread_vars(*s, offseti, true);
-                            dt_writeToObj(objmod, dt, segi, offseti); // need to align first?
-                            Offset(segi) = offseti;
-                            s.Sfl = FL.tlsdata;
-                            //              if (s.Sclass == SC.global || s.Sclass == SC.static_)
-                            //                  objmod.pubdefsize(seg,s,s.Soffset,datasize);    // do the definition
-
-                            // BUG AArch64: symbolic debug info?
-                            dt_free(dtstart);
-                            return;
-                        }
                         {   seg_data* pseg = objmod.tlsseg_bss();
                             s.Sseg = pseg.SDseg;
                             objmod.data_start(s, datasize, pseg.SDseg);
@@ -288,22 +272,6 @@ void outdata(Symbol* s)
         }
         case mTYthread:
         {
-            if (config.objfmt == OBJ_MACH && config.target_cpu == TARGET_AArch64)
-            {
-                // Special handling
-                import dmd.backend.machobj : MachObj_thread_vars;
-                targ_size_t offseti;
-                int segi = MachObj_thread_vars(*s, offseti, false);
-                dt_writeToObj(objmod, dtstart, segi, offseti);
-                Offset(segi) = offseti;
-                dt_free(dtstart);
-
-//              if (s.Sclass == SC.global || s.Sclass == SC.static_)
-//                  objmod.pubdefsize(seg,s,s.Soffset,datasize);    // do the definition
-
-                // BUG AArch64: symbolic debug info?
-                return;
-            }
             seg_data* pseg = objmod.tlsseg();
             s.Sseg = pseg.SDseg;
             objmod.data_start(s, datasize, s.Sseg);
