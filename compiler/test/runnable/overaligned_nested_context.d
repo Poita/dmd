@@ -1,4 +1,5 @@
 // Nested structs with over-aligned fields reach their enclosing frame through a context pointer.
+import core.lifetime : move;
 void test()
 {
     int i;
