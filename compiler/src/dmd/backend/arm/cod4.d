@@ -1681,17 +1681,21 @@ void cdcnvt(ref CGstate cg, ref CodeBuilder cdb,elem* e, ref regm_t pretregs)
             const tym = tybasic(e.Ety);
             reg_t Vd = allocreg(cdb,retregs,tym);       // destination floating point register
 
-            switch (e.Eoper)
+            void convert(reg_t Vn, reg_t Vd)
             {
-                case OPd_f:     // fcvt s31,d31
-                    cdb.gen1(INSTR.fcvt_float(1,4,V1,Vd));
-                    break;
-                case OPf_d:     // fcvt d31,s31
-                    cdb.gen1(INSTR.fcvt_float(0,5,V1,Vd));
-                    break;
-                default:
-                    assert(0);
+                if (e.Eoper == OPd_f)
+                    cdb.gen1(INSTR.fcvt_float(1,4,Vn,Vd));      // fcvt Sd,Dn
+                else
+                    cdb.gen1(INSTR.fcvt_float(0,5,Vn,Vd));      // fcvt Dd,Sn
             }
+            if (tycomplex(tym))
+            {
+                // convert the real and imaginary parts
+                convert(findreg(retregs1 & INSTR.LSW), findreg(retregs & INSTR.LSW));
+                convert(findreg(retregs1 & INSTR.MSW), findreg(retregs & INSTR.MSW));
+            }
+            else
+                convert(V1, Vd);
 
             fixresult(cg,cdb,e,retregs,pretregs);
             break;

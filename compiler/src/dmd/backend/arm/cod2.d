@@ -118,6 +118,57 @@ void cdorth(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
 
     if (tyfloating(ty1))
     {
+        if (isPair && !(tycomplex(ty1) && tycomplex(ty2)))
+        {
+            /* A complex and a real or imaginary operand: the real one only changes
+             * the real part, the imaginary one only the imaginary part
+             */
+            assert(e.Eoper == OPadd || e.Eoper == OPmin);
+            const ftype = INSTR.szToFtype(sz / 2);
+            const reg_t Rdre = findreg(retregs & INSTR.LSW);
+            const reg_t Rdim = findreg(retregs & INSTR.MSW);
+            const bool sub = e.Eoper == OPmin;
+            void arith(reg_t Rd, reg_t Rn, reg_t Rm)
+            {
+                cdb.gen1(sub ? INSTR.fsub_float(ftype,Rm,Rn,Rd)   // FSUB Rd,Rn,Rm
+                             : INSTR.fadd_float(ftype,Rm,Rn,Rd)); // FADD Rd,Rn,Rm
+            }
+            if (tycomplex(ty1))
+            {
+                const reg_t Rnre = findreg(retregs1 & INSTR.LSW);
+                const reg_t Rnim = findreg(retregs1 & INSTR.MSW);
+                if (tyimaginary(ty2))
+                {
+                    arith(Rdim, Rnim, Rm);
+                    cdb.gen1(INSTR.fmov(ftype,Rnre,Rdre));        // FMOV Rdre,Rnre
+                }
+                else
+                {
+                    arith(Rdre, Rnre, Rm);
+                    cdb.gen1(INSTR.fmov(ftype,Rnim,Rdim));        // FMOV Rdim,Rnim
+                }
+            }
+            else
+            {
+                const reg_t Rmre = findreg(retregs2 & INSTR.LSW);
+                const reg_t Rmim = findreg(retregs2 & INSTR.MSW);
+                if (tyimaginary(ty1))
+                {
+                    arith(Rdim, Rn, Rmim);
+                    cdb.gen1(sub ? INSTR.fneg_float(ftype,Rmre,Rdre)  // FNEG Rdre,Rmre
+                                 : INSTR.fmov(ftype,Rmre,Rdre));      // FMOV Rdre,Rmre
+                }
+                else
+                {
+                    arith(Rdre, Rn, Rmre);
+                    cdb.gen1(sub ? INSTR.fneg_float(ftype,Rmim,Rdim)  // FNEG Rdim,Rmim
+                                 : INSTR.fmov(ftype,Rmim,Rdim));      // FMOV Rdim,Rmim
+                }
+            }
+            pretregs = retregs | PSW;
+            fixresult(cg,cdb,e,retregs,pretregs);
+            return;
+        }
         if (isPair)
         {
             assert(sz != 32);           // TODO AArch64
