@@ -965,6 +965,17 @@ void cdshass(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
     {
         Rshiftee = cs.reg;
         retregs = mask(Rshiftee);
+        /* A narrow register variable's upper bits are unspecified,
+         * so extend it before shifting those bits in from the left
+         */
+        if (sz < 4 && (e.Eoper == OPshrass || e.Eoper == OPashrass))
+        {
+            getregs(cdb,retregs);
+            const imms = sz == 1 ? 7 : 15;
+            cdb.gen1(e.Eoper == OPashrass
+                ? INSTR.sbfm(0,0,0,imms,Rshiftee,Rshiftee)     // SXTB/SXTH
+                : INSTR.ubfm(0,0,0,imms,Rshiftee,Rshiftee));   // UXTB/UXTH
+        }
     }
     else
     {
