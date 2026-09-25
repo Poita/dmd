@@ -5773,7 +5773,9 @@ void cod3_adjSymOffsets(ref CGstate cg)
             case SC.regpar:
             case SC.shadowreg:
 //printf("s = '%s', Soffset = x%x, Para.size = x%x, EBPtoESP = x%x\n", s.Sident, s.Soffset, cg.Para.size, cg.EBPtoESP);
-                s.Soffset += cg.Para.size;
+                // AArch64 frames keep the saved frame pointer and return address below the locals
+                if (!cg.AArch64)
+                    s.Soffset += cg.Para.size;
                 if (0 && !(funcsym_p.Sfunc.Fflags & Fmember))
                 {
                     if (!cg.hasframe)
