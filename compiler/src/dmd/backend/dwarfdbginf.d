@@ -678,7 +678,9 @@ static if (1)
          */
 
         const bool AArch64 = AArch64();
-        const bool AppleAArch64 = AArch64 && config.objfmt == OBJ_MACH;
+        // Apple's zPR variant (LSDA in the compact unwind entry) is not used,
+        // AArch64 Mach-O describes frames and LSDAs entirely in __eh_frame
+        const bool AppleAArch64 = false;
 
         const uint startsize = cast(uint)buf.length();
 
@@ -739,16 +741,9 @@ static if (1)
             {
                 personality_pointer_encoding =
                            DW_EH_PE_indirect | DW_EH_PE_pcrel | DW_EH_PE_sdata4;
-                if (AArch64)
-                {
-                    LSDA_pointer_encoding    = DW_EH_PE_pcrel | DW_EH_PE_sdata4;
-                    address_pointer_encoding = DW_EH_PE_pcrel | DW_EH_PE_sdata4;
-                }
-                else
-                {
-                    LSDA_pointer_encoding    = DW_EH_PE_pcrel | DW_EH_PE_ptr;
-                    address_pointer_encoding = DW_EH_PE_pcrel | DW_EH_PE_ptr;
-                }
+                // dwarf_eh_frame_fixup() writes pointer sized pc relative addresses
+                LSDA_pointer_encoding    = DW_EH_PE_pcrel | DW_EH_PE_ptr;
+                address_pointer_encoding = DW_EH_PE_pcrel | DW_EH_PE_ptr;
             }
             if (AppleAArch64)
             {
@@ -925,12 +920,12 @@ static if (1)
             43                DW_CFA_advance_loc 3 ; advance 12 bytes
             */
             int off = 2 * REGSIZE + xlocalsize;
-            dwarf_CFA_set_loc(1);
-            dwarf_CFA_set_reg_offset(INSTR.SP, off); // CFA is now 8[SP]
+            dwarf_CFA_set_loc(4);             // address after STP x29,x30,[sp,#-off]!
+            dwarf_CFA_set_reg_offset(INSTR.SP, off); // CFA is now off[SP]
             dwarf_CFA_offset(INSTR.BP, -off); // BP is at 0[SP]
             dwarf_CFA_offset(30, -(8 + xlocalsize));
-            dwarf_CFA_set_reg_offset(INSTR.BP, off);      // CFA is now 0[BP]
-            dwarf_CFA_set_loc(4);             // address after MOV BP,SP
+            dwarf_CFA_set_loc(8);             // address after MOV x29,SP
+            dwarf_CFA_set_reg_offset(INSTR.BP, off);      // CFA is now off[BP]
             cfa_offset = off;  // remember the difference between the CFA and the frame pointer
         }
         else
@@ -1049,8 +1044,7 @@ static if (1)
             }
             if (config.objfmt == OBJ_MACH)
             {
-                ubyte len = config.target_cpu == TARGET_AArch64 ? 4 :
-                              I64 ? 8 : 4;
+                ubyte len = I64 ? 8 : 4;
                 buf.writeByten(len);                   // Augmentation Data Length goes here
 //printf("1buf.length: x%zx %s %s\n", buf.length(), sfunc.Sfunc.LSDAsym.Sident.ptr, fdesym.Sident.ptr);
                 dwarf_eh_frame_fixup(dfseg, buf.length(), sfunc.Sfunc.LSDAsym, 0, fdesym);
@@ -1087,13 +1081,23 @@ static if (1)
         uint functionEncoding = funcsym_p.Sfunc.Fflags & Fhasframe
                     ? UNWIND_ARM64_MODE_FRAME           // standard stack frame
                     : UNWIND_ARM64_MODE_FRAMELESS;      // no stack frame
+
+        // Functions with exception handling tables need the personality routine and their LSDA
+        Symbol* lsda = sfunc.Sfunc.LSDAsym;
+        if (lsda)
+            functionEncoding |= UNWIND_HAS_LSDA;
         buf.write32(functionEncoding);                  // functionEncoding
 
-        //mach_dwarf_reftoident(dfseg, buf.length(), personality, 0);   // personality
-        buf.write64(0);
-
-        //mach_dwarf_reftoident(dfseg, buf.length(), sfunc.Sfunc.LSDAsym, 0, sfunc);    // LSDA
-        buf.write64(0);
+        if (lsda)
+        {
+            MachObj_reftoident(dfseg, buf.length(), personality, 0, CF.offset64);    // personality
+            MachObj_reftoident(dfseg, buf.length(), lsda, 0, CF.offset64);           // LSDA
+        }
+        else
+        {
+            buf.write64(0);                             // personality
+            buf.write64(0);                             // LSDA
+        }
     }
 
     public
@@ -1118,10 +1122,7 @@ static if (1)
             CIE_offset_unwind = ~0;
             CIE_offset_no_unwind = ~0;
             //dwarf_except_table_alloc();
-            if (config.objfmt == OBJ_MACH && AArch64())
-                dwarf_compact_unwind_alloc();
-            else
-                dwarf_eh_frame_alloc();
+            dwarf_eh_frame_alloc();
         }
         if (!config.fulltypes)
             return;
@@ -1862,16 +1863,6 @@ static if (1)
 
         if (config.ehmethod == EHmethod.EH_DWARF)
         {
-            if (config.objfmt == OBJ_MACH && AArch64())
-            {
-                bool ehunwind = doUnwindEhFrame();
-                IDXSEC dfseg = dwarf_compact_unwind_alloc();
-                OutBuffer* buf = SegData[dfseg].SDbuf;
-                buf.reserve(32 * 10);    // 32 bytes per instance of struct compact_unwind_entry
-
-                writeCompactUnwindEntry(*buf, dfseg, sfunc, getRtlsymPersonality(), ehunwind);
-            }
-            else
             {
                 bool ehunwind = doUnwindEhFrame();
 

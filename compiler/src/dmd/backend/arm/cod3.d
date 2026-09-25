@@ -536,12 +536,10 @@ void prolog_saveregs(ref CGstate cg, ref CodeBuilder cdb, regm_t topush, int cfa
             : INSTR.str_imm_gen(1, reg, fp, gpoffset);            // STR reg,[fp,#offset]
         cdb.gen1(ins);
 
-        if (0) // TODO AArch64
         if (config.fulltypes == CVDWARF_C || config.fulltypes == CVDWARF_D ||
             config.ehmethod == EHmethod.EH_DWARF)
         {   // Emit debug_frame data giving location of saved register
             code* c = cdb.finish();
-            pinholeopt(c, null);
             dwarf_CFA_set_loc(calcblksize(c));  // address after save
             dwarf_CFA_offset(reg, cast(int)(gpoffset - cfa_offset));
             cdb.reset();
