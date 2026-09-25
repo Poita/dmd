@@ -463,7 +463,7 @@ void cddiv(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
     // http://www.scs.stanford.edu/~zyedidia/arm64/sdiv.html
     // http://www.scs.stanford.edu/~zyedidia/arm64/udiv.html
 
-    bool sf = sz == 8;
+    bool sf = _tysize[ty1] == 8;         // OPremquo's type is the pair of results
 
     // DIV Rd, Rn, Rm
     uint ins = INSTR.sdiv_udiv(sf, uns, Rdivisor, Rdividend, Rquo);
