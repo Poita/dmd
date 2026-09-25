@@ -436,7 +436,7 @@ static if (1)
         int dw_reg = dwarf_regno(reg);
         if (CFA_state_current.regstates[dw_reg].offset != offset)
         {
-            if (offset <= 0)
+            if (offset <= 0 && dw_reg < 0x40)     // DW_CFA_offset encodes the register in 6 bits
             {
                 cfa_buf.writeByte(cast(ubyte)(DW_CFA_offset + dw_reg));
                 cfa_buf.writeuLEB128(offset / -OFFSET_FAC);
