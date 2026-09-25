@@ -133,7 +133,38 @@ void cdorth(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
                 cdb.gen1(sub ? INSTR.fsub_float(ftype,Rm,Rn,Rd)   // FSUB Rd,Rn,Rm
                              : INSTR.fadd_float(ftype,Rm,Rn,Rd)); // FADD Rd,Rn,Rm
             }
-            if (tycomplex(ty1))
+            if (!tycomplex(ty1) && !tycomplex(ty2))
+            {
+                // a real and an imaginary operand make the two parts
+                const bool imag1 = tyimaginary(ty1) != 0;
+                const reg_t RdL = imag1 ? Rdim : Rdre;     // part from the left operand
+                const reg_t RdR = imag1 ? Rdre : Rdim;     // part from the right operand
+                void right()
+                {
+                    cdb.gen1(sub ? INSTR.fneg_float(ftype,Rm,RdR)   // FNEG RdR,Rm
+                                 : INSTR.fmov(ftype,Rm,RdR));       // FMOV RdR,Rm
+                }
+                if (RdR == Rn && RdL == Rm)
+                {
+                    // the parts swap registers, so go through a scratch register
+                    regm_t scratch = INSTR.FLOATREGS & ~(retregs | retregs1 | retregs2);
+                    const reg_t Vt = allocreg(cdb, scratch, TYdouble);
+                    cdb.gen1(INSTR.fmov(ftype,Rn,Vt));              // FMOV Vt,Rn
+                    right();
+                    cdb.gen1(INSTR.fmov(ftype,Vt,RdL));             // FMOV RdL,Vt
+                }
+                else if (RdR == Rn)
+                {
+                    cdb.gen1(INSTR.fmov(ftype,Rn,RdL));             // FMOV RdL,Rn
+                    right();
+                }
+                else
+                {
+                    right();
+                    cdb.gen1(INSTR.fmov(ftype,Rn,RdL));             // FMOV RdL,Rn
+                }
+            }
+            else if (tycomplex(ty1))
             {
                 const reg_t Rnre = findreg(retregs1 & INSTR.LSW);
                 const reg_t Rnim = findreg(retregs1 & INSTR.MSW);
