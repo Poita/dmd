@@ -74,8 +74,12 @@ void loadFromEA(ref code cs, reg_t reg, uint szw, uint szr)
         {
             if (cs.reg != reg)  // do not mov onto itself
             {
-                assert(cs.reg & 32);
-                if (szw == 16)
+                if (!(cs.reg & 32))     // a floating point variable held in a general register
+                {
+                    uint ftype = INSTR.szToFtype(szw);
+                    cs.Iop = INSTR.fmov_float_gen(szw == 8,ftype,0,7,cs.reg,reg); // FMOV reg,cs.reg
+                }
+                else if (szw == 16)
                     cs.Iop = INSTR.mov_orr_advsimd_reg(1,cs.reg,reg); // MOV Vd.16b,Vn.16b
                 else
                 {
@@ -109,6 +113,13 @@ void loadFromEA(ref code cs, reg_t reg, uint szw, uint szr)
     }
 
     bool signExtend = (cs.Sextend & 4) != 0; // SXTB, SXTH, SXTW, SXTX
+
+    if (cs.reg != NOREG && cs.reg & 32)     // an integer held in a floating point register
+    {
+        cs.Iop = INSTR.fmov_float_gen(szw == 8,INSTR.szToFtype(szw == 8 ? 8 : 4),0,6,cs.reg,reg); // FMOV reg,cs.reg
+        cs.IFL1 = FL.unde;
+        return;
+    }
 
     if (cs.reg != NOREG)
     {
@@ -214,13 +225,17 @@ void storeToEA(ref code cs, reg_t reg, uint sz)
         {
             if (cs.reg != reg)  // do not mov onto itself
             {
-                assert(cs.reg & 32);
-                if (sz == 16)
+                if (!(cs.reg & 32))     // a floating point variable held in a general register
+                {
+                    uint ftype = INSTR.szToFtype(sz);
+                    cs.Iop = INSTR.fmov_float_gen(sz == 8,ftype,0,6,reg,cs.reg); // FMOV cs.reg,reg
+                }
+                else if (sz == 16)
                     cs.Iop = INSTR.mov_orr_advsimd_reg(1,reg,cs.reg); // MOV Vd.16b,Vn.16b
                 else
                 {
                     uint ftype = INSTR.szToFtype(sz);
-                    cs.Iop = INSTR.fmov(ftype,cs.reg,reg);  // FMOV reg,cs.reg
+                    cs.Iop = INSTR.fmov(ftype,reg,cs.reg);  // FMOV cs.reg,reg
                 }
             }
             cs.IFL1 = FL.unde;
@@ -243,7 +258,9 @@ void storeToEA(ref code cs, reg_t reg, uint sz)
 
     if (cs.reg != NOREG)
     {
-        if (cs.reg != reg)  // do not mov onto itself
+        if (cs.reg & 32)        // an integer held in a floating point register
+            cs.Iop = INSTR.fmov_float_gen(sz == 8,INSTR.szToFtype(sz == 8 ? 8 : 4),0,7,reg,cs.reg); // FMOV cs.reg,reg
+        else if (cs.reg != reg)  // do not mov onto itself
             cs.Iop = INSTR.mov_register(sz == 8,reg,cs.reg);  // MOV cs.reg,reg
         cs.IFL1 = FL.unde;
     }
@@ -1444,7 +1461,7 @@ void fixresult(ref CGstate cg, ref CodeBuilder cdb, elem* e, regm_t retregs, ref
             uint ftype = INSTR.szToFtype(sz);
             if (Vn < 32) // move integer to float
             {
-                cdb.gen1(INSTR.fmov_float_gen(1,ftype,0,7,Vn,Vd));   // FMOV Vd,Rn https://www.scs.stanford.edu/~zyedidia/arm64/fmov_float_gen.html
+                cdb.gen1(INSTR.fmov_float_gen(ftype == 1,ftype,0,7,Vn,Vd));   // FMOV Vd,Rn https://www.scs.stanford.edu/~zyedidia/arm64/fmov_float_gen.html
             }
             else // move float to float
             {
