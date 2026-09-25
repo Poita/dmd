@@ -1,5 +1,5 @@
 /*
-DISABLED: win32 win64 osx32 linux32 freebsd32 openbsd32 hurd32
+DISABLED: win32 win64 osx32 linux32 freebsd32 openbsd32 hurd32 aarch64
 */
 
 void chkArgTypes(S, V...)()

@@ -212,8 +212,13 @@ void test2()
     {
         float f = float.infinity;
         int i = cast(int) f;
-        assert(i == cast(int)float.max);
-        assert(i == 0x80000000);
+        version (AArch64)
+            assert(i == int.max);       // FCVTZS saturates
+        else
+        {
+            assert(i == cast(int)float.max);
+            assert(i == 0x80000000);
+        }
     }
 }
 

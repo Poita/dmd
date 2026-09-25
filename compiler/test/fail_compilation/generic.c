@@ -28,7 +28,7 @@ int test4()
         long double: 5,
         double: 4);
 }
-_Static_assert(test4() == 4 + (sizeof(long double) == 8), "in");
+_Static_assert(test4() == 4 + _Generic((long double)0, double: 1, default: 0), "in");
 
 #line 100
 
