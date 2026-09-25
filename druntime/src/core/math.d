@@ -31,6 +31,36 @@ nothrow:
 @safe:
 
 pure:
+
+// DMD has no AArch64 instructions for these intrinsics, so they call the C library
+version (DigitalMars) version (AArch64) version = LibmFallback;
+
+version (LibmFallback)
+private extern (C) @trusted
+{
+    pragma(mangle, "cosf")    float  c_cosf(float x);
+    pragma(mangle, "cos")     double c_cos(double x);
+    pragma(mangle, "cosl")    real   c_cosl(real x);
+    pragma(mangle, "sinf")    float  c_sinf(float x);
+    pragma(mangle, "sin")     double c_sin(double x);
+    pragma(mangle, "sinl")    real   c_sinl(real x);
+    pragma(mangle, "llrintf") long   c_llrintf(float x);
+    pragma(mangle, "llrint")  long   c_llrint(double x);
+    pragma(mangle, "llrintl") long   c_llrintl(real x);
+    pragma(mangle, "ldexpf")  float  c_ldexpf(float n, int exp);
+    pragma(mangle, "ldexp")   double c_ldexp(double n, int exp);
+    pragma(mangle, "ldexpl")  real   c_ldexpl(real n, int exp);
+    pragma(mangle, "rintf")   float  c_rintf(float x);
+    pragma(mangle, "rint")    double c_rint(double x);
+    pragma(mangle, "rintl")   real   c_rintl(real x);
+    pragma(mangle, "log2f")   float  c_log2f(float x);
+    pragma(mangle, "log2")    double c_log2(double x);
+    pragma(mangle, "log2l")   real   c_log2l(real x);
+    pragma(mangle, "log1pf")  float  c_log1pf(float x);
+    pragma(mangle, "log1p")   double c_log1p(double x);
+    pragma(mangle, "log1pl")  real   c_log1pl(real x);
+}
+
 /***********************************
  * Returns cosine of x. x is in radians.
  *
@@ -43,9 +73,18 @@ pure:
  *      Results are undefined if |x| >= $(POWER 2,64).
  */
 
+version (LibmFallback)
+{
+float cos(float x) { return c_cosf(x); }
+double cos(double x) { return c_cos(x); }
+real cos(real x) { return c_cosl(x); }
+}
+else
+{
 float cos(float x);     /* intrinsic */
 double cos(double x);   /* intrinsic */ /// ditto
 real cos(real x);       /* intrinsic */ /// ditto
+}
 
 /***********************************
  * Returns sine of x. x is in radians.
@@ -60,9 +99,18 @@ real cos(real x);       /* intrinsic */ /// ditto
  *      Results are undefined if |x| >= $(POWER 2,64).
  */
 
+version (LibmFallback)
+{
+float sin(float x) { return c_sinf(x); }
+double sin(double x) { return c_sin(x); }
+real sin(real x) { return c_sinl(x); }
+}
+else
+{
 float sin(float x);     /* intrinsic */
 double sin(double x);   /* intrinsic */ /// ditto
 real sin(real x);       /* intrinsic */ /// ditto
+}
 
 /*****************************************
  * Returns x rounded to a long value using the current rounding mode.
@@ -71,9 +119,18 @@ real sin(real x);       /* intrinsic */ /// ditto
  * indeterminate.
  */
 
+version (LibmFallback)
+{
+long rndtol(float x) { return c_llrintf(x); }
+long rndtol(double x) { return c_llrint(x); }
+long rndtol(real x) { return c_llrintl(x); }
+}
+else
+{
 long rndtol(float x);   /* intrinsic */
 long rndtol(double x);  /* intrinsic */ /// ditto
 long rndtol(real x);    /* intrinsic */ /// ditto
+}
 
 /***************************************
  * Compute square root of x.
@@ -95,9 +152,18 @@ real sqrt(real x);      /* intrinsic */ /// ditto
  * References: frexp
  */
 
+version (LibmFallback)
+{
+float ldexp(float n, int exp) { return c_ldexpf(n, exp); }
+double ldexp(double n, int exp) { return c_ldexp(n, exp); }
+real ldexp(real n, int exp) { return c_ldexpl(n, exp); }
+}
+else
+{
 float ldexp(float n, int exp);   /* intrinsic */
 double ldexp(double n, int exp); /* intrinsic */ /// ditto
 real ldexp(real n, int exp);     /* intrinsic */ /// ditto
+}
 
 unittest {
     static if (real.mant_dig == 113)
@@ -154,14 +220,35 @@ unittest {
  * $(B nearbyint) performs
  * the same operation, but does not set the FE_INEXACT exception.
  */
+version (LibmFallback)
+{
+float rint(float x) { return c_rintf(x); }
+double rint(double x) { return c_rint(x); }
+real rint(real x) { return c_rintl(x); }
+}
+else
+{
 float rint(float x);    /* intrinsic */
 double rint(double x);  /* intrinsic */ /// ditto
 real rint(real x);      /* intrinsic */ /// ditto
+}
 
 /***********************************
  * Building block functions, they
  * translate to a single x87 instruction.
  */
+version (LibmFallback)
+{
+private enum real LOG2E = 0x1.71547652b82fe1777d0ffda0d23a8p+0L; // 1 / ln(2)
+float yl2x(float x, float y) { return y * c_log2f(x); }
+double yl2x(double x, double y) { return y * c_log2(x); }
+real yl2x(real x, real y) { return y * c_log2l(x); }
+float yl2xp1(float x, float y) { return y * c_log1pf(x) * cast(float) LOG2E; }
+double yl2xp1(double x, double y) { return y * c_log1p(x) * cast(double) LOG2E; }
+real yl2xp1(real x, real y) { return y * c_log1pl(x) * LOG2E; }
+}
+else
+{
 // y * log2(x)
 float yl2x(float x, float y);    /* intrinsic */
 double yl2x(double x, double y);  /* intrinsic */ /// ditto
@@ -170,6 +257,7 @@ real yl2x(real x, real y);      /* intrinsic */ /// ditto
 float yl2xp1(float x, float y);    /* intrinsic */
 double yl2xp1(double x, double y);  /* intrinsic */ /// ditto
 real yl2xp1(real x, real y);      /* intrinsic */ /// ditto
+}
 
 unittest
 {
