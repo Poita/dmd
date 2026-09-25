@@ -3333,7 +3333,9 @@ private elem* elind(elem* e, Goal goal)
     switch (e1.Eoper)
     {
         case OPrelconst:
-            if (sytab[e1.Vsym.Sclass] & SCDATA && e1.Vsym.Sfl != FL.func && cgstate.AArch64)
+            // AArch64 addresses data through a register, other than a function being called
+            if (sytab[e1.Vsym.Sclass] & SCDATA && cgstate.AArch64 &&
+                (e1.Vsym.Sfl != FL.func || !tyfunc(tym)))
                 break;
             e.E1.ET = e.ET;
             e = el_selecte1(e);
