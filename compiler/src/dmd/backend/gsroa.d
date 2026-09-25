@@ -389,8 +389,16 @@ if (enable) // disable while we test the inliner
             case SC.auto_:
             case SC.shadowreg:
             case SC.parameter:
+                // AArch64 passes a sliceable parameter in two general registers
+                if (config.target_cpu == TARGET_AArch64 &&
+                    (s.Sclass == SC.fastpar || s.Sclass == SC.shadowreg) &&
+                    (s.Spreg >= 32 || s.Spreg2 == NOREG || s.Spreg2 >= 32))
+                {
+                    if (log) printf(" can't because not in two general registers\n");
+                    sia[si].canSlice = false;
+                }
                 // We can't slice whole XMM registers
-                if (tyxmmreg(s.Stype.Tty) &&
+                else if (tyxmmreg(s.Stype.Tty) &&
                     isXMMreg(s.Spreg) && s.Spreg2 == NOREG)
                 {
                     if (log) printf(" can't because XMM reg\n");
