@@ -4956,6 +4956,35 @@ void prolog_loadparams(ref CGstate cg, ref CodeBuilder cdb, tym_t tyf, bool push
         }
         // MOV reg,param[BP]
         //assert(refparam);
+        if (cg.AArch64)
+        {
+            // LDR reg,[X16] where X16 = address of the parameter above the frame
+            import dmd.backend.arm.cod3 : genaddimm;
+            enum reg_t R16 = 16;
+            assert(cg.hasframe && !cg.enforcealign);
+            genaddimm(cdb, R16, 29, cast(uint)(s.Soffset + localsize + 16));    // ADD X16,BP,#offset
+            void load(reg_t reg, uint size, uint offset)
+            {
+                if (reg & 32)
+                {
+                    uint szf, opc;
+                    INSTR.szToSizeOpcLdr(size, szf, opc);
+                    cdb.gen1(INSTR.ldr_imm_fpsimd(szf, opc, offset / size, R16, reg));  // LDR Vreg,[X16,#offset]
+                }
+                else if (size >= 4)
+                    cdb.gen1(INSTR.ldr_imm_gen(size == 8, reg, R16, offset));          // LDR reg,[X16,#offset]
+                else
+                    cdb.gen1(INSTR.ldst_pos(size == 2 ? 1 : 0, 0, 1, offset / size, R16, reg)); // LDRB/LDRH reg,[X16,#offset]
+            }
+            if (sz > REGSIZE)
+            {
+                load(s.Sreglsw, REGSIZE, 0);
+                load(s.Sregmsw, sz - REGSIZE, REGSIZE);
+            }
+            else
+                load(s.Sreglsw, sz, 0);
+            continue;
+        }
         if (mask(s.Sreglsw) & XMMREGS)
         {
             const op = xmmload(s.Stype.Tty);  // MOVSS/D xreg,mem
