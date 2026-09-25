@@ -1892,10 +1892,11 @@ elem* toElem(Expression e, ref IRState irs)
 
         tym_t tym = totym(be.type);
 
-        if (op == OPmodass && target.isAArch64 && isComplex(be.e1.type))
+        if (op == OPmodass && target.isAArch64 && isFloating(be.e1.type))
         {
             /* v = cast(V)(cast(T)v % e2), with v's address evaluated once,
-             * where the cast to the operation type T may be implicit
+             * where the cast to the operation type T may be implicit.
+             * There is no floating point remainder instruction, it's fmod().
              */
             Expression ev1 = be.e1;
             while (auto ce = ev1.isCastExp())
@@ -1907,7 +1908,14 @@ elem* toElem(Expression e, ref IRState irs)
             elem* ex = el_una(OPind, tyv, ea2);
             if (tyv != tyop)
                 ex = el_una(_tysize[tybasic(tyv)] < _tysize[tybasic(tyop)] ? OPf_d : OPd_f, tyop, ex);
-            ex = complexMod(ex, toElem(be.e2, irs), tyop);
+            elem* ey = toElem(be.e2, irs);
+            if (tycomplex(tyop))
+                ex = complexMod(ex, ey, tyop);
+            else
+            {
+                const rtlsym = _tysize[tybasic(tyop)] == 4 ? RTLSYM.FMODF : RTLSYM.FMOD;
+                ex = el_bin(OPcall, tyop, el_var(getRtlsym(rtlsym)), el_param(ey, ex));
+            }
             if (tyv != tyop)
                 ex = el_una(_tysize[tybasic(tyv)] < _tysize[tybasic(tyop)] ? OPd_f : OPf_d, tyv, ex);
             elem* e = el_bin(OPeq, tyv, el_una(OPind, tyv, ea), ex);
@@ -1965,29 +1973,7 @@ elem* toElem(Expression e, ref IRState irs)
         }
         elem* er = toElem(be.e2, irs);
 
-        elem* e;
-        if (op == OPmodass &&
-            target.isAArch64 &&                 // x87 has FPREM instruction, others use fmod()
-            isFloating(be.type))
-        {
-
-            tym_t tym1 = tybasic(typemask(el));
-            RTLSYM rtlsym;
-            switch (_tysize[tym1])
-            {
-                case 4:  rtlsym = RTLSYM.FMODF; break;  // float
-                case 8:  rtlsym = RTLSYM.FMOD ; break;  // double
-                default: rtlsym = RTLSYM.FMODL; break;  // real
-            }
-
-            // el = fmod(el, er)
-            elem* ecall = el_bin(OPcall,tym,el_var(getRtlsym(rtlsym)),el_param(er, el_copytree(el)));
-            e = el_bin(OPeq, tym, el, ecall);
-        }
-        else
-        {
-            e = el_bin(op, tym, el, er);
-        }
+        elem* e = el_bin(op, tym, el, er);
         e = el_combine(e, ev);
         elem_setLoc(e,be.loc);
         return e;
