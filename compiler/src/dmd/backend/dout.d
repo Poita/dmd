@@ -1176,6 +1176,8 @@ Symbol* out_readonly_sym(tym_t ty, void[] data)
         s = symboldata(Offset(DATA),ty | mTYconst);
         s.Sseg = DATA;
         objmod.write_bytes(SegData[DATA], data);
+        if (config.target_cpu == TARGET_AArch64)
+            objmod.pubdef(DATA, s, s.Soffset);  // AArch64 relocations refer to a symbol, not a section
         //printf("s.Sseg = %d:x%x\n", s.Sseg, s.Soffset);
     }
 
