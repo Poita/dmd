@@ -192,9 +192,12 @@ void codgenx(ref CGstate cg, Symbol* sfunc)
                     case SC.fastpar:
                     case SC.shadowreg:
                         // only parameters in allocatable registers can be used from there,
-                        // not e.g. the AArch64 hidden return pointer in x8
-                        cg.regcon.params |= s.Spregm() &
-                            (cg.AArch64 ? INSTR.ALLREGS | INSTR.FLOATREGS : ~cast(regm_t)0);
+                        // not e.g. the AArch64 hidden return pointer in x8,
+                        // and not ones whose address is taken, as writes through it
+                        // leave the register stale
+                        if (!cg.AArch64 || s.Sflags & SFLdistinct)
+                            cg.regcon.params |= s.Spregm() &
+                                (cg.AArch64 ? INSTR.ALLREGS | INSTR.FLOATREGS : ~cast(regm_t)0);
                         goto case SC.parameter;
 
                     case SC.parameter:
