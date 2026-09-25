@@ -1812,7 +1812,7 @@ void cdstreq(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
     if (e1.Eoper == OPvar)
         e1.Vsym.Sflags |= SFLread;
 
-    if (e2.Eoper == OPcall && tyaggregate(e2.Ety))
+    if (OTcall(e2.Eoper) && tyaggregate(e2.Ety))
     {
         import dmd.backend.arm.cod1 : aarch64Aggregate, aggregateRetRegs, storeAggregateRegs, AggregateABI;
         const a = aarch64Aggregate(e2.ET);
