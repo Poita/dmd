@@ -6170,7 +6170,9 @@ elem* callfunc(Loc loc,
             {
                 const length = tf.parameterList.length;
                 assert(length < ubyte.max); // 254 should be enough for anybody
-                e.numParams = cast(ubyte)(tf.parameterList.length + 1); // +1 means variadic
+                // the hidden _arguments and this/context arguments are named parameters too
+                const named = length + tf.isDstyleVariadic() + ((ethis || ethis2) ? 1 : 0);
+                e.numParams = cast(ubyte)(named + 1); // +1 means variadic
             }
         }
     }
