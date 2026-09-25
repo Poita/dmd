@@ -2514,9 +2514,18 @@ void cdfunc(ref CGstate cg, ref CodeBuilder cdb, elem* e, ref regm_t pretregs)
                 scodelem(cg, cdb, ep, rregs, keepmsk, false);
                 getregs(cdb, regs);
                 const reg_t r0 = agg.kind == AggregateABI.Kind.hfa ? 32 : 0;
-                foreach (k; 0 .. agg.nregs)
-                    genmovreg(cdb, cast(reg_t)(preg + k), cast(reg_t)(r0 + k),
-                              agg.kind == AggregateABI.Kind.hfa ? (agg.esz == 4 ? TYfloat : TYdouble) : TYnptr);
+                const tym_t tyr = agg.kind == AggregateABI.Kind.hfa ? (agg.esz == 4 ? TYfloat : TYdouble) : TYnptr;
+                // copy downward when the ranges overlap with preg above r0, so no source is overwritten first
+                if (preg > r0)
+                {
+                    foreach_reverse (k; 0 .. agg.nregs)
+                        genmovreg(cdb, cast(reg_t)(preg + k), cast(reg_t)(r0 + k), tyr);
+                }
+                else
+                {
+                    foreach (k; 0 .. agg.nregs)
+                        genmovreg(cdb, cast(reg_t)(preg + k), cast(reg_t)(r0 + k), tyr);
+                }
             }
             else
             {
