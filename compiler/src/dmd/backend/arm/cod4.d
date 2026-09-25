@@ -1877,6 +1877,8 @@ void cdshtlng(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
                     }
                     else
                     {
+                        // zero extend whatever the signedness of the operand's type
+                        cs.Sextend = cast(ubyte)((cs.Sextend & 8) | Extend.UXTH);  // preserve S bit
                         loadFromEA(cs,reg,4,2);                 // LDRH Wreg,[sp,#8]
                         cdb.gen(&cs);
                     }
@@ -1916,6 +1918,8 @@ void cdshtlng(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
                 uint ins = INSTR.log_imm(0,0,0,immr,imms,reg,reg); // AND reg,reg,#0xFFFF
                 cdb.gen1(ins);
             }
+            else if (op == OPs16_32)
+                cdb.gen1(INSTR.sxth_sbfm(0, reg, reg));  // SXTH Wreg,Wreg
             else
             {
                 uint ins = INSTR.sxtw_sbfm(reg, reg);   // SXTW reg,reg
