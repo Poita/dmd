@@ -140,19 +140,20 @@ void cdeq(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
             {
                 getregs(cdb, mask(cs.reg));
                 const p = cast(targ_size_t*) &(e2.EV);
-                movregconst(cg,cdb,cs.reg,*p,sz == 8);
+                movregconst(cg,cdb,cs.reg,*p,(sz == 8) ? 64 : 0);
             }
             else
             {
                 /* Move constant into r, then store r into EA
                  */
                 regm_t m = allregs;
-                m &= ~(mask(cs.base) | mask(cs.index));
+                const regm_t addrregs = mask(cs.base) | mask(cs.index);   // the EA's registers stay live
+                m &= ~addrregs;
                 assert(NOREG < 64);  // otherwise mask(NOREG) will not work
                 reg_t r = allocreg(cdb, m, tyml);
                 const p = cast(targ_size_t*) &(e2.EV);
                 if (r >= 32)
-                    loadFloatRegConst(cdb,r,sz == 4 ? e2.EV.Vfloat : e2.EV.Vdouble,sz);
+                    loadFloatRegConst(cdb,r,sz == 4 ? e2.EV.Vfloat : e2.EV.Vdouble,sz,addrregs);
                 else
                     movregconst(cg,cdb,r,*p,(sz == 8) ? 64 : 0);
                 storeToEA(cs,r,sz);

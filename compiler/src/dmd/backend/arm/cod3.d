@@ -1529,7 +1529,7 @@ void genmovreg(ref CodeBuilder cdb, reg_t to, reg_t from, tym_t ty = TYMAX)
  *      sz = 4 for float, 8 for double
  */
 @trusted
-void loadFloatRegConst(ref CodeBuilder cdb, reg_t vreg, double value, uint sz)
+void loadFloatRegConst(ref CodeBuilder cdb, reg_t vreg, double value, uint sz, regm_t keep = 0)
 {
     //printf("loadFloatRegConst(vreg: %d, value: %g, sz: %u)\n", vreg, value, sz);
     assert(vreg & 32);
@@ -1545,7 +1545,7 @@ void loadFloatRegConst(ref CodeBuilder cdb, reg_t vreg, double value, uint sz)
     {
         float f = value;
         uint i = *cast(uint*)&f;
-        regm_t retregs = INSTR.ALLREGS;
+        regm_t retregs = INSTR.ALLREGS & ~keep;
         reg_t reg = allocreg(cdb, retregs, TYint);
         movregconst(cdb,reg,i,0);                         // MOV reg,i
         cdb.gen1(INSTR.fmov_float_gen(0,0,0,7,reg,vreg)); // FMOV Sd,Wn
@@ -1553,7 +1553,7 @@ void loadFloatRegConst(ref CodeBuilder cdb, reg_t vreg, double value, uint sz)
     else if (sz == 8)
     {
         ulong i = *cast(ulong*)&value;
-        regm_t retregs = INSTR.ALLREGS;
+        regm_t retregs = INSTR.ALLREGS & ~keep;
         reg_t reg = allocreg(cdb, retregs, TYllong);
         movregconst(cdb,reg,i,64);                        // MOV reg,i
         cdb.gen1(INSTR.fmov_float_gen(1,1,0,7,reg,vreg)); // FMOV Dd,Xn
