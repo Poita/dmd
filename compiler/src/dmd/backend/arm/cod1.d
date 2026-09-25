@@ -1386,6 +1386,15 @@ void tstresult(ref CGstate cg, ref CodeBuilder cdb, regm_t regm, tym_t tym, bool
             cdb.gen1(INSTR.fcmp_float(ftype,0,reg));    // FCMP Vn,#0.0
         }
     }
+    else if (sz > REGSIZE)
+    {
+        // a register pair is zero only when both halves are
+        enum reg_t R17 = 17;
+        const reg_t lsw = findreg(regm & INSTR.LSW);
+        const reg_t msw = findreg(regm & INSTR.MSW);
+        cdb.gen1(INSTR.orr_shifted_register(1,0,msw,0,lsw,R17));  // ORR X17,lsw,msw
+        gentstreg(cdb,R17,1);                                       // CMP X17,#0
+    }
     else
         gentstreg(cdb,reg,sz == 8);                 // CMP reg,#0
     code_orflag(cdb.last(),CF.psw);
