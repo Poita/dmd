@@ -1075,8 +1075,10 @@ void cdcmp(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         reverse ^= 1;
     }
 
-    /* See if we should swap operands     */
-    if (e1.Eoper == OPvar && e2.Eoper == OPvar && evalinregister(e2))
+    /* See if we should swap operands; the integer compare puts them back in order,
+     * the floating point one does not
+     */
+    if (e1.Eoper == OPvar && e2.Eoper == OPvar && evalinregister(e2) && !tyfloating(e1.Ety))
     {
         e1 = e.E2;
         e2 = e.E1;
