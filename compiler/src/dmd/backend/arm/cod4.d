@@ -366,7 +366,7 @@ void cdaddass(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         // negate reg
         uint sf = sz == 8;
         uint S = forccs != 0;
-        uint ins = INSTR.neg_sub_addsub_shift(sf,S,0,reg,0,cs.reg);
+        uint ins = INSTR.neg_sub_addsub_shift(sf,S,0,reg,0,reg);
         cdb.gen1(ins);
         storeToEA(cs, reg, sz);
         cdb.gen(&cs);
