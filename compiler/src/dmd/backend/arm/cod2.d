@@ -387,6 +387,21 @@ Extend tyToExtend(tym_t ty)
 }
 
 /*****************************
+ * Returns: `e` if it is complex, otherwise a complex of type `tyc` with `e` as
+ * its real or imaginary part and zero for the other.
+ */
+@trusted
+private elem* widenToComplex(elem* e, tym_t tyc)
+{
+    if (tycomplex(e.Ety))
+        return e;
+    Vconst zero;
+    elem* ez = el_const(_tysize[tybasic(e.Ety)] == 4 ? TYfloat : TYdouble, zero);
+    return tyimaginary(e.Ety) ? el_bin(OPpair, tyc, ez, e)
+                              : el_bin(OPpair, tyc, e, ez);
+}
+
+/*****************************
  * Handle multiply, OPmul
  */
 
@@ -403,6 +418,12 @@ void cdmul(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         pretregs = 0;                          // in case they got set
         codelem(cg,cdb,e2,pretregs,false);
         return;
+    }
+
+    if (tycomplex(e.Ety))
+    {
+        e.E1 = e1 = widenToComplex(e1, e.Ety);
+        e.E2 = e2 = widenToComplex(e2, e.Ety);
     }
 
     const ty = tybasic(e.Ety);
@@ -476,18 +497,8 @@ void cddiv(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
 
     if (tycomplex(e.Ety))
     {
-        // widen a real or imaginary operand to complex with a zero part
-        static elem* widen(elem* ex, tym_t tyc)
-        {
-            if (tycomplex(ex.Ety))
-                return ex;
-            Vconst zero;
-            elem* ez = el_const(_tysize[tybasic(ex.Ety)] == 4 ? TYfloat : TYdouble, zero);
-            return tyimaginary(ex.Ety) ? el_bin(OPpair, tyc, ez, ex)
-                                       : el_bin(OPpair, tyc, ex, ez);
-        }
-        e.E1 = e1 = widen(e1, e.Ety);
-        e.E2 = e2 = widen(e2, e.Ety);
+        e.E1 = e1 = widenToComplex(e1, e.Ety);
+        e.E2 = e2 = widenToComplex(e2, e.Ety);
     }
 
     const ty = tybasic(e.Ety);
