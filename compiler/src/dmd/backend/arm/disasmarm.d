@@ -2166,7 +2166,7 @@ void disassemble(uint c) @trusted
         uint Rn     = field(ins, 9, 5);
         uint Rd     = field(ins, 4, 0);
 
-        static immutable string[20] fops = ["fmov",  "fabs",    "fneg",    "fqsrt",   "fcvt",
+        static immutable string[20] fops = ["fmov",  "fabs",    "fneg",    "fsqrt",   "fcvt",
                                             "fcvt",  "",        "fcvt",    "frintn",  "frintp",
                                             "frintm","frintz",  "frinta",  "",        "frintx",
                                             "frinti","frint32z","frint32x","frint64z","frint64x"];
@@ -3248,7 +3248,7 @@ unittest
 unittest
 {
     int line64 = __LINE__;
-    string[100] cases64 =      // 64 bit code gen
+    string[102] cases64 =      // 64 bit code gen
     [
         "1E 61 04 00         fccmp  d0,d1,#0x0,eq",
         "1E 65 64 A0         fccmp  d5,d5,#0x0,vs",
@@ -3272,6 +3272,8 @@ unittest
         "D4 20 00 20         brk    #1",
         "D6 3F 00 00         blr    x0",
         "1E 21 43 FF         fneg   s31,s31",
+        "1E 21 C0 00         fsqrt  s0,s0",
+        "1E 61 C3 FF         fsqrt  d31,d31",
         "1E 3F 23 D0         fcmpe  s30,s31",
         "1E 62 00 1F         scvtf  d31,w0",
         "1E 63 00 1F         ucvtf  d31,w0",
