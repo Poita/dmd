@@ -887,13 +887,39 @@ else version (AArch64)
     // time counter (it is a counter of CPU cycles, where here we want a time clock).
     // Also, priviledged execution rights are needed to enable correct counting with
     // ldc.intrinsics.llvm_readcyclecounter on AArch64.
-    extern (D) void QueryPerformanceCounter(timer_t* ctr)
+    version (DigitalMars)
     {
-        asm { "mrs %0, cntvct_el0" : "=r" (*ctr); }
+        extern (D) void QueryPerformanceCounter(timer_t* ctr)
+        {
+            asm
+            {
+                naked;
+                op 0xD53BE041;          // MRS x1,cntvct_el0
+                op 0xF9000001;          // STR x1,[x0]
+                op 0xD65F03C0;          // RET
+            }
+        }
+        extern (D) void QueryPerformanceFrequency(timer_t* freq)
+        {
+            asm
+            {
+                naked;
+                op 0xD53BE001;          // MRS x1,cntfrq_el0
+                op 0xF9000001;          // STR x1,[x0]
+                op 0xD65F03C0;          // RET
+            }
+        }
     }
-    extern (D) void QueryPerformanceFrequency(timer_t* freq)
+    else
     {
-        asm { "mrs %0, cntfrq_el0" : "=r" (*freq); }
+        extern (D) void QueryPerformanceCounter(timer_t* ctr)
+        {
+            asm { "mrs %0, cntvct_el0" : "=r" (*ctr); }
+        }
+        extern (D) void QueryPerformanceFrequency(timer_t* freq)
+        {
+            asm { "mrs %0, cntfrq_el0" : "=r" (*freq); }
+        }
     }
 }
 else version (LDC)
