@@ -470,10 +470,20 @@ public int runLINK(bool verbose, ErrorSink eSink)
             argv.push("arm64");
         }
         else if (target.isX86_64)
-            argv.push("-m64");
+        {
+            // clang on an Apple Silicon host needs -arch, -m64 would still mean arm64
+            if (target.os == Target.OS.OSX)
+            {
+                argv.push("-arch");
+                argv.push("x86_64");
+            }
+            else
+                argv.push("-m64");
+        }
         else
             argv.push("-m32");
-        version (OSX)
+        // AArch64 relies on compact unwind info, there is no __eh_frame
+        version (OSX) if (!target.isAArch64)
         {
             /* Without this switch, ld generates messages of the form:
              * ld: warning: could not create compact unwind for __Dmain: offset of saved registers too far to encode

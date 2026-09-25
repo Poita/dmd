@@ -980,32 +980,40 @@ void MachObj_term(const(char)[] objfilename)
                                 printf("%d:x%04llx isCode %x : targseg %d targsym %s REL%s subtractor %d\n", seg, r.offset, pseg.isCode(), r.targseg, s ? s.Sident.ptr : "0", rs, r.subtractor);
                             }
                             //printf("rel1\n");
+                            // value = s - funcsym + addend, where funcsym marks the start of the FDE
+                            long addend = r.funcsym.Soffset - r.offset;    // makes the result pc relative
                             rel.r_type = ARM64_RELOC_SUBTRACTOR;
                             rel.r_address = cast(int)r.offset;
                             rel.r_pcrel = 0;
                             rel.r_length = 3;
-                            rel.r_extern = s.Sclass == SC.locstat ? 0 : 1;
-                            if (rel.r_extern == 1)
+                            rel.r_extern = 1;
+                            rel.r_symbolnum = r.funcsym.Sxtrnnum;
+                            assert(rel.r_symbolnum < nsyms);
+                            machobj.fobjbuf.write(&rel, rel.sizeof);
+                            foffset += rel.sizeof;
+                            ++nreloc;
+
+                            rel.r_type = ARM64_RELOC_UNSIGNED;
+                            if (s.Sclass != SC.locstat)
                             {
+                                rel.r_extern = 1;
                                 rel.r_symbolnum = s.Sxtrnnum;
                                 assert(rel.r_symbolnum < nsyms);
                             }
                             else
                             {
+                                // relocate relative to the local symbol's section
+                                rel.r_extern = 0;
                                 rel.r_symbolnum = segToSect[s.Sseg];
                                 assert(rel.r_symbolnum < SegData.length);
+                                addend += machobj.section_64s[SegData[s.Sseg].SDshtidx].addr + s.Soffset;
                             }
-                            machobj.fobjbuf.write(&rel, rel.sizeof);
-                            foffset += (rel).sizeof;
-                            ++nreloc;
-
-                            rel.r_type = ARM64_RELOC_UNSIGNED;
                             machobj.fobjbuf.write(&rel, rel.sizeof);
                             foffset += rel.sizeof;
                             ++nreloc;
 
-                            // patch with fdesym.Soffset - offset
-                            *pvalue += r.funcsym.Soffset - r.offset;
+                            // writing the relocations may have moved fobjbuf, so get the address again
+                            *cast(long*)patchAddr64(seg, r.offset) += addend;
                             continue;
                         }
                         else if (pseg.isCode())
