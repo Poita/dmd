@@ -702,7 +702,12 @@ private int tryMain(const(char)[][] argv, out Param params)
     {
 
     // Do pass 3 semantic analysis
-    foreach (m; modules)
+    if (workers.isChild)
+    {
+        import dmd.parallel : semantic3Shared;
+        semantic3Shared(workers, modules);
+    }
+    else foreach (m; modules)
     {
         if (params.v.verbose)
             eSink.message(Loc.initial, "semantic3 %s", m.toChars());

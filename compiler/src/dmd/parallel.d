@@ -2,13 +2,13 @@
  * Split the semantic3, inlining and code generation of the root modules across
  * forked worker processes.
  *
- * After semantic2 the modules are divided into chunks of about equal source size,
- * and one process per chunk carries on compiling only that chunk. Each worker writes
- * its output (an object file or a library) with a part suffix, and the first worker,
- * which is the original process, waits for the others and combines the parts into
- * the requested output. Declarations are fully analyzed before the split, so every
- * worker sees the same symbols; a template instance can end up generated in more than
- * one part, which is harmless as template instances are weak definitions.
+ * After semantic2 the original process forks worker processes, which take the
+ * modules one at a time, largest first, and carry on compiling the modules they take.
+ * Each worker writes its output (an object file or a library) with a part suffix, and
+ * the original process waits for the workers and combines the parts into the requested
+ * output. Declarations are fully analyzed before the split, so every worker sees the
+ * same symbols; a template instance can end up generated in more than one part, which
+ * is harmless as template instances are weak definitions.
  *
  * Copyright:   Copyright (C) 1999-2026 by The D Language Foundation, All Rights Reserved
  * License:     $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0)
@@ -26,9 +26,46 @@ import dmd.root.filename;
 
 version (Posix)
 {
+    import core.sys.posix.sys.mman : mmap, MAP_ANON, MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE;
     import core.sys.posix.sys.types : pid_t;
     import core.sys.posix.sys.wait : waitpid, WIFEXITED, WEXITSTATUS;
     import core.sys.posix.unistd : dup2, fork, _exit, sysconf, execvp, _SC_NPROCESSORS_ONLN;
+}
+
+/**************************************
+ * In a worker, run semantic3 on the modules it takes from those not yet taken by
+ * any worker, largest first, so that faster workers take more of them.
+ * Params:
+ *      w = the split
+ *      modules = the root modules; narrowed to those this worker takes
+ */
+void semantic3Shared(ref Workers w, ref Modules modules) @system
+{
+    import core.atomic : atomicFetchAdd;
+    import dmd.semantic3 : semantic3;
+
+    auto taken = new bool[modules.length];
+    while (true)
+    {
+        const i = atomicFetchAdd(*w.next, 1);
+        if (i >= w.order.length)
+            break;
+        const j = w.order[i];
+        taken[j] = true;
+        modules[j].semantic3(null);
+    }
+    size_t k = 0;
+    foreach (j; 0 .. modules.length)
+    {
+        if (taken[j])
+            modules[k++] = modules[j];
+        else
+        {
+            w.others ~= modules[j];
+            w.seen ~= w.membersAtSplit[j];
+        }
+    }
+    modules.setDim(k);
 }
 
 /**************************************
@@ -81,7 +118,10 @@ struct Workers
     int index = -1;         /// in a worker, its number; -1 in the original process
     int count;              /// number of workers started, 0 if the compilation is not split
     bool succeeded;         /// in the original process: every worker wrote its output part
-    Module[] others;        /// in a worker: the root modules of the other workers
+    shared(size_t)* next;   /// the position in `order` of the next module to take, shared by the workers
+    size_t[] order;         /// indices of the root modules, largest first
+    size_t[] membersAtSplit;/// the number of members of each root module when the split happened
+    Module[] others;        /// in a worker: the root modules other workers take
     size_t[] seen;          /// how many members of each of `others` have been looked at
 
     /// Returns: true if this is a forked worker
@@ -114,7 +154,7 @@ version (Posix)
  * process, still in its state from before the split, then compiles all the modules
  * itself, so that diagnostics are exactly those of an unsplit compilation.
  * Params:
- *      modules = the root modules; in a worker, narrowed to its chunk
+ *      modules = the root modules
  *      requested = number of workers asked for, 0 for one per processor
  * Returns:
  *      the split
@@ -130,7 +170,7 @@ Workers split(ref Modules modules, uint requested)
         if (n < 2)
             return w;
 
-        /* Assign the largest modules first, each to the least loaded chunk
+        /* Workers take the largest modules first
          */
         auto order = new size_t[modules.length];
         foreach (i, ref o; order)
@@ -146,17 +186,13 @@ Workers split(ref Modules modules, uint requested)
         }
         qsort(order.ptr, order.length, size_t.sizeof, &cmp);
 
-        auto chunkOf = new int[modules.length];
-        auto load = new size_t[n];
-        foreach (i; order)
-        {
-            size_t best = 0;
-            foreach (k; 1 .. n)
-                if (load[k] < load[best])
-                    best = k;
-            chunkOf[i] = cast(int)best;
-            load[best] += weight(modules[i]);
-        }
+        void* next = mmap(null, size_t.sizeof, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+        if (next == MAP_FAILED)
+            return w;
+        w.next = cast(shared(size_t)*)next;
+        w.order = order;
+        foreach (m; modules)
+            w.membersAtSplit ~= m.members ? m.members.length : 0;
 
         fflush(stdout);
         fflush(stderr);
@@ -189,18 +225,6 @@ Workers split(ref Modules modules, uint requested)
         if (w.isChild)
         {
             w.count = cast(int)n;
-            size_t j = 0;
-            foreach (i; 0 .. modules.length)
-            {
-                if (chunkOf[i] == w.index)
-                    modules[j++] = modules[i];
-                else
-                {
-                    w.others ~= modules[i];
-                    w.seen ~= modules[i].members ? modules[i].members.length : 0;
-                }
-            }
-            modules.setDim(j);
             return w;
         }
 
@@ -263,12 +287,17 @@ private void readResult(FILE* result)
         global.params.libfiles.push(buf + i);
 }
 
-/// Returns: the names of the output parts of `count` workers writing `file`
+/// Returns: the names of the output parts written by `count` workers writing `file`;
+/// a worker that took no modules writes none
 const(char)[][] partNames(const(char)[] file, int count)
 {
     const(char)[][] parts;
     foreach (k; 0 .. count)
-        parts ~= file ~ partSuffix(k);
+    {
+        const p = file ~ partSuffix(k);
+        if (FileName.exists(p) == 1)
+            parts ~= p;
+    }
     return parts;
 }
 
