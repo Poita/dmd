@@ -9,6 +9,9 @@ pragma(inline, false) uint  k6() { return 0xFFF0_0FFF; }
 pragma(inline, false) ulong k7() { return 0x1234_5678_9ABC_DEF0; }
 pragma(inline, false) uint  k8() { return 0x8000_0001; }
 pragma(inline, false) int   k9() { return 0x3333_3333; }
+pragma(inline, false) ulong k10() { return 0x6161_6161_6161_6161; }   // not a bitmask immediate
+pragma(inline, false) uint  k11() { return 0x6161_6161; }
+pragma(inline, false) ulong k12() { return 0x0000_0000_8000_0000; }
 
 void main()
 {
@@ -22,4 +25,12 @@ void main()
     assert(k7() == 0x1234_5678_9ABC_DEF0 * one);
     assert(k8() == 0x8000_0001 * cast(uint) one);
     assert(k9() == 0x3333_3333 * cast(int) one);
+    // byte by byte, as the expected constant would load the same way
+    const v10 = k10();
+    foreach (i; 0 .. 8)
+        assert(((v10 >> (i * 8)) & 0xFF) == 0x61);
+    const v11 = k11();
+    foreach (i; 0 .. 4)
+        assert(((v11 >> (i * 8)) & 0xFF) == 0x61);
+    assert(k12() == 0x8000_0000 * one);
 }

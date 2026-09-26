@@ -1632,6 +1632,7 @@ bool encodeNImmrImms(ulong value, out uint N, out uint immr, out uint imms)
 {
     if (value == 0 || value == ~0L)
         return false;
+    const ulong original = value;
 
     /* `size` is the number of bits in the pattern
      */
@@ -1725,7 +1726,32 @@ bool encodeNImmrImms(ulong value, out uint N, out uint immr, out uint imms)
     immr = ((size - rotation) & (size - 1)) & 0x3F;
     imms = ((~(size - 1) << 1) | (numOnes - 1)) & 0x3F;
     N = size == 64;
-    return true;
+
+    /* The encoding is only valid if it decodes back to the original: a single
+     * rotated run of ones repeated to fill 64 bits
+     */
+    const ulong emask = size == 64 ? ~0UL : (1UL << size) - 1;
+    const ulong run = (1UL << numOnes) - 1;
+    const r = immr % size;
+    ulong elem = r ? ((run >> r) | (run << (size - r))) & emask : run;
+    ulong decoded = elem;
+    for (uint sz = size; sz < 64; sz *= 2)
+        decoded |= decoded << sz;
+    return decoded == original;
+}
+
+unittest
+{
+    uint N,immr,imms;
+    assert(!encodeNImmrImms(0x6161_6161_6161_6161,N,immr,imms));   // two runs of ones per byte
+    assert(!encodeNImmrImms(0x1234_5678_9ABC_DEF0,N,immr,imms));
+}
+
+unittest
+{
+    uint N,immr,imms;
+    assert(encodeNImmrImms(0x8000_0000,N,immr,imms));
+    assert(encodeNImmrImms(0xFFF0_0FFF_FFF0_0FFF,N,immr,imms));
 }
 
 unittest
