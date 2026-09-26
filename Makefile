@@ -172,7 +172,7 @@ dmd-pgo: $(BUILD_EXE) $(RUN_EXE) ../phobos
 	cd $(GENERATED) && $(LDC_PROFDATA) merge --output=merged.profdata --input-files=profraw_list.rsp
 	cd $(GENERATED) && xargs $(RM) < profraw_list.rsp && $(RM) profraw_list.rsp
 	@echo "PGO step 4/4: Building PGO+LTO'd compiler"
-	$(BUILD_EXE) ENABLE_RELEASE=1 ENABLE_LTO=1 DFLAGS='-fprofile-use=$(abspath $(GENERATED))/merged.profdata $(HOST_DFLAGS)' dmd --force
+	$(BUILD_EXE) ENABLE_RELEASE=1 ENABLE_LTO=1 DFLAGS='-fprofile-use=$(abspath $(GENERATED))/merged.profdata --no-pgo-warn-mismatch $(HOST_DFLAGS)' dmd --force
 	$(RM) $(GENERATED)/merged.profdata
 
 endif # ldmd2
