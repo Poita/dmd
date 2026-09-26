@@ -1378,9 +1378,11 @@ static if (1)
 
             debug_info.buf.writeStringz(filename);             // DW_AT_name
 
-            char* cwd = getcwd(null, 0);
+            // The compiler does not change directory, so getcwd(), which is slow, is called once
+            __gshared const(char)* cwd;
+            if (!cwd)
+                cwd = getcwd(null, 0);
             debug_info.buf.writeStringz(cwd);                  // DW_AT_comp_dir as DW_FORM_string
-            free(cwd);
 
             append_addr(debug_info.buf, 0);               // DW_AT_low_pc
             append_addr(debug_info.buf, 0);               // DW_AT_entry_pc
