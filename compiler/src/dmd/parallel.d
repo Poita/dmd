@@ -367,12 +367,8 @@ void exitWorker(bool ok)
         if (fflush(resultFile) != 0)
             ok = false;
     }
-    fflush(stdout);
-    fflush(stderr);
-    version (Posix)
-        _exit(ok ? 0 : 1);
-    else
-        exit(ok ? 0 : 1);
+    // exit() rather than _exit(), so that an instrumented compiler writes its profile
+    exit(ok ? 0 : 1);
 }
 
 /* Add the library files a worker reported to the link.
