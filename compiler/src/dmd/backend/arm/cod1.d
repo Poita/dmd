@@ -3098,11 +3098,26 @@ private void movParams(ref CGstate cg, ref CodeBuilder cdb, elem* e, uint funcar
     const tym_t tym = tybasic(e.Ety);
     if (tyaggregate(tym))
     {
-        // copy the aggregate to [SP + funcargtos]
         enum reg_t R16 = 16;
+        const size = cast(uint)type_size(e.ET);
+        e = evalToAggregate(cg, cdb, e, 0);
+        if (OTcall(e.Eoper))
+        {
+            const agg = aarch64Aggregate(e.ET);
+            regm_t rregs = aggregateRetRegs(agg);
+            if (rregs)
+            {
+                // the aggregate comes back in registers, store them to [SP + funcargtos]
+                scodelem(cg, cdb, e, rregs, 0, false);
+                genaddimm(cdb, R16, INSTR.SP, funcargtos);          // ADD X16,SP,#funcargtos
+                storeAggregateRegs(cdb, agg, R16, agg.kind == AggregateABI.Kind.hfa ? 32 : 0);
+                return;
+            }
+        }
+        // copy the aggregate to [SP + funcargtos]
         const Rs = aggregateAddress(cg, cdb, e, 0);
         genaddimm(cdb, R16, INSTR.SP, funcargtos);                  // ADD X16,SP,#funcargtos
-        copyBytes(cdb, Rs, R16, cast(uint)type_size(e.ET));
+        copyBytes(cdb, Rs, R16, size);
         return;
     }
     bool isPair = isRegisterPair(true, tym, 0);
