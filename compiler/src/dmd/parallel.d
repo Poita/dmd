@@ -70,9 +70,11 @@ void semantic3Shared(ref Workers w, ref Modules modules) @system
 
 /**************************************
  * A template instance is added to the module declaring its template, which may be
- * one another worker compiles. Instances this worker has added to the other workers'
- * modules since the split are semantically analyzed here and moved to this worker's
- * first module, so that it generates their code.
+ * one another worker compiles. Instances in the other workers' modules that this
+ * worker has added since the split, or that were added before it and have completed
+ * semantic analysis, are semantically analyzed here and added to this worker's first
+ * module, so that it generates their code if it needs them. Which worker generates
+ * the code of a template instance function is settled by `claimFunction`.
  * Params:
  *      w = the split
  *      modules = this worker's root modules
@@ -86,7 +88,20 @@ void adoptForeignInstances(ref Workers w, ref Modules modules) @system
 
     if (w.index < 0 || !modules.length)
         return;
+    import dmd.dsymbol : PASS;
+
     TemplateInstance[] adopted;
+    foreach (k, m; w.others)
+    {
+        if (!m.members)
+            continue;
+        foreach (s; (*m.members)[0 .. w.seen[k]])
+        {
+            if (auto ti = s.isTemplateInstance())
+                if (ti.semanticRun >= PASS.semantic3)
+                    adopted ~= ti;
+        }
+    }
     bool again = true;
     while (again)
     {
@@ -138,6 +153,20 @@ const(char)[] partSuffix(int index)
 
 version (Posix)
 {
+    /* The mangled names of the template instance functions the workers generate code
+     * for, in memory shared by the workers
+     */
+    private struct Claims
+    {
+        enum slotCount = 1 << 20;                   // a power of 2
+        enum arenaSize = 64 << 20;
+        shared(uint)[slotCount] slots;  // offset + 1 in `arena` of a claimed name, 0 if free
+        shared(uint) used;              // bytes of `arena` in use
+        ubyte[arenaSize] arena;         // each name as its length and its claimer, uints, then its characters
+    }
+    private __gshared Claims* claims;       // in a worker: the claims of all workers
+    private __gshared uint workerIndex;     // in a worker: its number
+
     /* In a worker: where it reports its results to the original process, and how
      * many library files were listed when it started
      */
@@ -190,6 +219,9 @@ Workers split(ref Modules modules, uint requested)
         if (next == MAP_FAILED)
             return w;
         w.next = cast(shared(size_t)*)next;
+        void* c = mmap(null, Claims.sizeof, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+        if (c != MAP_FAILED)
+            claims = cast(Claims*)c;
         w.order = order;
         foreach (m; modules)
             w.membersAtSplit ~= m.members ? m.members.length : 0;
@@ -214,6 +246,7 @@ Workers split(ref Modules modules, uint requested)
                 dup2(fileno(output), 1);
                 dup2(fileno(output), 2);
                 resultFile = result;
+                workerIndex = cast(uint)k;
                 w.index = cast(int)k;
                 break;
             }
@@ -228,6 +261,7 @@ Workers split(ref Modules modules, uint requested)
             return w;
         }
 
+        claims = null;              // the original process generates all it compiles
         w.count = cast(int)children.length;
         w.succeeded = children.length == n;
         foreach (k, pid; children)
@@ -247,6 +281,63 @@ Workers split(ref Modules modules, uint requested)
             fclose(result);
     }
     return w;
+}
+
+/**************************************
+ * Settle which worker generates the code of a template instance function, which
+ * any worker needing it could.
+ * Params:
+ *      name = the function's mangled name
+ *      claim = claim the function for this worker if no worker has
+ * Returns:
+ *      true if this worker is to generate the function: the compilation is not split,
+ *      this worker has claimed it, or no worker had and `claim` is set
+ */
+bool claimFunction(const(char)[] name, bool claim)
+{
+    version (Posix)
+    {
+        import core.atomic : atomicFetchAdd, atomicLoad, cas;
+
+        if (!claims)
+            return true;
+        ulong h = 14695981039346656037UL;          // FNV-1a
+        foreach (c; name)
+        {
+            h ^= c;
+            h *= 1099511628211UL;
+        }
+        uint mine;
+        foreach (probe; 0 .. Claims.slotCount)
+        {
+            shared(uint)* slot = &claims.slots[(h + probe) & (Claims.slotCount - 1)];
+            uint v = atomicLoad(*slot);
+            if (v == 0)
+            {
+                if (!claim)
+                    return true;
+                if (!mine)
+                {
+                    const need = cast(uint)((2 * uint.sizeof + name.length + 3) & ~3);
+                    const offset = atomicFetchAdd(claims.used, need);
+                    if (offset + need > Claims.arenaSize)
+                        return true;            // out of space: generate it anyway
+                    auto header = cast(uint*)(claims.arena.ptr + offset);
+                    header[0] = cast(uint)name.length;
+                    header[1] = workerIndex;
+                    memcpy(claims.arena.ptr + offset + 2 * uint.sizeof, name.ptr, name.length);
+                    mine = offset + 1;
+                }
+                if (cas(slot, 0u, mine))
+                    return true;
+                v = atomicLoad(*slot);
+            }
+            const header = cast(uint*)(claims.arena.ptr + v - 1);
+            if (header[0] == name.length && memcmp(header + 2, name.ptr, name.length) == 0)
+                return header[1] == workerIndex;
+        }
+    }
+    return true;
 }
 
 /**************************************
