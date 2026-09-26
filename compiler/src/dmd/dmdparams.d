@@ -49,7 +49,7 @@ struct DMDparams
     bool lib;               // write library file instead of object file(s)
     bool link = true;       // perform link
     bool oneobj;            // write one object file instead of multiple ones
-    uint workers;           // processes to split code generation across, 0 for one per processor
+    uint workers;           // processes to split code generation across, 0 to choose by the processors and the amount of source
 
     bool optimize;          // run optimizer
     bool nofloat;           // code should not pull in floating point support

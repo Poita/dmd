@@ -184,7 +184,8 @@ version (Posix)
  * itself, so that diagnostics are exactly those of an unsplit compilation.
  * Params:
  *      modules = the root modules
- *      requested = number of workers asked for, 0 for one per processor
+ *      requested = number of workers asked for, 0 for one per processor, or fewer for
+ *                  a small compilation
  * Returns:
  *      the split
  */
@@ -193,7 +194,20 @@ Workers split(ref Modules modules, uint requested)
     Workers w;
     version (Posix)
     {
-        size_t n = requested ? requested : cast(size_t)sysconf(_SC_NPROCESSORS_ONLN);
+        size_t n = requested;
+        if (!n)
+        {
+            /* Starting a worker costs more than compiling a little source, so by
+             * default there is one worker for each `sourcePerWorker` bytes of source
+             */
+            enum sourcePerWorker = 128 * 1024;
+            size_t total;
+            foreach (m; modules)
+                total += m.src.length;
+            n = cast(size_t)sysconf(_SC_NPROCESSORS_ONLN);
+            if (n > total / sourcePerWorker)
+                n = total / sourcePerWorker;
+        }
         if (n > modules.length)
             n = modules.length;
         if (n < 2)
