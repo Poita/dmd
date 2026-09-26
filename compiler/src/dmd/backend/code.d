@@ -297,6 +297,7 @@ struct seg_data
     uint             SDaranges_offset;  // if !=0, offset in .debug_aranges
 
     Barray!(linnum_data) SDlinnum_data;     // array of line number / offset data
+    size_t SDlinnum_last;               // index in SDlinnum_data of the most recently used file
 
   nothrow:
     @trusted
@@ -324,6 +325,7 @@ struct seg_data
         SDsym = null;
         SDaranges_offset = 0;
         SDlinnum_data.reset();
+        SDlinnum_last = 0;
     }
 }
 

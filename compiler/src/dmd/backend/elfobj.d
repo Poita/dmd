@@ -1318,16 +1318,23 @@ static if (0)
     size_t i;
     seg_data* pseg = SegData[seg];
 
-    // Find entry i in SDlinnum_data[] that corresponds to srcpos filename
-    for (i = 0; 1; i++)
+    /* Find entry i in SDlinnum_data[] that corresponds to srcpos filename,
+     * trying first the file of the previous line record
+     */
+    i = pseg.SDlinnum_last;
+    if (i >= pseg.SDlinnum_data.length || pseg.SDlinnum_data[i].filename != srcpos.Sfilename)
     {
-        if (i == pseg.SDlinnum_data.length)
-        {   // Create new entry
-            pseg.SDlinnum_data.push(linnum_data(srcpos.Sfilename));
-            break;
+        for (i = 0; 1; i++)
+        {
+            if (i == pseg.SDlinnum_data.length)
+            {   // Create new entry
+                pseg.SDlinnum_data.push(linnum_data(srcpos.Sfilename));
+                break;
+            }
+            if (pseg.SDlinnum_data[i].filename == srcpos.Sfilename)
+                break;
         }
-        if (pseg.SDlinnum_data[i].filename == srcpos.Sfilename)
-            break;
+        pseg.SDlinnum_last = i;
     }
 
     linnum_data* ld = &pseg.SDlinnum_data[i];
