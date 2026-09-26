@@ -1352,6 +1352,70 @@ void stackoffsets(ref CGstate cg, ref symtab_t symtab, bool estimate)
     }
 }
 
+/*****************************
+ * Set the register contents known on entry to `bl`: the immediate values and
+ * parameters that all its predecessors have in registers at their exits.
+ * Params:
+ *      regcon = register state to set
+ *      bl = block being entered
+ */
+@trusted
+private void mergePredRegcon(ref con_t regcon, block* bl)
+{
+    regcon.immed.mval = 0;      // assume no previous contents in registers
+    foreach (i, bp; bl.Bpred[])
+    {
+        // the same predecessor can appear more than once, e.g. for switch cases
+        if (i == 0)
+        {
+            regcon.immed = bp.Bregcon.immed;
+            regcon.params = bp.Bregcon.params;
+        }
+        else
+        {
+            regcon.params &= bp.Bregcon.params;
+            if ((regcon.immed.mval &= bp.Bregcon.immed.mval) != 0)
+                // Actual values must match, too
+                foreach (r; 0 .. REGMAX)
+                {
+                    if (regcon.immed.value[r] != bp.Bregcon.immed.value[r])
+                        regcon.immed.mval &= ~mask(r);
+                }
+        }
+    }
+}
+
+@trusted unittest
+{
+    // several switch cases go to the same block as another predecessor that
+    // doesn't have the value in a register
+    block sw, other, target;
+    sw.Bregcon.immed.mval = mask(0);
+    sw.Bregcon.immed.value[0] = 0;
+    target.Bpred.push(&sw);
+    target.Bpred.push(&other);
+    target.Bpred.push(&sw);
+    con_t regcon;
+    mergePredRegcon(regcon, &target);
+    assert(!(regcon.immed.mval & mask(0)));
+}
+
+@trusted unittest
+{
+    block a, b, target;
+    a.Bregcon.immed.mval = mask(1) | mask(2);
+    a.Bregcon.immed.value[1] = 5;
+    a.Bregcon.immed.value[2] = 7;
+    b.Bregcon.immed.mval = mask(1) | mask(2);
+    b.Bregcon.immed.value[1] = 5;
+    b.Bregcon.immed.value[2] = 8;
+    target.Bpred.push(&a);
+    target.Bpred.push(&b);
+    con_t regcon;
+    mergePredRegcon(regcon, &target);
+    assert(regcon.immed.mval == mask(1) && regcon.immed.value[1] == 5);
+}
+
 /****************************
  * Generate code for a block.
  * Params:
@@ -1370,29 +1434,7 @@ private void blcodgen(ref CGstate cg, block* bl)
         together the values from all the predecessors of b.
      */
     assert(bl.Bregcon.immed.mval == 0);
-    cg.regcon.immed.mval = 0;      // assume no previous contents in registers
-//    cg.regcon.cse.mval = 0;
-    foreach (bp; bl.Bpred[])
-    {
-        if (bp == bl.Bpred[0])
-        {   cg.regcon.immed = bp.Bregcon.immed;
-            cg.regcon.params = bp.Bregcon.params;
-//          cg.regcon.cse = bp.Bregcon.cse;
-        }
-        else
-        {
-            int i;
-
-            cg.regcon.params &= bp.Bregcon.params;
-            if ((cg.regcon.immed.mval &= bp.Bregcon.immed.mval) != 0)
-                // Actual values must match, too
-                for (i = 0; i < REGMAX; i++)
-                {
-                    if (cg.regcon.immed.value[i] != bp.Bregcon.immed.value[i])
-                        cg.regcon.immed.mval &= ~mask(i);
-                }
-        }
-    }
+    mergePredRegcon(cg.regcon, bl);
     cg.regcon.cse.mops &= cg.regcon.cse.mval;
 
     // Set cg.regcon.mvar according to what variables are in registers for this block
