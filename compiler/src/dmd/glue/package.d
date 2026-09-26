@@ -123,7 +123,8 @@ public void generateCodeAndWrite(Module[] modules, const(char)*[] libmodules,
         if (!FileName.absolute(arg))
             arg = FileName.combine(objdir, arg);
 
-        library.setFilename(arg);
+        outputFile = arg;
+        library.setFilename(outputPartSuffix.length ? arg ~ outputPartSuffix : arg);
 
         // Add input object and input library files to output library
         foreach (p; libmodules)
@@ -152,7 +153,9 @@ public void generateCodeAndWrite(Module[] modules, const(char)*[] libmodules,
         }
         if (!global.errors && firstm)
         {
-            obj_end(objbuf, library, firstm.objfile.toString());
+            const objname = firstm.objfile.toString();
+            outputFile = objname;
+            obj_end(objbuf, library, !library && outputPartSuffix.length ? objname ~ outputPartSuffix : objname);
         }
     }
     else
@@ -196,6 +199,38 @@ public void generateCodeAndWrite(Module[] modules, const(char)*[] libmodules,
         }
         destroy(tmpname);
     }
+}
+
+/// Suffix added to the name of the object file or library written by
+/// generateCodeAndWrite(), when the compilation is split across workers
+public __gshared const(char)[] outputPartSuffix;
+
+/// The object file or library written by generateCodeAndWrite(), without outputPartSuffix
+public __gshared const(char)[] outputFile;
+
+/**************************************
+ * Combine the library parts written by split workers into one library.
+ * Params:
+ *      libfile = the library to write
+ *      parts = the library parts, which are deleted
+ * Returns:
+ *      true on success
+ */
+public bool mergeLibraries(const(char)[] libfile, const(char)[][] parts)
+{
+    auto library = Library.factory(target.objectFormat(), target.lib_ext, global.errorSink);
+    library.setFilename(libfile);
+    foreach (p; parts)
+        library.addObject(p, null);
+    if (global.errors)
+        return false;
+    auto tmpname = libfile ~ ".tmp\0";
+    auto libbuf = OutBuffer(tmpname.ptr);
+    library.writeLibToBuffer(libbuf);
+    const ok = libbuf.moveToFile(libfile);
+    foreach (p; parts)
+        File.remove((p ~ "\0").ptr);
+    return ok;
 }
 
 // FIXME: does not work on old bootstrap compilers

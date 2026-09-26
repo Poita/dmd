@@ -615,6 +615,9 @@ private int tryMain(const(char)[][] argv, out Param params)
     if (global.errors)
         removeHdrFilesAndFail(params.dihdr.doOutput, modules);
 
+    import dmd.parallel : Workers, split, partSuffix, waitForWorkers, exitWorker, mergeObjects;
+    Workers workers;    // set when the compilation is split across worker processes
+
     {
     timeTraceBeginEvent(TimeTraceEventType.semaGeneral);
     scope (exit) timeTraceEndEvent(TimeTraceEventType.semaGeneral);
@@ -662,6 +665,22 @@ private int tryMain(const(char)[][] argv, out Param params)
     if (global.errors)
         removeHdrFilesAndFail(params.dihdr.doOutput, modules);
 
+    /* Split the rest of the compilation of the root modules across worker processes,
+     * when nothing but code generation needs all of them
+     */
+    if (driverParams.workers != 1 && params.obj && !includeImports && !params.addMain &&
+        !params.json.doOutput && !params.ddoc.doOutput && !params.vcg_ast &&
+        !params.cxxhdr.doOutput && !params.moduleDeps.buffer && !params.dihdr.doOutput &&
+        !params.timeTrace && !params.v.verbose && !params.v.templates)
+    {
+        workers = split(modules, driverParams.workers);
+        if (workers.index >= 0)
+        {
+            import dmd.glue : outputPartSuffix;
+            outputPartSuffix = partSuffix(workers.index);
+        }
+    }
+
     // Do pass 3 semantic analysis
     foreach (m; modules)
     {
@@ -684,6 +703,11 @@ private int tryMain(const(char)[][] argv, out Param params)
         }
     }
     runDeferredSemantic3();
+    if (workers.index >= 0)
+    {
+        import dmd.parallel : adoptForeignInstances;
+        adoptForeignInstances(workers, modules);
+    }
     if (global.errors)
         removeHdrFilesAndFail(params.dihdr.doOutput, modules);
 
@@ -805,9 +829,32 @@ private int tryMain(const(char)[][] argv, out Param params)
         ObjcGlue_initialize();
         timeTraceBeginEvent(TimeTraceEventType.codegenGlobal);
         scope (exit) timeTraceEndEvent(TimeTraceEventType.codegenGlobal);
-        generateCodeAndWrite(modules[], libmodules[], params.libname, params.objdir,
+        generateCodeAndWrite(modules[], workers.isChild ? null : libmodules[], params.libname, params.objdir,
                             driverParams.lib, params.obj, driverParams.oneobj, params.multiobj,
                             params.v.verbose);
+    }
+
+    if (workers.isChild)
+        exitWorker(!global.errors);
+    if (workers.isFirst)
+    {
+        import dmd.glue : outputFile, mergeLibraries;
+        bool ok = waitForWorkers(workers) && !global.errors;
+        if (ok && driverParams.lib)
+        {
+            const(char)[][] parts;
+            foreach (k; 0 .. workers.count)
+                parts ~= outputFile ~ partSuffix(k);
+            ok = mergeLibraries(outputFile, parts);
+        }
+        else if (ok && driverParams.oneobj)
+            ok = mergeObjects(outputFile, workers.count);
+        if (!ok)
+        {
+            if (!global.errors)
+                eSink.error(Loc.initial, "compilation split across worker processes failed");
+            fatal();
+        }
     }
 
     backend_term();

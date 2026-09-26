@@ -1609,6 +1609,19 @@ bool parseCommandLine(const ref Strings arguments, const size_t argc, out Param 
         {
             params.ehnogc = true;
         }
+        else if (startsWith(p + 1, "j="))  // number of worker processes
+        {
+            uint n = 0;
+            foreach (c; arg[3 .. $])
+            {
+                if (c < '0' || c > '9' || n > 1000)
+                    goto Lerror;
+                n = n * 10 + (c - '0');
+            }
+            if (n == 0)
+                goto Lerror;
+            driverParams.workers = n;
+        }
         else if (arg == "-lib")         // https://dlang.org/dmd.html#switch-lib
             driverParams.lib = params.fullyQualifiedObjectFiles = true;
         else if (arg == "-nofloat")
