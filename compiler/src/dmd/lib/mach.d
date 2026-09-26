@@ -195,20 +195,19 @@ final class LibMach : Library
                     return corrupt(__LINE__);
                 uint moff = Port.readlongLE(symtab + 4 + i * 8 + 4);
                 //printf("symtab[%d] moff = x%x  x%x, name = %s\n", i, moff, moff + MachLibHeader.sizeof, name);
-                for (uint m = mstart; 1; m++)
+                // The modules were added in the order of their offsets
+                size_t lo = mstart, hi = objmodules.length;
+                while (lo < hi)
                 {
-                    if (m == objmodules.length)
-                        return corrupt(__LINE__);       // didn't find it
-                    MachObjModule* om = objmodules[m];
-                    //printf("\tom offset = x%x\n", cast(char *)om.base - cast(char *)buffer.ptr);
-                    if (moff == cast(char*)om.base - cast(char*)buffer.ptr)
-                    {
-                        addSymbol(om, name[0 .. namelen], 1);
-                        //if (mstart == m)
-                        //    mstart++;
-                        break;
-                    }
+                    const mid = (lo + hi) / 2;
+                    if (cast(char*)objmodules[mid].base - cast(char*)buffer.ptr < moff)
+                        lo = mid + 1;
+                    else
+                        hi = mid;
                 }
+                if (lo == objmodules.length || cast(char*)objmodules[lo].base - cast(char*)buffer.ptr != moff)
+                    return corrupt(__LINE__);       // didn't find it
+                addSymbol(objmodules[lo], name[0 .. namelen], 1);
             }
             return;
         }
