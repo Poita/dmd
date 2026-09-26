@@ -28,7 +28,7 @@ version (Posix)
 {
     import core.sys.posix.sys.types : pid_t;
     import core.sys.posix.sys.wait : waitpid, WIFEXITED, WEXITSTATUS;
-    import core.sys.posix.unistd : fork, _exit, sysconf, execvp, _SC_NPROCESSORS_ONLN;
+    import core.sys.posix.unistd : dup2, fork, _exit, sysconf, execvp, _SC_NPROCESSORS_ONLN;
 }
 
 /**************************************
@@ -78,17 +78,14 @@ nothrow:
 /// The state of a compilation split across worker processes
 struct Workers
 {
-    int index = -1;         /// this process's worker number, -1 when not split
-    int count;              /// number of workers
-    version (Posix) pid_t[] children; /// in worker 0: the other workers' process ids
-    Module[] others;        /// the root modules of the other workers
+    int index = -1;         /// in a worker, its number; -1 in the original process
+    int count;              /// number of workers started, 0 if the compilation is not split
+    bool succeeded;         /// in the original process: every worker wrote its output part
+    Module[] others;        /// in a worker: the root modules of the other workers
     size_t[] seen;          /// how many members of each of `others` have been looked at
 
-    /// Returns: true if the compilation is split and this is worker 0, the original process
-    bool isFirst() const { return index == 0; }
-
-    /// Returns: true if this is a forked worker other than the first
-    bool isChild() const { return index > 0; }
+    /// Returns: true if this is a forked worker
+    bool isChild() const nothrow { return index >= 0; }
 }
 
 /// Returns: the suffix added to the output file names of worker `index`
@@ -99,13 +96,28 @@ const(char)[] partSuffix(int index)
     return buf[0 .. n].idup;
 }
 
+version (Posix)
+{
+    /* In a worker: where it reports its results to the original process, and how
+     * many library files were listed when it started
+     */
+    private __gshared FILE* resultFile;
+    private __gshared size_t libfilesAtSplit;
+}
+
 /**************************************
  * Split the root modules across worker processes.
+ *
+ * The original process forks the workers and waits for them. A worker's output
+ * goes to a temporary file: a worker that prints anything (errors, warnings,
+ * deprecations, messages) or fails makes the split unsuccessful, and the original
+ * process, still in its state from before the split, then compiles all the modules
+ * itself, so that diagnostics are exactly those of an unsplit compilation.
  * Params:
- *      modules = the root modules; narrowed to this worker's chunk
+ *      modules = the root modules; in a worker, narrowed to its chunk
  *      requested = number of workers asked for, 0 for one per processor
  * Returns:
- *      the split, with `index` of -1 if the modules were not split
+ *      the split
  */
 Workers split(ref Modules modules, uint requested)
 {
@@ -124,7 +136,6 @@ Workers split(ref Modules modules, uint requested)
         foreach (i, ref o; order)
             o = i;
         static size_t weight(Module m) { return m.src.length + 1; }
-        import core.stdc.stdlib : qsort;
         __gshared Module[] sortModules;
         sortModules = modules[];
         extern (C) static int cmp(const void* a, const void* b)
@@ -149,69 +160,84 @@ Workers split(ref Modules modules, uint requested)
 
         fflush(stdout);
         fflush(stderr);
-        w.count = cast(int)n;
-        w.index = 0;
-        foreach (k; 1 .. n)
+        libfilesAtSplit = global.params.libfiles.length;
+        pid_t[] children;
+        FILE*[] outputs;
+        FILE*[] results;
+        foreach (k; 0 .. n)
         {
+            FILE* output = tmpfile();
+            FILE* result = tmpfile();
+            if (!output || !result)
+                break;
             const pid = fork();
             if (pid == -1)
-                break;          // carry on with fewer workers
+                break;
             if (pid == 0)
             {
+                dup2(fileno(output), 1);
+                dup2(fileno(output), 2);
+                resultFile = result;
                 w.index = cast(int)k;
-                w.children = null;
                 break;
             }
-            w.children ~= pid;
+            children ~= pid;
+            outputs ~= output;
+            results ~= result;
         }
-        if (w.index == 0)
-            w.count = cast(int)(w.children.length + 1);
 
-        /* Keep this worker's chunk; a worker that couldn't be forked leaves its
-         * chunk to worker 0
-         */
-        size_t j = 0;
-        foreach (i; 0 .. modules.length)
+        if (w.isChild)
         {
-            const c = chunkOf[i];
-            if (c == w.index || (w.index == 0 && c >= w.count))
-                modules[j++] = modules[i];
-            else
+            w.count = cast(int)n;
+            size_t j = 0;
+            foreach (i; 0 .. modules.length)
             {
-                w.others ~= modules[i];
-                w.seen ~= modules[i].members ? modules[i].members.length : 0;
+                if (chunkOf[i] == w.index)
+                    modules[j++] = modules[i];
+                else
+                {
+                    w.others ~= modules[i];
+                    w.seen ~= modules[i].members ? modules[i].members.length : 0;
+                }
             }
+            modules.setDim(j);
+            return w;
         }
-        modules.setDim(j);
+
+        w.count = cast(int)children.length;
+        w.succeeded = children.length == n;
+        foreach (k, pid; children)
+        {
+            int status;
+            if (waitpid(pid, &status, 0) == -1 || !WIFEXITED(status) || WEXITSTATUS(status) != 0 ||
+                fseek(outputs[k], 0, SEEK_END) != 0 || ftell(outputs[k]) != 0)
+                w.succeeded = false;
+            fclose(outputs[k]);
+        }
+        if (w.succeeded)
+        {
+            foreach (result; results)
+                readResult(result);
+        }
+        foreach (result; results)
+            fclose(result);
     }
     return w;
 }
 
 /**************************************
- * In worker 0, wait for the other workers.
- * Returns:
- *      true if they all succeeded
- */
-bool waitForWorkers(ref Workers w)
-{
-    bool ok = true;
-    version (Posix)
-    {
-        foreach (pid; w.children)
-        {
-            int status;
-            if (waitpid(pid, &status, 0) == -1 || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
-                ok = false;
-        }
-    }
-    return ok;
-}
-
-/**************************************
- * End a forked worker once its output part is written.
+ * End a worker once its output part is written, reporting to the original process
+ * the library files it added to the link.
  */
 void exitWorker(bool ok)
 {
+    version (Posix)
+    {
+        foreach (name; global.params.libfiles[libfilesAtSplit .. $])
+            fwrite(name, 1, strlen(name) + 1, resultFile);
+        if (fflush(resultFile) != 0)
+            ok = false;
+    }
     fflush(stdout);
     fflush(stderr);
     version (Posix)
@@ -220,15 +246,48 @@ void exitWorker(bool ok)
         exit(ok ? 0 : 1);
 }
 
+/* Add the library files a worker reported to the link.
+ */
+version (Posix)
+private void readResult(FILE* result)
+{
+    fseek(result, 0, SEEK_END);
+    const size = ftell(result);
+    if (size <= 0)
+        return;
+    auto buf = cast(char*)malloc(size);
+    rewind(result);
+    if (fread(buf, 1, size, result) != size)
+        return;
+    for (size_t i = 0; i < size; i += strlen(buf + i) + 1)
+        global.params.libfiles.push(buf + i);
+}
+
+/// Returns: the names of the output parts of `count` workers writing `file`
+const(char)[][] partNames(const(char)[] file, int count)
+{
+    const(char)[][] parts;
+    foreach (k; 0 .. count)
+        parts ~= file ~ partSuffix(k);
+    return parts;
+}
+
+/// Delete output parts
+void removeParts(const(char)[][] parts)
+{
+    foreach (p; parts)
+        remove(toCString(p));
+}
+
 /**************************************
- * Combine the object file parts of all workers into one object file with `ld -r`.
+ * Combine object file parts into one object file with `ld -r`.
  * Params:
  *      objfile = the object file to write
- *      count = number of workers
+ *      parts = the object files to combine
  * Returns:
  *      true on success
  */
-bool mergeObjects(const(char)[] objfile, int count)
+bool mergeObjects(const(char)[] objfile, const(char)[][] parts)
 {
     version (Posix)
     {
@@ -237,12 +296,8 @@ bool mergeObjects(const(char)[] objfile, int count)
         argv ~= "-r";
         argv ~= "-o";
         argv ~= toCString(objfile);
-        const(char)[][] parts;
-        foreach (k; 0 .. count)
-        {
-            parts ~= objfile ~ partSuffix(k);
-            argv ~= toCString(parts[$ - 1]);
-        }
+        foreach (p; parts)
+            argv ~= toCString(p);
         argv ~= null;
 
         fflush(stdout);
@@ -256,10 +311,7 @@ bool mergeObjects(const(char)[] objfile, int count)
             _exit(127);
         }
         int status;
-        const ok = waitpid(pid, &status, 0) != -1 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
-        foreach (p; parts)
-            remove(toCString(p));
-        return ok;
+        return waitpid(pid, &status, 0) != -1 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
     }
     else
         return false;

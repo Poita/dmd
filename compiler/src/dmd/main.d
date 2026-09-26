@@ -615,7 +615,7 @@ private int tryMain(const(char)[][] argv, out Param params)
     if (global.errors)
         removeHdrFilesAndFail(params.dihdr.doOutput, modules);
 
-    import dmd.parallel : Workers, split, partSuffix, waitForWorkers, exitWorker, mergeObjects;
+    import dmd.parallel : Workers, split, partSuffix, partNames, removeParts, exitWorker, mergeObjects;
     Workers workers;    // set when the compilation is split across worker processes
 
     {
@@ -671,15 +671,35 @@ private int tryMain(const(char)[][] argv, out Param params)
     if (driverParams.workers != 1 && params.obj && !includeImports && !params.addMain &&
         !params.json.doOutput && !params.ddoc.doOutput && !params.vcg_ast &&
         !params.cxxhdr.doOutput && !params.moduleDeps.buffer && !params.dihdr.doOutput &&
-        !params.timeTrace && !params.v.verbose && !params.v.templates)
+        !params.timeTrace && !params.v.verbose && !params.v.templates && !params.makeDeps.doOutput)
     {
         workers = split(modules, driverParams.workers);
-        if (workers.index >= 0)
+        if (workers.isChild)
         {
             import dmd.glue : outputPartSuffix;
             outputPartSuffix = partSuffix(workers.index);
         }
+        else if (workers.count)
+        {
+            /* Combine the workers' output parts; if the workers did not all succeed,
+             * this process compiles the modules itself
+             */
+            import dmd.glue : libraryFileName, oneObjectFileName, mergeLibraries;
+            const output = driverParams.lib ? libraryFileName(params.libname, params.objdir) :
+                           driverParams.oneobj ? oneObjectFileName(modules[]) : null;
+            if (output.length)
+            {
+                auto parts = partNames(output, workers.count);
+                if (workers.succeeded)
+                    workers.succeeded = driverParams.lib ? mergeLibraries(output, libmodules[], parts) :
+                                                           mergeObjects(output, parts);
+                removeParts(parts);
+            }
+        }
     }
+
+    if (!workers.succeeded)
+    {
 
     // Do pass 3 semantic analysis
     foreach (m; modules)
@@ -703,7 +723,7 @@ private int tryMain(const(char)[][] argv, out Param params)
         }
     }
     runDeferredSemantic3();
-    if (workers.index >= 0)
+    if (workers.isChild)
     {
         import dmd.parallel : adoptForeignInstances;
         adoptForeignInstances(workers, modules);
@@ -735,6 +755,7 @@ private int tryMain(const(char)[][] argv, out Param params)
                 eSink.message(Loc.initial, "scan all inlines in %s", m.toChars());
             inlineScanAllFunctions(m, eSink);
         }
+    }
     }
     }
 
@@ -825,6 +846,7 @@ private int tryMain(const(char)[][] argv, out Param params)
             params.objfiles.push(mainModule.objfile.toChars());
     }
 
+    if (!workers.succeeded)
     {
         ObjcGlue_initialize();
         timeTraceBeginEvent(TimeTraceEventType.codegenGlobal);
@@ -836,26 +858,6 @@ private int tryMain(const(char)[][] argv, out Param params)
 
     if (workers.isChild)
         exitWorker(!global.errors);
-    if (workers.isFirst)
-    {
-        import dmd.glue : outputFile, mergeLibraries;
-        bool ok = waitForWorkers(workers) && !global.errors;
-        if (ok && driverParams.lib)
-        {
-            const(char)[][] parts;
-            foreach (k; 0 .. workers.count)
-                parts ~= outputFile ~ partSuffix(k);
-            ok = mergeLibraries(outputFile, parts);
-        }
-        else if (ok && driverParams.oneobj)
-            ok = mergeObjects(outputFile, workers.count);
-        if (!ok)
-        {
-            if (!global.errors)
-                eSink.error(Loc.initial, "compilation split across worker processes failed");
-            fatal();
-        }
-    }
 
     backend_term();
 

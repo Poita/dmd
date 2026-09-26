@@ -107,23 +107,7 @@ public void generateCodeAndWrite(Module[] modules, const(char)*[] libmodules,
     {
         library = Library.factory(target.objectFormat(), target.lib_ext, eSink);
 
-        /* Determine actual file name of library to write to by combining
-         * objdir, libname, the first object file name, and lib_ext
-         */
-        const(char)[] arg;
-        if (!libname.length)
-        {
-            // get name of the first object file
-            const(char)[] n = global.params.objfiles[0].toDString;
-            n = FileName.name(n);                // remove its path
-            arg = FileName.forceExt(n, library.lib_ext); // force library name extension
-        }
-        else
-            arg = FileName.defaultExt(libname, library.lib_ext);
-        if (!FileName.absolute(arg))
-            arg = FileName.combine(objdir, arg);
-
-        outputFile = arg;
+        const arg = libraryFileName(libname, objdir);
         library.setFilename(outputPartSuffix.length ? arg ~ outputPartSuffix : arg);
 
         // Add input object and input library files to output library
@@ -154,7 +138,6 @@ public void generateCodeAndWrite(Module[] modules, const(char)*[] libmodules,
         if (!global.errors && firstm)
         {
             const objname = firstm.objfile.toString();
-            outputFile = objname;
             obj_end(objbuf, library, !library && outputPartSuffix.length ? objname ~ outputPartSuffix : objname);
         }
     }
@@ -205,21 +188,21 @@ public void generateCodeAndWrite(Module[] modules, const(char)*[] libmodules,
 /// generateCodeAndWrite(), when the compilation is split across workers
 public __gshared const(char)[] outputPartSuffix;
 
-/// The object file or library written by generateCodeAndWrite(), without outputPartSuffix
-public __gshared const(char)[] outputFile;
-
 /**************************************
  * Combine the library parts written by split workers into one library.
  * Params:
  *      libfile = the library to write
- *      parts = the library parts, which are deleted
+ *      libmodules = object and library files given on the command line to add to it
+ *      parts = the library parts
  * Returns:
  *      true on success
  */
-public bool mergeLibraries(const(char)[] libfile, const(char)[][] parts)
+public bool mergeLibraries(const(char)[] libfile, const(char)*[] libmodules, const(char)[][] parts)
 {
     auto library = Library.factory(target.objectFormat(), target.lib_ext, global.errorSink);
     library.setFilename(libfile);
+    foreach (p; libmodules)
+        library.addObject(p.toDString(), null);
     foreach (p; parts)
         library.addObject(p, null);
     if (global.errors)
@@ -227,10 +210,39 @@ public bool mergeLibraries(const(char)[] libfile, const(char)[][] parts)
     auto tmpname = libfile ~ ".tmp\0";
     auto libbuf = OutBuffer(tmpname.ptr);
     library.writeLibToBuffer(libbuf);
-    const ok = libbuf.moveToFile(libfile);
-    foreach (p; parts)
-        File.remove((p ~ "\0").ptr);
-    return ok;
+    return libbuf.moveToFile(libfile);
+}
+
+/**
+ * Get the name of the library to write, by combining objdir, libname,
+ * the first object file name, and the library extension.
+ */
+public const(char)[] libraryFileName(const(char)[] libname, const(char)[] objdir)
+{
+    const(char)[] arg;
+    if (!libname.length)
+    {
+        // get name of the first object file
+        const(char)[] n = global.params.objfiles[0].toDString;
+        n = FileName.name(n);                // remove its path
+        arg = FileName.forceExt(n, target.lib_ext); // force library name extension
+    }
+    else
+        arg = FileName.defaultExt(libname, target.lib_ext);
+    if (!FileName.absolute(arg))
+        arg = FileName.combine(objdir, arg);
+    return arg;
+}
+
+/**
+ * Get the name of the one object file written for `modules`.
+ */
+public const(char)[] oneObjectFileName(Module[] modules)
+{
+    foreach (m; modules)
+        if (m.filetype != FileType.dhdr)
+            return m.objfile.toString();
+    return null;
 }
 
 // FIXME: does not work on old bootstrap compilers
