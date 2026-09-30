@@ -1373,25 +1373,20 @@ int branch(block* bl,int flag)
 
                     ct = c.IEV1.Vcode;         /* target of branch     */
                     assert(ct.Iflags & (CF.targ | CF.targ2));
+
+                    /* Only whether the branch is to the next instruction matters,
+                     * so the distance to the target is not added up
+                     */
+                    disp = 1;
                     for (cr = cn; cr; cr = code_next(cr))
                     {
                         if (cr == ct)
-                            break;
-                        disp += calccodsize(cr);
-                    }
-
-                    if (!cr)
-                    {   // Didn't find it in forward search. Try backwards jump
-                        int s = 0;
-                        disp = 0;
-                        for (cr = bl.Bcode; cr != cn; cr = code_next(cr))
                         {
-                            assert(cr != null); // must have found it
-                            if (cr == ct)
-                                s = 1;
-                            if (s)
-                                disp += calccodsize(cr);
+                            disp = 0;
+                            break;
                         }
+                        if (calccodsize(cr))
+                            break;
                     }
 
                     if (config.flags4 & CFG4optimized && !flag)
@@ -2222,47 +2217,92 @@ void jmpaddr(code* c)
 {
     //printf("jmpaddr()\n");
 
-    code* ci,cn,ctarg,cstart;
-    uint ad;
-    cstart = c;                           /* remember start of code       */
+    CodePositions positions;
+    code* cstart = c;                     /* remember start of code       */
     while (c)
     {
         const op = c.Iop;
         //printf("%08X ", c.Iop); disassemble(c.Iop);
-        if (isBranch(op) && c.IFL1 == FL.code) // or CALL?
+        if ((isBranch(op) || op == LOOP) && c.IFL1 == FL.code) // or CALL?
         {
-            ci = code_next(c);
-            ctarg = c.IEV1.Vcode;  /* target code                  */
-            ad = 4;                /* IP displacement              */
-            while (ci && ci != ctarg)
+            if (!positions.length)
+                positions.build(cstart);
+            const from = positions.find(c);
+            const to = positions.find(c.IEV1.Vcode);
+            assert(to);
+            if (to.index > from.index)          // forward branch
             {
-                ad += calccodsize(ci);
-                ci = code_next(ci);
+                const ad = to.offset - from.offset;
+                c.Iop |= (ad >> 2) << 5;
             }
-            if (!ci)
-                goto Lbackjmp;      // couldn't find it
-            c.Iop |= (ad >> 2) << 5;
-            c.IFL1 = FL.unde;
-        }
-        if (op == LOOP && c.IFL1 == FL.code)    /* backwards refs       */
-        {
-          Lbackjmp:
-            ctarg = c.IEV1.Vcode;
-            for (ci = cstart; ci != ctarg; ci = code_next(ci))
-                if (!ci || ci == c)
-                    assert(0);
-            ad = 0;                 /* - IP displacement            */
-            while (ci != c)
+            else                                // backward branch
             {
-                assert(ci);
-                ad += calccodsize(ci);
-                ci = code_next(ci);
+                const ad = from.offset - to.offset;
+                c.Iop |= (-(ad >> 2) & ((1 << 19) - 1)) << 5;    // set the signed imm19 field
             }
-            c.Iop |= (-(ad >> 2) & ((1 << 19) - 1)) << 5;    // set the signed imm19 field
             c.IFL1 = FL.unde;
         }
         c = code_next(c);
     }
+}
+
+/* The positions of the instructions of a code list: their order and their offsets
+ * from its start, found by the instruction's address
+ */
+private struct CodePositions
+{
+  nothrow @trusted:
+    static struct Position
+    {
+        code* c;
+        uint index;
+        uint offset;
+    }
+
+    size_t length;
+
+    /// Find the positions of the instructions of the list starting with `c`
+    void build(code* c)
+    {
+        size_t n;
+        for (code* ci = c; ci; ci = code_next(ci))
+            ++n;
+        size_t size = 16;
+        while (size < 2 * n)
+            size *= 2;
+        table.setLength(size);
+        table[][] = Position.init;
+        uint index, offset;
+        for (code* ci = c; ci; ci = code_next(ci))
+        {
+            size_t i = slot(ci);
+            while (table[i].c)
+                i = (i + 1) & (table.length - 1);
+            table[i] = Position(ci, index++, offset);
+            offset += calccodsize(ci);
+        }
+        length = n;
+    }
+
+    /// Returns: the position of `c`, or null if it is not in the list
+    Position* find(const(code)* c)
+    {
+        for (size_t i = slot(c); table[i].c; i = (i + 1) & (table.length - 1))
+        {
+            if (table[i].c is c)
+                return &table[i];
+        }
+        return null;
+    }
+
+  private:
+    size_t slot(const(code)* c) const
+    {
+        const h = cast(size_t)c;
+        return ((h >> 4) ^ (h >> 12)) & (table.length - 1);
+    }
+
+    __gshared Barray!Position table;    // reused by each list
 }
 
 /*******************************
