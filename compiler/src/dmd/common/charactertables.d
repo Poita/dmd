@@ -134,36 +134,42 @@ private
 }
 
 ///
+pragma(inline, true)
 bool isoctal(const char c)
 {
     return (cmtable[c] & CMoctal) != 0;
 }
 
 ///
+pragma(inline, true)
 bool ishex(const char c)
 {
     return (cmtable[c] & CMhex) != 0;
 }
 
 ///
+pragma(inline, true)
 bool isidchar(const char c)
 {
     return (cmtable[c] & CMidchar) != 0;
 }
 
 ///
+pragma(inline, true)
 bool isZeroSecond(const char c)
 {
     return (cmtable[c] & CMzerosecond) != 0;
 }
 
 ///
+pragma(inline, true)
 bool isDigitSecond(const char c)
 {
     return (cmtable[c] & CMdigitsecond) != 0;
 }
 
 ///
+pragma(inline, true)
 bool issinglechar(const char c)
 {
     return (cmtable[c] & CMsinglechar) != 0;
