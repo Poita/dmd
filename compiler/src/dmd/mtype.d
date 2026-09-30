@@ -2383,6 +2383,11 @@ extern (C++) final class Parameter : ASTNode
      */
     static size_t dim(Parameters* parameters)
     {
+        if (!parameters)
+            return 0;
+        if (!anyToFold(parameters, parameters.length))
+            return parameters.length;
+
         size_t nargs = 0;
 
         int dimDg(size_t n, Parameter p)
@@ -2412,6 +2417,9 @@ extern (C++) final class Parameter : ASTNode
      */
     static Parameter getNth(Parameters* parameters, size_t nth)
     {
+        if (parameters && nth < parameters.length && !anyToFold(parameters, nth + 1))
+            return (*parameters)[nth];
+
         Parameter param;
 
         int getNthParamDg(size_t n, Parameter p)
@@ -2426,6 +2434,19 @@ extern (C++) final class Parameter : ASTNode
 
         int res = _foreach(parameters, &getNthParamDg);
         return res ? param : null;
+    }
+
+    /* Returns: true if any of the first `n` of `parameters` is a tuple or null,
+     * which folding in tuples expands or drops
+     */
+    private static bool anyToFold(Parameters* parameters, size_t n)
+    {
+        foreach (p; (*parameters)[0 .. n])
+        {
+            if (!p || p.type.isTypeTuple())
+                return true;
+        }
+        return false;
     }
 
     /// Type of delegate when iterating solely on the parameters
