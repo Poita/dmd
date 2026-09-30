@@ -1153,9 +1153,9 @@ private struct Backref
 
   private:
 
-    extern(D) bool backrefImpl(T)(ref OutBuffer buf, ref AssocArray!(T, size_t) aa, T key)
+    extern(D) bool backrefImpl(T)(ref OutBuffer buf, ref BackrefTable!T table, T key)
     {
-        auto p = aa.getLvalue(key);
+        auto p = table.getLvalue(key);
         if (*p)
         {
             const offset = *p - 1;
@@ -1167,8 +1167,39 @@ private struct Backref
     }
 
     Type rootType;                          /// avoid infinite recursion
-    AssocArray!(Type, size_t) types;        /// Type => (offset+1) in buf
-    AssocArray!(Identifier, size_t) idents; /// Identifier => (offset+1) in buf
+    BackrefTable!Type types;                /// Type => (offset+1) in buf
+    BackrefTable!Identifier idents;         /// Identifier => (offset+1) in buf
+}
+
+/**
+ * Map from the types or identifiers of a mangled name to their positions in it.
+ * Mangled names mostly have few of them, which are found by a linear search
+ * without allocating; the rest go in an associative array.
+ */
+private struct BackrefTable(K)
+{
+    enum inlineLength = 16;
+    K[inlineLength] keys;
+    size_t[inlineLength] values;
+    size_t length;
+    AssocArray!(K, size_t) more;
+
+    /// Returns: the value for `key`, added as 0 if not present
+    size_t* getLvalue(K key)
+    {
+        foreach (i; 0 .. length)
+        {
+            if (keys[i] is key)
+                return &values[i];
+        }
+        if (length < inlineLength)
+        {
+            keys[length] = key;
+            values[length] = 0;
+            return &values[length++];
+        }
+        return more.getLvalue(key);
+    }
 }
 
 /*********************************
