@@ -4322,7 +4322,7 @@ public:
         case EXP.concatenateAssign:
         case EXP.concatenateElemAssign:
         case EXP.concatenateDcharAssign:
-            interpretAssignCommon(e, &ctfeCat);
+            interpretAssignCommon(e, &ctfeAppend);
             return;
 
         case EXP.mulAssign:

@@ -1488,6 +1488,55 @@ UnionExp ctfeCat(Loc loc, Type type, Expression e1, Expression e2)
     return ue;
 }
 
+/***********************************************
+ * `e1 ~= e2` at compile time.
+ * Appending a string to a string with immutable elements, the string's data is
+ * extended in place when it ends where the data last extended this way does, and
+ * that data has room: repeated appends to a string then take time proportional to
+ * the appended length rather than to the string's.
+ */
+UnionExp ctfeAppend(Loc loc, Type type, Expression e1, Expression e2)
+{
+    auto es1 = e1.isStringExp();
+    auto es2 = e2.isStringExp();
+    Type tn = type.toBasetype().nextOf();
+    if (!es1 || !es2 || es1.sz != es2.sz || !tn || !tn.isImmutable())
+        return ctfeCat(loc, type, e1, e2);
+
+    /* The data most recently extended in place, how much of it is used,
+     * and how much there is
+     */
+    __gshared const(void)* lastData;
+    __gshared size_t lastUsed;
+    __gshared size_t lastCapacity;
+
+    const sz = es1.sz;
+    const data1 = es1.peekData();
+    const data2 = es2.peekData();
+    const length = data1.length + data2.length;
+    void* data;
+    if (data1.ptr is lastData && data1.length == lastUsed && length + sz <= lastCapacity)
+        data = cast(void*)lastData;
+    else
+    {
+        const capacity = 2 * (length + sz) + 64;
+        data = mem.xmalloc_noscan(capacity);
+        memcpy(data, data1.ptr, data1.length);
+        lastData = data;
+        lastCapacity = capacity;
+    }
+    memcpy(data + data1.length, data2.ptr, data2.length);
+    memset(data + length, 0, sz);
+    lastUsed = length;
+
+    UnionExp ue;
+    emplaceExp!(StringExp)(&ue, loc, data[0 .. length], length / sz, sz);
+    StringExp es = ue.exp().isStringExp();
+    es.committed = es1.committed | es2.committed;
+    es.type = type;
+    return ue;
+}
+
 /*  Given an AA literal 'ae', and a key 'e2':
  *  Return ae[e2] if present, or NULL if not found.
  */
