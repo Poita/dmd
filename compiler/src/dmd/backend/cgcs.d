@@ -138,6 +138,14 @@ struct CGCS
     Barray!HCS hcstab;           // array of hcs's
     HCSArray hcsarray;
 
+    /* hcstab[] indexed by hash: for each bucket of hashes, 1 + the index of the
+     * last entry with a hash in it, and for each entry, 1 + the index of the one
+     * before it in the same bucket, or 0
+     */
+    enum bucketCount = 4096;     // a power of 2
+    Barray!uint heads;
+    Barray!uint prevs;
+
     // Use a bit vector for quick check if expression is possibly in hcstab[].
     // This results in much faster compiles when hcstab[] gets big.
     vec_t csvec;                 // vector of used entries
@@ -153,6 +161,8 @@ struct CGCS
         if (!csvec)
         {
             csvec = vec_calloc(CGCS.CSVECDIM);
+            heads.setLength(bucketCount);
+            heads[][] = 0;
         }
     }
 
@@ -163,7 +173,10 @@ struct CGCS
     void reset()
     {
         vec_clear(csvec);       // don't free it, recycle storage
+        foreach (ref hcs; hcstab[])
+            heads[hcs.Hhash & (bucketCount - 1)] = 0;
         hcstab.reset();
+        prevs.reset();
         hcsarray = HCSArray.init;
     }
 
@@ -174,6 +187,24 @@ struct CGCS
     void push(elem* e, hash_t hash)
     {
         hcstab.push(HCS(e, hash));
+        auto head = &heads[hash & (bucketCount - 1)];
+        prevs.push(*head);
+        *head = cast(uint)hcstab.length;
+    }
+
+    /****************************
+     * Remove the entries added since hcstab[] had `length` of them.
+     */
+    void truncate(size_t length)
+    {
+        foreach_reverse (i; length .. hcstab.length)
+        {
+            auto head = &heads[hcstab[i].Hhash & (bucketCount - 1)];
+            assert(*head == i + 1);
+            *head = prevs[i];
+        }
+        hcstab.setLength(length);
+        prevs.setLength(length);
     }
 
     /*******************************
@@ -288,7 +319,7 @@ void ecom(ref CGCS cgcs, ref elem* pe)
             auto hcsarraySave = cgcs.hcsarray;
             ecom(cgcs, e.E2);
             cgcs.hcsarray = hcsarraySave;        // no common subs by E2
-            cgcs.hcstab.setLength(lengthSave);
+            cgcs.truncate(lengthSave);
             return;                         /* if comsub then logexp() will */
         }
 
@@ -299,10 +330,10 @@ void ecom(ref CGCS cgcs, ref elem* pe)
             auto hcsarraySave = cgcs.hcsarray;
             ecom(cgcs, e.E2.E1);               // left condition
             cgcs.hcsarray = hcsarraySave;        // no common subs by E2
-            cgcs.hcstab.setLength(lengthSave);
+            cgcs.truncate(lengthSave);
             ecom(cgcs, e.E2.E2);               // right condition
             cgcs.hcsarray = hcsarraySave;        // no common subs by E2
-            cgcs.hcstab.setLength(lengthSave);
+            cgcs.truncate(lengthSave);
             return;                         // can't be a common sub
         }
 
@@ -489,8 +520,11 @@ void ecom(ref CGCS cgcs, ref elem* pe)
     int csveci = hash % CGCS.CSVECDIM;
     if (vec_testbit(csveci,cgcs.csvec))
     {
-        foreach_reverse (i, ref hcs; cgcs.hcstab[])
+        // the entries with a hash in the same bucket, last first
+        for (uint i1 = cgcs.heads[hash & (CGCS.bucketCount - 1)]; i1; i1 = cgcs.prevs[i1 - 1])
         {
+            const i = i1 - 1;
+            auto hcs = &cgcs.hcstab[i];
             debug if (debugx)
                 printf("i: %2d Hhash: %6d Helem: %p\n",
                        cast(int) i,hcs.Hhash,hcs.Helem);
