@@ -341,8 +341,7 @@ void optfunc(ref GlobalOptimizer go, ref BlockOpt bo)
     int iter = 0;           // iteration count
 
     /* Further rounds rarely improve the code enough to pay for re-running
-     * every data flow analysis, so the optimizer stops after maxRounds. With
-     * one round, constant propagation runs once, after the loop optimizations.
+     * every data flow analysis, so the optimizer stops after maxRounds.
      */
     enum maxRounds = 1;
     bool anotherRound()
@@ -391,6 +390,8 @@ void optfunc(ref GlobalOptimizer go, ref BlockOpt bo)
         out_regcand(globsym[]);         // recompute register candidates
         go.changes = 0;                 // no changes yet
         sliceStructs(globsym, bo.startblock);
+        if (go.mfoptim & MFcnp)
+            constprop(go, bo, go.changes);  /* make relationals unsigned     */
         if (go.mfoptim & (MFli | MFliv))
             loopopt(go, bo);                /* remove loop invariants and    */
                                         /* induction vars                */
