@@ -620,35 +620,42 @@ noprop:
 struct DefIndex
 {
     /* The go.defnod[] indices of the assignments to variables, by variable:
-     * sorted by the variable's address, then by index
+     * for the variables in globsym[], those of globsym[k] are
+     * localDefs[localStart[k] .. localStart[k + 1]], in increasing order; the
+     * others are in otherDefs sorted by the variable's address, then by index
      */
     static struct SymDef
     {
         const(Symbol)* s;
         uint i;
     }
-    Barray!SymDef symDefs;
+    Barray!uint localStart;
+    Barray!SymDef localDefs;
+    Barray!SymDef otherDefs;
 
     vec_t asmDefs;      // the OPasm definitions
     vec_t anyDefs;      // the OPasm definitions, assignments through pointers and other definitions
-    vec_t varDefs;      // the assignments to variables, which those of symDefs still are
+    vec_t varDefs;      // the assignments to variables, which those listed still are
 
     /// Returns: the go.defnod[] indices of the assignments to `s`, in order
-    SymDef[] defsOf(const Symbol* s) nothrow
+    @trusted SymDef[] defsOf(const Symbol* s) nothrow
     {
-        size_t lo = 0, hi = symDefs.length;
+        const k = s.Ssymnum;
+        if (k < globsym.length && globsym[k] is s)
+            return localDefs[localStart[k] .. localStart[k + 1]];
+        size_t lo = 0, hi = otherDefs.length;
         while (lo < hi)
         {
             const mid = (lo + hi) / 2;
-            if (symDefs[mid].s < s)
+            if (otherDefs[mid].s < s)
                 lo = mid + 1;
             else
                 hi = mid;
         }
         size_t end = lo;
-        while (end < symDefs.length && symDefs[end].s is s)
+        while (end < otherDefs.length && otherDefs[end].s is s)
             ++end;
-        return symDefs[lo .. end];
+        return otherDefs[lo .. end];
     }
 }
 
@@ -662,13 +669,26 @@ public void buildDefIndex(ref GlobalOptimizer go)
 {
     alias di = defIndex;
     const n = go.defnod.length;
-    di.symDefs.setLength(0);
+    const nsyms = globsym.length;
+    di.localStart.setLength(nsyms + 1);
+    di.localStart[][] = 0;
+    di.otherDefs.setLength(0);
     vec_free(di.asmDefs);
     vec_free(di.anyDefs);
     vec_free(di.varDefs);
     di.asmDefs = vec_calloc(n);
     di.anyDefs = vec_calloc(n);
     di.varDefs = vec_calloc(n);
+
+    /* The globsym[] index of the variable assigned by go.defnod[i], or nsyms for
+     * another variable
+     */
+    size_t localOf(const Symbol* s)
+    {
+        const k = s.Ssymnum;
+        return k < nsyms && globsym[k] is s ? k : nsyms;
+    }
+
     foreach (uint i; 0 .. cast(uint)n)
     {
         elem* d = go.defnod[i].DNelem;
@@ -680,12 +700,30 @@ public void buildDefIndex(ref GlobalOptimizer go)
         }
         else if (OTassign(op) && d.E1.Eoper == OPvar)
         {
-            di.symDefs.push(DefIndex.SymDef(d.E1.Vsym, i));
+            const k = localOf(d.E1.Vsym);
+            if (k < nsyms)
+                ++di.localStart[k + 1];
+            else
+                di.otherDefs.push(DefIndex.SymDef(d.E1.Vsym, i));
             vec_setbit(i, di.varDefs);
         }
         else
             vec_setbit(i, di.anyDefs);
     }
+    foreach (k; 0 .. nsyms)
+        di.localStart[k + 1] += di.localStart[k];
+    di.localDefs.setLength(di.localStart[nsyms]);
+    for (size_t i = 0; (i = vec_index(i, di.varDefs)) < n; ++i)
+    {
+        const s = go.defnod[i].DNelem.E1.Vsym;
+        const k = localOf(s);
+        if (k < nsyms)
+            di.localDefs[di.localStart[k]++] = DefIndex.SymDef(s, cast(uint)i);
+    }
+    foreach_reverse (k; 0 .. nsyms)             // restore the starts the stores advanced
+        di.localStart[k + 1] = di.localStart[k];
+    di.localStart[0] = 0;
+
     extern (C) static int cmp(scope const void* a, scope const void* b) nothrow
     {
         auto x = cast(const DefIndex.SymDef*)a;
@@ -694,7 +732,8 @@ public void buildDefIndex(ref GlobalOptimizer go)
             return x.s < y.s ? -1 : 1;
         return x.i < y.i ? -1 : x.i > y.i;
     }
-    qsort(di.symDefs[].ptr, di.symDefs.length, DefIndex.SymDef.sizeof, &cmp);
+    if (di.otherDefs.length > 1)
+        qsort(di.otherDefs[].ptr, di.otherDefs.length, DefIndex.SymDef.sizeof, &cmp);
 }
 
 /***********************************
