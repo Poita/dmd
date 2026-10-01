@@ -86,7 +86,7 @@ struct Symbol
 
     regm_t Spregm()             // return mask of Spreg and Spreg2
     {
-        return (1 << Spreg) | (Spreg2 == NOREG ? 0 : (1 << Spreg2));
+        return (1UL << Spreg) | (Spreg2 == NOREG ? 0 : (1UL << Spreg2));
     }
 
     Symbol* Sscope;             // enclosing scope (could be struct tag,
