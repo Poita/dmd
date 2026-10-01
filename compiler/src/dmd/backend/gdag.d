@@ -30,6 +30,7 @@ import dmd.backend.symbol;
 import dmd.backend.ty;
 import dmd.backend.type;
 
+import dmd.backend.barray;
 import dmd.backend.dvec;
 
 
@@ -62,6 +63,7 @@ void builddags(ref GlobalOptimizer go, ref BlockOpt bo)
     if (go.exptop <= 1)             /* if no AEs                     */
         return;
     go.aetype = Aetype.cse;
+    buildAeIndex(go);
 
     debug
         foreach (i, e; go.expnod[])
@@ -147,6 +149,91 @@ void builddags(ref GlobalOptimizer go, ref BlockOpt bo)
 }
 
 
+/* The go.expnod[] AEs by a hash that is equal for elems el_match() matches,
+ * built at the start of the CSE walks
+ */
+private struct AeIndex
+{
+    Barray!uint hashes;         // for each go.expnod[] index, the hash of the elem
+    Barray!ulong sorted;        // (hash << 32) | index, in increasing order
+
+    /* Returns: the go.expnod[] indices of the elems with hash h, in increasing order
+     */
+    @trusted
+    auto sameHash(uint h)
+    {
+        static struct Range
+        {
+            const(ulong)[] a;
+            nothrow:
+            bool empty() const { return a.length == 0 || cast(uint)(a[0] >> 32) != h; }
+            uint front() const { return cast(uint)a[0]; }
+            void popFront() { a = a[1 .. $]; }
+            uint h;
+        }
+        const key = cast(ulong)h << 32;
+        size_t lo = 0, hi = sorted.length;
+        while (lo < hi)
+        {
+            const mid = (lo + hi) / 2;
+            if (sorted[mid] < key)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        return Range(sorted[][lo .. $], h);
+    }
+}
+
+private __gshared AeIndex aeIndex;
+
+/* Hash of elem n, from what el_match() requires to be equal: the operators, and the
+ * symbols and offsets of the variables. The hashes of the AEs below go.expnod[limit]
+ * are taken from aeIndex.hashes[].
+ */
+@trusted
+private uint aeHash(ref GlobalOptimizer go, const(elem)* n, uint limit)
+{
+    if (n.Eexp && n.Eexp < limit && go.expnod[n.Eexp] is n)
+        return aeIndex.hashes[n.Eexp];
+    uint h = n.Eoper * 0x9E3779B1;
+    if (OTunary(n.Eoper))
+        h = (h ^ aeHash(go, n.E1, limit)) * 0x85EBCA6B;
+    else if (OTbinary(n.Eoper))
+        h = ((h ^ aeHash(go, n.E1, limit)) * 0x85EBCA6B ^ aeHash(go, n.E2, limit)) * 0xC2B2AE35;
+    else if (n.Eoper == OPvar || n.Eoper == OPrelconst)
+    {
+        const size_t p = cast(size_t)n.Vsym;
+        h = ((h ^ cast(uint)p ^ cast(uint)(p >> 32)) * 0x85EBCA6B ^ cast(uint)n.Voffset) * 0xC2B2AE35;
+    }
+    return h;
+}
+
+@trusted
+private void buildAeIndex(ref GlobalOptimizer go)
+{
+    alias ai = aeIndex;
+    ai.hashes.setLength(go.exptop);
+    ai.sorted.setLength(0);
+    foreach (uint i; 1 .. go.exptop)
+    {
+        if (const e = go.expnod[i])
+        {
+            const h = aeHash(go, e, i);
+            ai.hashes[i] = h;
+            ai.sorted.push((cast(ulong)h << 32) | i);
+        }
+    }
+    import core.stdc.stdlib : qsort;
+    static extern (C) int cmp(scope const void* a, scope const void* b)
+    {
+        const x = *cast(const ulong*)a, y = *cast(const ulong*)b;
+        return x < y ? -1 : x > y;
+    }
+    if (ai.sorted.length > 1)
+        qsort(ai.sorted[].ptr, ai.sorted.length, ulong.sizeof, &cmp);
+}
+
 /****************************
  * Walk tree, rewriting* pn into a DAG as we go.
  * Params:
@@ -167,12 +254,18 @@ private void aewalk(ref GlobalOptimizer go, ref elem* pn, vec_t ae)
         assert(go.expnod[n.Eexp] == n);
         if (go.aetype == Aetype.cse)
         {
-            for (uint i = 0; (i = cast(uint) vec_index(i, ae)) < go.exptop; ++i)
-            {   elem* e = go.expnod[i];
+            /* Only the AEs with the same hash as n can match it; look at those
+             * available in increasing order like vec_index() would
+             */
+            foreach (i; aeIndex.sameHash(aeIndex.hashes[n.Eexp]))
+            {
+                if (!vec_testbit(i, ae))
+                    continue;
+                elem* e = go.expnod[i];
 
                 // Attempt to replace n with e
                 if (e == null)              // if elem no longer exists
-                    vec_clearbit(i,ae);     // it's not available
+                    continue;
                 else if (n != e &&
                     el_match(n,e) &&
                     e.Ecount < 0xFF-1 &&   // must fit in unsigned char
