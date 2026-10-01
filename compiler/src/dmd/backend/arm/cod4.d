@@ -701,7 +701,7 @@ void floatOpAss(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
     if (isPair && (op == OPmulass || op == OPdivass))
         retregs2 = mask(34)|mask(35);       // v2|v3
 
-    codelem(cg,cdb,e2,retregs2,false); // eval right leaf
+    codelem(cg,cdb,e2,retregs2,true); // eval right leaf, which is only read
     reg_t rreg = findreg(retregs2);
 
     bool regvar = false;
@@ -908,7 +908,7 @@ void cdmulass(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
     regm_t regm2 = ~pretregs & cg.allregs;
     if (!regm2)
         regm2 = cg.allregs;
-    codelem(cg,cdb,e2,regm2,false); // load rvalue in reg2
+    codelem(cg,cdb,e2,regm2,true);  // load rvalue in reg2, which is only read
     reg_t reg2 = findreg(regm2);
     getlvalue(cg,cdb,cs,e1,regm2);  // get EA
     regm_t earegm = mask(cs.base) | mask(cs.index);
@@ -982,7 +982,8 @@ void cddivass(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
     regm_t Rdivisorm = ~pretregs & cg.allregs;
     if (!Rdivisorm)
         Rdivisorm = cg.allregs;
-    codelem(cg,cdb,e2,Rdivisorm,false); // load rvalue in Rdivisor
+    // the divisor is only read, but the remainder register is allocated without regard to it
+    codelem(cg,cdb,e2,Rdivisorm,e.Eoper == OPdivass); // load rvalue in Rdivisor
     reg_t Rdivisor = findreg(Rdivisorm);
     getlvalue(cg,cdb,cs,e1,Rdivisorm);  // get EA
     regm_t earegm = mask(cs.base) | mask(cs.index);

@@ -2971,7 +2971,13 @@ void codelem(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs,uin
         pretregs &= ~cg.regcon.mvar;                      /* can't use register vars */
 
     uint op = e.Eoper;
-    if (e.Ecount && e.Ecount != e.Ecomsub)     // if common subexp
+    /* A register variable read for its current value needs no reload from the
+     * CSE when the register is only read
+     */
+    const bool regvarRead = cg.AArch64 && constflag & 1 && op == OPvar && e.Vsym.Sfl == FL.reg &&
+        tysize(e.Ety) <= REGSIZE && tysize(e.Vsym.Stype.Tty) <= REGSIZE &&
+        (e.Vsym.Sregm & pretregs) == e.Vsym.Sregm;
+    if (e.Ecount && e.Ecount != e.Ecomsub && !regvarRead)     // if common subexp
     {
         comsub(cdb,e, pretregs);
         goto L1;
