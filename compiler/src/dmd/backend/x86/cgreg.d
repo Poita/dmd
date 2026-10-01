@@ -370,6 +370,7 @@ private __gshared size_t rangeWalksUsed;
 private __gshared Barray!uint walkHead;
 private __gshared Barray!uint walkStamp;
 private __gshared vec_t walkUsed;
+private __gshared Barray!int walkBefore;   // for cgreg_benefit_walk()
 private __gshared uint rangeWalkStamp = 1;
 
 /* Compute cgreg_benefit() by walking the live range of s.
@@ -386,6 +387,7 @@ private int cgreg_benefit_walk(ref CGstate cg, Symbol* s, reg_t reg, Symbol* ret
     int bi;
     int gotoepilog;
     int retsym_cnt;
+    int x;                      // the block taken out of Slvreg
 
     //printf("cgreg_benefit(s = '%s', reg = %d)\n", s.Sident.ptr, reg);
 
@@ -396,18 +398,37 @@ private int cgreg_benefit_walk(ref CGstate cg, Symbol* s, reg_t reg, Symbol* ret
     reg_t dst_float_reg;
     cgreg_dst_regs(&dst_integer_reg, &dst_float_reg);
 
-Lagain:
-    //printf("again\n");
+    /* Taking block x out of Slvreg changes what the scan finds only at x and at
+     * its successors, so the scan resumes at the first of those in the live range,
+     * with the benefit it had before reaching it.
+     */
+    walkBefore.setLength(2 * bo.dfo.length);
+    int start = 0;
     benefit = 0;
     retsym_cnt = 0;
-
     if (!walkOnly)
         benefit += cgreg_benefit_adjustment(cg, s, reg);
+    goto Lscan;
 
-    for (bi = 0; (bi = cast(uint) vec_index(bi, s.Srange)) < bo.dfo.length; ++bi)
+Lagain:
+    vec_clearbit(x, s.Slvreg);
+    start = x;
+    foreach (bs; bo.dfo[x].Bsucc[])
+    {
+        const j = bs.Bdfoidx;
+        if (j < start && vec_testbit(j, s.Srange))
+            start = j;
+    }
+    benefit = walkBefore[2 * start];
+    retsym_cnt = walkBefore[2 * start + 1];
+
+Lscan:
+    for (bi = start; (bi = cast(uint) vec_index(bi, s.Srange)) < bo.dfo.length; ++bi)
     {   int inoutp;
         int inout_;
 
+        walkBefore[2 * bi] = benefit;
+        walkBefore[2 * bi + 1] = retsym_cnt;
         b = bo.dfo[bi];
         switch (b.bc)
         {
@@ -470,7 +491,7 @@ Lagain:
                         inoutp = 1;
                         if (inout_ != 1)
                         {   if (gotoepilog)
-                            {   vec_clearbit(bpi,s.Slvreg);
+                            {   x = bpi;
                                 goto Lagain;
                             }
                             benefit2 -= b.Bweight;     // need to mov into mem
@@ -483,7 +504,7 @@ Lagain:
                         {   gotoepilog = 1;
                             goto L2;
                         }
-                        vec_clearbit(bpi,s.Slvreg);
+                        x = bpi;
                         goto Lagain;
 
                     default:
@@ -498,7 +519,7 @@ Lagain:
                         inoutp = -1;
                         if (inout_ != -1)
                         {   if (gotoepilog)
-                            {   vec_clearbit(bi,s.Slvreg);
+                            {   x = bi;
                                 goto Lagain;
                             }
                             benefit2 -= b.Bweight;     // need to mov into reg
@@ -510,7 +531,7 @@ Lagain:
                             goto L2;
                         }
                         if (inout_ == 1)
-                        {   vec_clearbit(bi,s.Slvreg);
+                        {   x = bi;
                             goto Lagain;
                         }
                         goto Lcant;
