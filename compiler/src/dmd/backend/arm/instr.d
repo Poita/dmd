@@ -687,6 +687,21 @@ struct INSTR
         return (sf << 31) | (op << 30) | (S << 29) | (0xD4 << 21) | (Rm << 16) | (cond << 12) | (o2 << 10) | (Rn << 5) | Rd;
     }
 
+    /* CSEL Rd,Rn,Rm,<cond> https://www.scs.stanford.edu/~zyedidia/arm64/csel.html
+     */
+    static uint csel(uint sf, ubyte Rm, uint cond, ubyte Rn, ubyte Rd)
+    {
+        return condsel(sf, 0, 0, Rm, cond, 0, Rn, Rd);
+    }
+
+    /* FCSEL Vd,Vn,Vm,<cond> https://www.scs.stanford.edu/~zyedidia/arm64/fcsel_float.html
+     */
+    static uint fcsel_float(uint ftype, ubyte Vm, uint cond, ubyte Vn, ubyte Vd)
+    {
+        assert(cond < 16);
+        return 0x1E200C00 | (ftype << 22) | ((Vm & 31) << 16) | (cond << 12) | ((Vn & 31) << 5) | (Vd & 31);
+    }
+
     /* CSET Rd,<invcond> https://www.scs.stanford.edu/~zyedidia/arm64/cset_csinc.html
      */
     static uint cset(uint sf, uint cond, reg_t Rd)

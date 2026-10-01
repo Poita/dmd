@@ -1026,6 +1026,78 @@ void cdcond(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         return;
     }
 
+    /* Select between two values that are cheap to compute and can not fault:
+     *  CMP/FCMP ...; CSEL/FCSEL Rd,Rn,Rm,cond
+     */
+    static bool selectable(const(elem)* x, ref int budget)
+    {
+        if (--budget < 0 || x.Ety & mTYvolatile)
+            return false;
+        switch (x.Eoper)
+        {
+            case OPconst:
+                return true;
+            case OPvar:
+                return true;
+            case OPadd:
+            case OPmin:
+            case OPmul:
+            case OPand:
+            case OPor:
+            case OPxor:
+            case OPshl:
+            case OPshr:
+            case OPashr:
+                return !tycomplex(x.Ety) && selectable(x.E1, budget) && selectable(x.E2, budget);
+            case OPneg:
+            case OPcom:
+            case OPu8_16:
+            case OPs8_16:
+            case OPu16_32:
+            case OPs16_32:
+            case OPu32_64:
+            case OPs32_64:
+            case OP64_32:
+            case OP32_16:
+            case OP16_8:
+                return selectable(x.E1, budget);
+            default:
+                return false;
+        }
+    }
+    const tym_t tyr = tybasic(e.Ety);
+    const bool selfloat = tyr == TYfloat || tyr == TYdouble;
+    int budget1 = 4, budget2 = 4;
+    if (OTrel(op1) && !e1.Ecount && !psw &&
+        !tycomplex(e1.E1.Ety) && tysize(e1.E1.Ety) <= REGSIZE && tysize(e1.E1.Ety) != 16 &&
+        (selfloat || (tyintegral(tyr) || typtr(tyr)) && (_tysize[tyr] == 4 || _tysize[tyr] == 8)) &&
+        (tyfloating(e21.Ety) != 0) == selfloat && (tyfloating(e22.Ety) != 0) == selfloat &&
+        selectable(e21, budget1) && selectable(e22, budget2))
+    {
+        // the flags first, which evaluating the values does not change
+        regm_t retregsf = mPSW;
+        codelem(cg,cdb,e1,retregsf,false);
+        const regm_t posregs = selfloat ? INSTR.FLOATREGS : cg.allregs;
+        regm_t retregs1 = posregs;
+        codelem(cg,cdb,e21,retregs1,true);
+        regm_t retregs2 = readOnlyRegs2(e21, e22, posregs, retregs1);
+        scodelem(cg,cdb,e22,retregs2,retregs1,true);
+        regm_t retregs = pretregs & posregs;
+        if (!retregs)
+            retregs = posregs;
+        const reg_t Rd = allocreg(cdb,retregs,tyr);
+        const reg_t Rn = findreg(retregs1);
+        const reg_t Rm = findreg(retregs2);
+        if (selfloat)
+            cdb.gen1(INSTR.fcsel_float(INSTR.szToFtype(_tysize[tyr]),Rm,jop,Rn,Rd));  // FCSEL Rd,Rn,Rm,jop
+        else
+            cdb.gen1(INSTR.csel(_tysize[tyr] == 8,Rm,jop,Rn,Rd));    // CSEL Rd,Rn,Rm,jop
+        freenode(e2);
+        fixresult(cg,cdb,e,retregs,pretregs);
+        cg.stackclean--;
+        return;
+    }
+
     uint sz2;
     if (0 && OTrel(op1) && sz1 <= REGSIZE && tysize(e2.Ety) <= REGSIZE && // TODO AArch64
         !e1.Ecount &&
