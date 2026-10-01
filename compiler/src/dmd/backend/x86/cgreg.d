@@ -60,6 +60,12 @@ private __gshared int assignPasses;     // calls to cgreg_assign() for the funct
 void cgreg_init()
 {
     assignPasses = 0;
+    rangeWalksUsed = 0;
+    if (++functionStamp == 0)           // invalidate the walks of the last function
+    {
+        walkStamp[][] = 0;
+        functionStamp = 1;
+    }
     if (!(config.flags4 & CFG4optimized))
         return;
 
@@ -308,7 +314,7 @@ private int cgreg_benefit(ref CGstate cg, Symbol* s, reg_t reg, Symbol* retsym)
             }
             vec_and(walkUsed, s.Srange, regrange[reg]);
 
-            k = walkStamp[si] == rangeWalkStamp ? walkHead[si] : noWalk;
+            k = walkStamp[si] == functionStamp ? walkHead[si] : noWalk;
             for (; k != noWalk; k = rangeWalks[k].next)
             {
                 if (vec_equal(rangeWalks[k].used, walkUsed))
@@ -325,9 +331,9 @@ private int cgreg_benefit(ref CGstate cg, Symbol* s, reg_t reg, Symbol* retsym)
                 w.benefit = walk;
                 setVec(w.used, walkUsed);
                 setVec(w.lvreg, s.Slvreg);
-                w.next = walkStamp[si] == rangeWalkStamp ? walkHead[si] : noWalk;
+                w.next = walkStamp[si] == functionStamp ? walkHead[si] : noWalk;
                 walkHead[si] = k;
-                walkStamp[si] = rangeWalkStamp;
+                walkStamp[si] = functionStamp;
             }
             walkMemo[memoIndex] = (cast(ulong)rangeWalkStamp << 32) | k;
         }
@@ -375,9 +381,11 @@ private int cgreg_benefit_adjustment(ref CGstate cg, const Symbol* s, reg_t reg)
     return benefit;
 }
 
-/* The walks of live ranges in the current cgreg_assign(), rangeWalks[0 .. rangeWalksUsed],
+/* The walks of live ranges in the current function, rangeWalks[0 .. rangeWalksUsed],
  * listed for each globsym[] index i through `next` from walkHead[i] if walkStamp[i]
- * is rangeWalkStamp
+ * is functionStamp. A walk depends on the blocks of the live range where the
+ * register is used and on what does not change while generating the code of a
+ * function, so it stays valid over its passes.
  */
 private struct RangeWalk
 {
@@ -397,7 +405,8 @@ private __gshared Barray!int walkBefore;   // for cgreg_benefit_walk()
 private enum walkMemoRegs = 64;
 private __gshared Barray!ulong walkMemo;    // for each symbol and register: rangeWalkStamp, then the walk
 private __gshared vec_t lastLvreg;          // the blocks where cgreg_benefit() puts the symbol in the register
-private __gshared uint rangeWalkStamp = 1;
+private __gshared uint rangeWalkStamp = 1;      // for walkMemo, changed by each cgreg_assign()
+private __gshared uint functionStamp = 1;       // for walkStamp, changed by each cgreg_init()
 
 /* Compute cgreg_benefit() by walking the live range of s.
  * Params:
@@ -927,10 +936,9 @@ int cgreg_assign(ref CGstate cg, Symbol* retsym)
 {
     int flag = false;                   // assume no changes
     ++assignPasses;
-    rangeWalksUsed = 0;
-    if (++rangeWalkStamp == 0)          // invalidate the walks of the last call
+    if (++rangeWalkStamp == 0)          // forget the walks remembered in the last call
     {
-        walkStamp[][] = 0;
+        walkMemo[][] = 0;
         rangeWalkStamp = 1;
     }
     const bool AArch64 = cg.AArch64;
