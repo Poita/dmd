@@ -909,12 +909,18 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
         return e;
     }
 
-    /* Chain the element assignments in a[] with commas */
+    /* Chain the element assignments in a[] with commas, whose value and type,
+     * including the struct type that says how it is passed, are the last one's
+     */
     static elem* chain(elem*[] a)
     {
         elem* c = a[$ - 1];
         foreach_reverse (x; a[0 .. $ - 1])
-            c = el_bin(OPcomma, c.Ety, x, c);
+        {
+            elem* ec = el_bin(OPcomma, c.Ety, x, c);
+            ec.ET = c.ET;
+            c = ec;
+        }
         return c;
     }
 
