@@ -607,6 +607,7 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
         tym_t[4] ety;   // type of each element
         uint elems;     // number of element accesses
         uint wholes;    // number of accesses of the whole that go through memory
+        bool assigned;  // assigned something other than a constant
         SYMIDX si0;     // index of the first element's symbol after splitting
         type* t;        // the struct type
         Symbol* tmp;    // the copy in memory for accesses of the whole
@@ -773,7 +774,10 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
                     auto inf2 = candidate(e.E2);
                     if (!valueUsed)
                     {
-                        final switch (assignForm(e, inf1, inf2))
+                        const form = assignForm(e, inf1, inf2);
+                        if (inf1 && form != Form.constant && form != Form.none)
+                            inf1.assigned = true;
+                        final switch (form)
                         {
                             case Form.copy:     inf1.elems += inf1.n; inf2.elems += inf2.n; return;
                             case Form.constant: inf1.elems += inf1.n; return;
@@ -784,12 +788,15 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
                         }
                         if (inf1 && isWhole(e.E1, *inf1))
                         {
+                            inf1.assigned = true;
                             ++inf1.wholes;      // written through the copy in memory
                             e = e.E2;
                             valueUsed = true;
                             continue;
                         }
                     }
+                    if (inf1 && isElement(e.E1, *inf1) && e.E2.Eoper != OPconst)
+                        inf1.assigned = true;
                     if (inf1 && !isElement(e.E1, *inf1))
                         inf1.can = false;
                     goto default;
@@ -841,7 +848,10 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
     foreach (si; 0 .. len)
     {
         Info* inf = &info[si];
-        if (!inf.can || !inf.elems || inf.elems < 2 * inf.wholes * inf.n)
+        /* An integer pair only ever assigned constants, like a null array,
+         * would only make what it points to a constant
+         */
+        if (!inf.can || !inf.elems || inf.elems < 2 * inf.wholes * inf.n || inf.isInt && !inf.assigned)
         {
             inf.can = false;
             continue;
