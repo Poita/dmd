@@ -267,34 +267,49 @@ private int cgreg_benefit(ref CGstate cg, Symbol* s, reg_t reg, Symbol* retsym)
 {
     /* Unless s is retsym, the benefit depends on reg only through the blocks of s's
      * live range where reg is used, and by the adjustments for reg made before
-     * walking the live range. The walk for a register used in none of the blocks
-     * is the same for all such registers, so is done once in each cgreg_assign().
+     * walking the live range. So the walk is done once in each cgreg_assign() for
+     * each set of such blocks.
      */
     const si = cast(size_t)s.Ssymnum;
-    if (s != retsym && si < globsym.length && globsym[si] is s && vec_disjoint(s.Srange, regrange[reg]))
+    if (s != retsym && si < globsym.length && globsym[si] is s)
     {
-        if (rangeWalks.length < globsym.length)
+        if (walkHead.length < globsym.length)
         {
-            const oldLength = rangeWalks.length;
-            rangeWalks.setLength(globsym.length);
-            foreach (ref w; rangeWalks[oldLength .. $])
-                w = RangeWalk.init;
+            const oldLength = walkHead.length;
+            walkHead.setLength(globsym.length);
+            walkStamp.setLength(globsym.length);
+            walkStamp[oldLength .. $] = 0;
         }
-        auto w = &rangeWalks[si];
-        if (w.stamp != rangeWalkStamp)
+        const nbits = vec_numbits(s.Srange);
+        if (!walkUsed || vec_numbits(walkUsed) != nbits)
         {
-            w.stamp = rangeWalkStamp;
+            vec_free(walkUsed);
+            walkUsed = vec_calloc(nbits);
+        }
+        vec_and(walkUsed, s.Srange, regrange[reg]);
+
+        uint k = walkStamp[si] == rangeWalkStamp ? walkHead[si] : noWalk;
+        for (; k != noWalk; k = rangeWalks[k].next)
+        {
+            if (vec_equal(rangeWalks[k].used, walkUsed))
+                break;
+        }
+        if (k == noWalk)
+        {
             const walk = cgreg_benefit_walk(cg, s, reg, retsym, true);
+            k = cast(uint)rangeWalksUsed++;
+            if (k == rangeWalks.length)
+                rangeWalks.push(RangeWalk.init);
+            auto w = &rangeWalks[k];
             w.cant = walk == int.min;
             w.benefit = walk;
-            if (!w.lvreg || vec_numbits(w.lvreg) != vec_numbits(s.Slvreg))
-            {
-                vec_free(w.lvreg);
-                w.lvreg = vec_clone(s.Slvreg);
-            }
-            else
-                vec_copy(w.lvreg, s.Slvreg);
+            setVec(w.used, walkUsed);
+            setVec(w.lvreg, s.Slvreg);
+            w.next = walkStamp[si] == rangeWalkStamp ? walkHead[si] : noWalk;
+            walkHead[si] = k;
+            walkStamp[si] = rangeWalkStamp;
         }
+        auto w = &rangeWalks[k];
         if (w.cant)
             return -1;
         vec_copy(s.Slvreg, w.lvreg);
@@ -304,6 +319,20 @@ private int cgreg_benefit(ref CGstate cg, Symbol* s, reg_t reg, Symbol* retsym)
         return benefit;
     }
     return cgreg_benefit_walk(cg, s, reg, retsym, false);
+}
+
+/* Set v to a copy of x, reusing v's memory if it has the same size
+ */
+@trusted
+private void setVec(ref vec_t v, const vec_t x)
+{
+    if (!v || vec_numbits(v) != vec_numbits(x))
+    {
+        vec_free(v);
+        v = vec_clone(x);
+    }
+    else
+        vec_copy(v, x);
 }
 
 /* The adjustments of cgreg_benefit() for the choice of register
@@ -323,17 +352,24 @@ private int cgreg_benefit_adjustment(ref CGstate cg, const Symbol* s, reg_t reg)
     return benefit;
 }
 
-/* The walks of live ranges for registers used in none of their blocks,
- * by globsym[] index, valid when their stamp is rangeWalkStamp
+/* The walks of live ranges in the current cgreg_assign(), rangeWalks[0 .. rangeWalksUsed],
+ * listed for each globsym[] index i through `next` from walkHead[i] if walkStamp[i]
+ * is rangeWalkStamp
  */
 private struct RangeWalk
 {
-    uint stamp;
+    vec_t used;         // the blocks of the live range where the register is used
     bool cant;          // s cannot be in a register
     int benefit;        // benefit from the walk
     vec_t lvreg;        // the blocks where s would be in the register
+    uint next;          // the next walk of the same symbol, or noWalk
 }
+private enum uint noWalk = uint.max;
 private __gshared Barray!RangeWalk rangeWalks;
+private __gshared size_t rangeWalksUsed;
+private __gshared Barray!uint walkHead;
+private __gshared Barray!uint walkStamp;
+private __gshared vec_t walkUsed;
 private __gshared uint rangeWalkStamp = 1;
 
 /* Compute cgreg_benefit() by walking the live range of s.
@@ -843,10 +879,10 @@ struct Reg              // data for trial register assignment
 int cgreg_assign(ref CGstate cg, Symbol* retsym)
 {
     int flag = false;                   // assume no changes
+    rangeWalksUsed = 0;
     if (++rangeWalkStamp == 0)          // invalidate the walks of the last call
     {
-        foreach (ref w; rangeWalks[])
-            w.stamp = 0;
+        walkStamp[][] = 0;
         rangeWalkStamp = 1;
     }
     const bool AArch64 = cg.AArch64;
