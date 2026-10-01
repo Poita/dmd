@@ -41,7 +41,7 @@ import dmd.backend.ty;
 import dmd.backend.type;
 import dmd.backend.machobj  : MachObj_getChkstkSym;
 import dmd.backend.arm.cod2 : tyToExtend;
-import dmd.backend.arm.cod3 : COND, genBranch, conditionCode, gentstreg;
+import dmd.backend.arm.cod3 : COND, genBranch, genCompBranch, conditionCode, gentstreg;
 import dmd.backend.arm.instr;
 import dmd.backend.arm.cod3 : loadFloatRegConst, genaddimm;
 import dmd.backend.x86.cod1 : cdisscaledindex, ssindex_array;
@@ -541,6 +541,60 @@ void logexp(ref CGstate cg, ref CodeBuilder cdb, elem* e, uint jcond, FL fltarg,
        )
     {
         longcmp(cdb, e, jcond != 0, fltarg, targ);
+        cg.stackclean--;
+        return;
+    }
+
+    // !b of a bool b is b ^ 1
+    if (e.Eoper == OPxor && !e.Ecount && e.E2.Eoper == OPconst && el_tolong(e.E2) == 1 &&
+        tybasic(e.E1.Ety) == TYbool)
+    {
+        elem* e1 = e.E1;
+        freenode(e.E2);
+        freenode(e);
+        e = e1;
+        jcond ^= 1;
+    }
+
+    /* A variable, a value in memory or a call's result tested against zero:
+     * CBZ or CBNZ, after a TST of the bits of a value narrower than its
+     * register when the others may not be zero
+     */
+    const tym_t tye = tybasic(e.Ety);
+    const sze = _tysize[tye];
+    if ((e.Eoper == OPvar || e.Eoper == OPind || OTcall(e.Eoper)) &&
+        (tyintegral(tye) || typtr(tye)) && (sze == 1 || sze == 2 || sze == 4 || sze == 8))
+    {
+        const bool ne = (conditionCode(e) == COND.ne) == ((jcond & 1) != 0);
+        /* Loaded from memory, so extended to the whole register; a common
+         * subexpression may be in the register of the value assigned to it
+         */
+        const bool clean = sze >= 4 || !e.Ecount && (e.Eoper == OPind ||
+            e.Eoper == OPvar && e.Vsym.Sfl != FL.reg &&
+            e.Vsym.Sclass != SC.fastpar && e.Vsym.Sclass != SC.shadowreg);
+        regm_t varregm;
+        reg_t R;
+        if (e.Eoper == OPvar && !e.Ecount && !e.Voffset && tysize(e.Vsym.ty()) <= REGSIZE &&
+            isregvar(e, varregm, R) && !(varregm & ~cg.allregs))
+            freenode(e);                // a register variable is tested where it is
+        else
+        {
+            regm_t retregs = cg.allregs;
+            codelem(cg, cdb, e, retregs, true);
+            R = findreg(retregs);
+        }
+        cse_flush(cdb, 1);
+        if (clean)
+            genCompBranch(cdb, sze == 8, R, ne, fltarg, cast(block*) targ);
+        else
+        {
+            uint N, immr, imms;
+            // the mask repeated in both halves, for a 32 bit element
+            const ok = encodeNImmrImms(sze == 1 ? 0x0000_00FF_0000_00FF : 0x0000_FFFF_0000_FFFF, N, immr, imms);
+            assert(ok);
+            cdb.gen1(INSTR.log_imm(0, 3, N, immr, imms, R, 31));   // TST R,#mask
+            genBranch(cdb, ne ? COND.ne : COND.eq, fltarg, cast(block*) targ);
+        }
         cg.stackclean--;
         return;
     }
@@ -1512,6 +1566,14 @@ void tstresult(ref CGstate cg, ref CodeBuilder cdb, regm_t regm, tym_t tym, bool
         const reg_t msw = findreg(regm & INSTR.MSW);
         cdb.gen1(INSTR.orr_shifted_register(1,0,msw,0,lsw,R17));  // ORR X17,lsw,msw
         gentstreg(cdb,R17,1);                                       // CMP X17,#0
+    }
+    else if (sz < 4)
+    {
+        // the register may hold other bits above the value
+        enum reg_t R17 = 17;
+        const uint imms = sz * 8 - 1;
+        cdb.gen1(INSTR.bitfield(0, tyuns(tym) ? 2 : 0, 0, 0, imms, reg, R17)); // UXTB/UXTH/SXTB/SXTH W17,reg
+        gentstreg(cdb,R17,0);                       // CMP W17,#0
     }
     else
         gentstreg(cdb,reg,sz == 8);                 // CMP reg,#0
