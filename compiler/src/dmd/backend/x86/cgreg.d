@@ -283,44 +283,64 @@ private int cgreg_benefit(ref CGstate cg, Symbol* s, reg_t reg, Symbol* retsym)
             walkStamp.setLength(globsym.length);
             walkStamp[oldLength .. $] = 0;
         }
-        const nbits = vec_numbits(s.Srange);
-        if (!walkUsed || vec_numbits(walkUsed) != nbits)
+        /* Within a cgreg_assign() the blocks of the live ranges of the symbols
+         * still evaluated where a register is used do not change, so the walk
+         * found for a symbol and register is found again
+         */
+        const memoIndex = si * walkMemoRegs + reg;
+        if (walkMemo.length < globsym.length * walkMemoRegs)
         {
-            vec_free(walkUsed);
-            walkUsed = vec_calloc(nbits);
+            const oldLength = walkMemo.length;
+            walkMemo.setLength(globsym.length * walkMemoRegs);
+            walkMemo[oldLength .. $] = 0;
         }
-        vec_and(walkUsed, s.Srange, regrange[reg]);
+        uint k = noWalk;
+        const memo = walkMemo[memoIndex];
+        if (cast(uint)(memo >> 32) == rangeWalkStamp)
+            k = cast(uint)memo;
+        else
+        {
+            const nbits = vec_numbits(s.Srange);
+            if (!walkUsed || vec_numbits(walkUsed) != nbits)
+            {
+                vec_free(walkUsed);
+                walkUsed = vec_calloc(nbits);
+            }
+            vec_and(walkUsed, s.Srange, regrange[reg]);
 
-        uint k = walkStamp[si] == rangeWalkStamp ? walkHead[si] : noWalk;
-        for (; k != noWalk; k = rangeWalks[k].next)
-        {
-            if (vec_equal(rangeWalks[k].used, walkUsed))
-                break;
-        }
-        if (k == noWalk)
-        {
-            const walk = cgreg_benefit_walk(cg, s, reg, retsym, true);
-            k = cast(uint)rangeWalksUsed++;
-            if (k == rangeWalks.length)
-                rangeWalks.push(RangeWalk.init);
-            auto w = &rangeWalks[k];
-            w.cant = walk == int.min;
-            w.benefit = walk;
-            setVec(w.used, walkUsed);
-            setVec(w.lvreg, s.Slvreg);
-            w.next = walkStamp[si] == rangeWalkStamp ? walkHead[si] : noWalk;
-            walkHead[si] = k;
-            walkStamp[si] = rangeWalkStamp;
+            k = walkStamp[si] == rangeWalkStamp ? walkHead[si] : noWalk;
+            for (; k != noWalk; k = rangeWalks[k].next)
+            {
+                if (vec_equal(rangeWalks[k].used, walkUsed))
+                    break;
+            }
+            if (k == noWalk)
+            {
+                const walk = cgreg_benefit_walk(cg, s, reg, retsym, true);
+                k = cast(uint)rangeWalksUsed++;
+                if (k == rangeWalks.length)
+                    rangeWalks.push(RangeWalk.init);
+                auto w = &rangeWalks[k];
+                w.cant = walk == int.min;
+                w.benefit = walk;
+                setVec(w.used, walkUsed);
+                setVec(w.lvreg, s.Slvreg);
+                w.next = walkStamp[si] == rangeWalkStamp ? walkHead[si] : noWalk;
+                walkHead[si] = k;
+                walkStamp[si] = rangeWalkStamp;
+            }
+            walkMemo[memoIndex] = (cast(ulong)rangeWalkStamp << 32) | k;
         }
         auto w = &rangeWalks[k];
+        lastLvreg = w.lvreg;
         if (w.cant)
             return -1;
-        vec_copy(s.Slvreg, w.lvreg);
         int benefit = w.benefit + cgreg_benefit_adjustment(cg, s, reg);
         if (benefit > s.Sweight + 1)
             benefit = int.max;      // saturate instead of overflow error
         return benefit;
     }
+    lastLvreg = s.Slvreg;
     return cgreg_benefit_walk(cg, s, reg, retsym, false);
 }
 
@@ -374,6 +394,9 @@ private __gshared Barray!uint walkHead;
 private __gshared Barray!uint walkStamp;
 private __gshared vec_t walkUsed;
 private __gshared Barray!int walkBefore;   // for cgreg_benefit_walk()
+private enum walkMemoRegs = 64;
+private __gshared Barray!ulong walkMemo;    // for each symbol and register: rangeWalkStamp, then the walk
+private __gshared vec_t lastLvreg;          // the blocks where cgreg_benefit() puts the symbol in the register
 private __gshared uint rangeWalkStamp = 1;
 
 /* Compute cgreg_benefit() by walking the live range of s.
@@ -1122,7 +1145,7 @@ int cgreg_assign(ref CGstate cg, Symbol* retsym)
                             vec_println(regrange[r2]);
                         }
     
-                        if (vec_disjoint(s.Slvreg,regrange[r2]))
+                        if (vec_disjoint(lastLvreg,regrange[r2]))
                         {
                             regmsw = r2;
                             break;
@@ -1130,7 +1153,7 @@ int cgreg_assign(ref CGstate cg, Symbol* retsym)
                     }
                     if (regmsw == NOREG && pseqmsw.length)
                         goto Ltried;                // tried and failed to assign MSW
-                    vec_copy(v,s.Slvreg);
+                    vec_copy(v,lastLvreg);
                     u.benefit = benefit;
                     u.reglsw = reg;
                     u.regmsw = regmsw;
