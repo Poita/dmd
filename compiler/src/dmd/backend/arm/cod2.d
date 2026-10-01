@@ -3081,6 +3081,22 @@ void cdneg(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
     const sz = _tysize[tyml];
     bool isPair = isRegisterPair(true, tyml, 0);
 
+    if (tyfloating(tyml) && !isPair && sz <= 8)
+    {
+        // the operand is only read, as the result goes to Vd
+        regm_t retregs1 = INSTR.FLOATREGS;
+        codelem(cg,cdb,e.E1,retregs1,true);
+        const Vn = findreg(retregs1);
+        regm_t retregs = pretregs & INSTR.FLOATREGS;
+        if (retregs == 0)
+            retregs = INSTR.FLOATREGS;
+        const Vd = allocreg(cdb,retregs,tyml);
+        const ftype = INSTR.szToFtype(sz);
+        cdb.gen1(e.Eoper == OPsqrt ? INSTR.fsqrt_float(ftype, Vn, Vd)    // FSQRT Vd,Vn
+                                   : INSTR.fneg_float(ftype, Vn, Vd));   // FNEG Vd,Vn
+        fixresult(cg,cdb,e,retregs,pretregs);
+        return;
+    }
     if (tyfloating(tyml))
     {
         regm_t retregs = pretregs & INSTR.FLOATREGS;
