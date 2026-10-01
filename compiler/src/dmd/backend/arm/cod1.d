@@ -556,6 +556,20 @@ void logexp(ref CGstate cg, ref CodeBuilder cdb, elem* e, uint jcond, FL fltarg,
         jcond ^= 1;
     }
 
+    // x == 0 and x != 0 test x
+    if ((e.Eoper == OPeqeq || e.Eoper == OPne) && !e.Ecount && e.E2.Eoper == OPconst &&
+        !tyfloating(e.E2.Ety) && el_tolong(e.E2) == 0 && tysize(e.E2.Ety) <= 8 &&
+        (e.E1.Eoper == OPvar || e.E1.Eoper == OPind || OTcall(e.E1.Eoper)) &&
+        tysize(e.E1.Ety) == tysize(e.E2.Ety))
+    {
+        elem* e1 = e.E1;
+        if (e.Eoper == OPeqeq)
+            jcond ^= 1;
+        freenode(e.E2);
+        freenode(e);
+        e = e1;
+    }
+
     /* A variable, a value in memory or a call's result tested against zero:
      * CBZ or CBNZ, after a TST of the bits of a value narrower than its
      * register when the others may not be zero

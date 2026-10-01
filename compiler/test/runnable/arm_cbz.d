@@ -33,6 +33,21 @@ pragma(inline, false) int narrow(int a, int b, int k)
     return n;
 }
 
+pragma(inline, false) int compares(int* p, long q, uint k, ubyte b)
+{
+    int n;
+    foreach (i; 0 .. k)
+    {
+        if (p == null) n += 1;
+        if (q != 0) n += 2;
+        if (p && *p == 0) n += 4;
+        if (b == 0) n += 8;
+        q >>= 1;
+        b += 64;
+    }
+    return n;
+}
+
 pragma(inline, false) bool odd(int i) { return (i & 1) != 0; }
 pragma(inline, false) ubyte low(int i) { return cast(ubyte) i; }
 
@@ -74,6 +89,12 @@ void main()
     assert(narrow(255, 0, 3) == narrowRef(255, 0, 3));
     assert(narrow(65535, 1, 3) == narrowRef(65535, 1, 3));
     assert(narrow(200, 300, 70) == narrowRef(200, 300, 70));
+
+    int z = 0, nz = 5;
+    // q: 4, 2, 1, 0; b: 0, 64, 128, 192
+    assert(compares(&z, 4, 4, 0) == 2 * 3 + 4 * 4 + 8);
+    assert(compares(&nz, 4, 4, 0) == 2 * 3 + 8);
+    assert(compares(null, 0, 2, 192) == 1 * 2 + 8);
 
     int n;
     bool flag = false;
