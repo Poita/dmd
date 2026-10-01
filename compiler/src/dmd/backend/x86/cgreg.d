@@ -265,6 +265,85 @@ private void el_weights(int bi,elem* e,uint weight)
 @trusted
 private int cgreg_benefit(ref CGstate cg, Symbol* s, reg_t reg, Symbol* retsym)
 {
+    /* Unless s is retsym, the benefit depends on reg only through the blocks of s's
+     * live range where reg is used, and by the adjustments for reg made before
+     * walking the live range. The walk for a register used in none of the blocks
+     * is the same for all such registers, so is done once in each cgreg_assign().
+     */
+    const si = cast(size_t)s.Ssymnum;
+    if (s != retsym && si < globsym.length && globsym[si] is s && vec_disjoint(s.Srange, regrange[reg]))
+    {
+        if (rangeWalks.length < globsym.length)
+        {
+            const oldLength = rangeWalks.length;
+            rangeWalks.setLength(globsym.length);
+            foreach (ref w; rangeWalks[oldLength .. $])
+                w = RangeWalk.init;
+        }
+        auto w = &rangeWalks[si];
+        if (w.stamp != rangeWalkStamp)
+        {
+            w.stamp = rangeWalkStamp;
+            const walk = cgreg_benefit_walk(cg, s, reg, retsym, true);
+            w.cant = walk == int.min;
+            w.benefit = walk;
+            if (!w.lvreg || vec_numbits(w.lvreg) != vec_numbits(s.Slvreg))
+            {
+                vec_free(w.lvreg);
+                w.lvreg = vec_clone(s.Slvreg);
+            }
+            else
+                vec_copy(w.lvreg, s.Slvreg);
+        }
+        if (w.cant)
+            return -1;
+        vec_copy(s.Slvreg, w.lvreg);
+        int benefit = w.benefit + cgreg_benefit_adjustment(cg, s, reg);
+        if (benefit > s.Sweight + 1)
+            benefit = int.max;      // saturate instead of overflow error
+        return benefit;
+    }
+    return cgreg_benefit_walk(cg, s, reg, retsym, false);
+}
+
+/* The adjustments of cgreg_benefit() for the choice of register
+ */
+@trusted
+private int cgreg_benefit_adjustment(ref CGstate cg, const Symbol* s, reg_t reg)
+{
+    int benefit;
+    // If s is passed in a register to the function, favor that register
+    if ((s.Sclass == SC.fastpar || s.Sclass == SC.shadowreg) && s.Spreg == reg)
+        ++benefit;
+
+    // Make sure we have enough uses to justify
+    // using a register we must save
+    if (cg.fregsaved & (1UL << reg) & cg.mfuncreg)
+        benefit -= 1 + nretblocks;
+    return benefit;
+}
+
+/* The walks of live ranges for registers used in none of their blocks,
+ * by globsym[] index, valid when their stamp is rangeWalkStamp
+ */
+private struct RangeWalk
+{
+    uint stamp;
+    bool cant;          // s cannot be in a register
+    int benefit;        // benefit from the walk
+    vec_t lvreg;        // the blocks where s would be in the register
+}
+private __gshared Barray!RangeWalk rangeWalks;
+private __gshared uint rangeWalkStamp = 1;
+
+/* Compute cgreg_benefit() by walking the live range of s.
+ * Params:
+ *      walkOnly = leave out the adjustments for the choice of register and the
+ *                 saturation, returning int.min if s cannot be in a register
+ */
+@trusted
+private int cgreg_benefit_walk(ref CGstate cg, Symbol* s, reg_t reg, Symbol* retsym, bool walkOnly)
+{
     int benefit;
     int benefit2;
     block* b;
@@ -286,18 +365,8 @@ Lagain:
     benefit = 0;
     retsym_cnt = 0;
 
-static if (1) // causes assert failure in std.range(4488) from std.parallelism's unit tests
-{
-      // (it works now - but keep an eye on it for the moment)
-    // If s is passed in a register to the function, favor that register
-    if ((s.Sclass == SC.fastpar || s.Sclass == SC.shadowreg) && s.Spreg == reg)
-        ++benefit;
-}
-
-    // Make sure we have enough uses to justify
-    // using a register we must save
-    if (cg.fregsaved & (1UL << reg) & cg.mfuncreg)
-        benefit -= 1 + nretblocks;
+    if (!walkOnly)
+        benefit += cgreg_benefit_adjustment(cg, s, reg);
 
     for (bi = 0; (bi = cast(uint) vec_index(bi, s.Srange)) < bo.dfo.length; ++bi)
     {   int inoutp;
@@ -431,12 +500,14 @@ static if (1) // causes assert failure in std.range(4488) from std.parallelism's
      * it should go into a register anyway. So just saturate it at int.max
      */
     //assert(benefit <= s.Sweight + retsym_cnt + 1);
+    if (walkOnly)
+        return benefit;
     if (benefit > s.Sweight + retsym_cnt + 1)
         benefit = int.max;      // saturate instead of overflow error
     return benefit;
 
 Lcant:
-    return -1;                  // can't assign to reg
+    return walkOnly ? int.min : -1;     // can't assign to reg
 }
 
 /*********************************************
@@ -772,6 +843,12 @@ struct Reg              // data for trial register assignment
 int cgreg_assign(ref CGstate cg, Symbol* retsym)
 {
     int flag = false;                   // assume no changes
+    if (++rangeWalkStamp == 0)          // invalidate the walks of the last call
+    {
+        foreach (ref w; rangeWalks[])
+            w.stamp = 0;
+        rangeWalkStamp = 1;
+    }
     const bool AArch64 = cg.AArch64;
 
     /* First do any 'unregistering' which might have happened in the last
@@ -857,154 +934,218 @@ int cgreg_assign(ref CGstate cg, Symbol* retsym)
             : 0;
     }
 
-    // Find symbol t, which is the most 'deserving' symbol that should be
-    // placed into a register.
-    Reg t;
-    t.sym = null;
-    t.benefit = 0;
-    foreach (s; globsym[])
+    /* Assign registers to the most 'deserving' symbol t, then to the next most
+     * deserving one with a live range apart from those of the symbols assigned
+     * so far, and so on. Assigning a register changes the code generated for the
+     * blocks of the symbol's live range, so which registers that code uses, which
+     * the next assignments in those blocks depend on, is only known after
+     * generating the code again; the code of other blocks is unaffected.
+     */
+    vec_t assignedRange = vec_calloc(bo.dfo.length);
+    /* The best register assignment for symbol s in the current state, with in v
+     * the blocks where s would be in the register
+     */
+    Reg evaluate(Symbol* s, vec_t v)
     {
         Reg u;
-        u.sym = s;
-        if (!(s.Sflags & GTregcand) ||
-            s.Sflags & SFLspill ||
-            // Keep trying to reassign retsym into destination register
-            (s.Sfl == FL.reg && !(s == retsym && s.Sregm != dst_integer_mask && s.Sregm != dst_float_mask))
-           )
-        {
-            debug if (debugr)
+            u.sym = s;
+            if (!(s.Sflags & GTregcand) ||
+                s.Sflags & SFLspill ||
+                // Keep trying to reassign retsym into destination register
+                (s.Sfl == FL.reg && !(s == retsym && s.Sregm != dst_integer_mask && s.Sregm != dst_float_mask))
+               )
             {
-                if (s.Sfl == FL.reg)
+                debug if (debugr)
                 {
-                    printf("symbol '%s' is in reg %s\n",s.Sident.ptr,regm_str(s.Sregm));
-                }
-                else if (s.Sflags & SFLspill)
-                {
-                    printf("symbol '%s' spilled in reg %s\n",s.Sident.ptr,regm_str(s.Sregm));
-                }
-                else if (!(s.Sflags & GTregcand))
-                {
-                    printf("symbol '%s' is not a reg candidate\n",s.Sident.ptr);
-                }
-                else
-                    printf("symbol '%s' is not a candidate\n",s.Sident.ptr);
-            }
-
-            continue;
-        }
-
-        tym_t ty = s.ty();
-
-        debug
-        {
-            if (debugr)
-            {   printf("symbol '%3s', ty x%x weight x%x %s\n   ",
-                s.Sident.ptr,ty,s.Sweight,
-                regm_str(s.Spregm()));
-                vec_println(s.Srange);
-            }
-        }
-
-        // Select sequence of registers to try to map s onto
-        const(reg_t)[] pseq;                     // sequence to try for LSW
-        const(reg_t)[] pseqmsw = null;           // sequence to try for MSW, null if none
-        cgreg_set_priorities(ty, pseq, pseqmsw);
-
-        u.benefit = 0;
-        for (int i = 0; i < pseq.length; i++)
-        {
-            reg_t reg = pseq[i];
-
-            // Symbols used as return values should only be mapped into return value registers
-            if (s == retsym && !(reg == dst_integer_reg || reg == dst_float_reg))
-                continue;
-
-            // If BP isn't available, can't assign to it
-            if (!AArch64 && reg == BP && !(cg.allregs & mBP))
-                continue;
-
-static if (0 && TARGET_LINUX)
-{
-            // Need EBX for static pointer
-            if (reg == BX && !(cg.allregs & mBX))
-                continue;
-}
-            /* Don't enregister any parameters to variadicPrologRegs
-             */
-            if (variadicPrologRegs & (1UL << reg))
-            {
-                if (s.Sclass == SC.parameter || s.Sclass == SC.fastpar)
-                    continue;
-                /* Win64 doesn't use the Posix variadic scheme, so we can skip SCshadowreg
-                 */
-            }
-
-            /* Don't assign register parameter to another register parameter
-             */
-            if ((s.Sclass == SC.fastpar || s.Sclass == SC.shadowreg) &&
-                (1UL << reg) & regparams &&
-                reg != s.Spreg)
-                continue;
-
-            if (!AArch64 &&
-                s.Sflags & GTbyte &&
-                !((1UL << reg) & BYTEREGS))
-                    continue;
-
-            int benefit = cgreg_benefit(cg,s,reg,retsym);
-
-            debug if (debugr)
-            {   printf(" %s",regstring[reg]);
-                vec_print(regrange[reg]);
-                printf(" %d\n",benefit);
-            }
-
-            if (benefit > u.benefit)
-            {   // successful assigning of lsw
-                reg_t regmsw = NOREG;
-
-                // Now assign MSW
-                foreach (r2; pseqmsw[])
-                {
-                    if (r2 == reg)              // can't assign msw and lsw to same reg
-                        continue;
-                    if ((s.Sclass == SC.fastpar || s.Sclass == SC.shadowreg) &&
-                        (1UL << r2) & regparams &&
-                        r2 != s.Spreg2)
-                        continue;
-
-                    debug if (debugr)
-                    {   printf(".%s",regstring[r2]);
-                        vec_println(regrange[r2]);
-                    }
-
-                    if (vec_disjoint(s.Slvreg,regrange[r2]))
+                    if (s.Sfl == FL.reg)
                     {
-                        regmsw = r2;
-                        break;
+                        printf("symbol '%s' is in reg %s\n",s.Sident.ptr,regm_str(s.Sregm));
                     }
+                    else if (s.Sflags & SFLspill)
+                    {
+                        printf("symbol '%s' spilled in reg %s\n",s.Sident.ptr,regm_str(s.Sregm));
+                    }
+                    else if (!(s.Sflags & GTregcand))
+                    {
+                        printf("symbol '%s' is not a reg candidate\n",s.Sident.ptr);
+                    }
+                    else
+                        printf("symbol '%s' is not a candidate\n",s.Sident.ptr);
                 }
-                if (regmsw == NOREG && pseqmsw.length)
-                    goto Ltried;                // tried and failed to assign MSW
-                vec_copy(v,s.Slvreg);
-                u.benefit = benefit;
-                u.reglsw = reg;
-                u.regmsw = regmsw;
+    
+                return Reg.init;
             }
-Ltried:
-        }
+    
+            tym_t ty = s.ty();
+    
+            debug
+            {
+                if (debugr)
+                {   printf("symbol '%3s', ty x%x weight x%x %s\n   ",
+                    s.Sident.ptr,ty,s.Sweight,
+                    regm_str(s.Spregm()));
+                    vec_println(s.Srange);
+                }
+            }
+    
+            // Select sequence of registers to try to map s onto
+            const(reg_t)[] pseq;                     // sequence to try for LSW
+            const(reg_t)[] pseqmsw = null;           // sequence to try for MSW, null if none
+            cgreg_set_priorities(ty, pseq, pseqmsw);
+    
+            u.benefit = 0;
+            for (int i = 0; i < pseq.length; i++)
+            {
+                reg_t reg = pseq[i];
+    
+                // Symbols used as return values should only be mapped into return value registers
+                if (s == retsym && !(reg == dst_integer_reg || reg == dst_float_reg))
+                    continue;
+    
+                // If BP isn't available, can't assign to it
+                if (!AArch64 && reg == BP && !(cg.allregs & mBP))
+                    continue;
+    
+    static if (0 && TARGET_LINUX)
+    {
+                // Need EBX for static pointer
+                if (reg == BX && !(cg.allregs & mBX))
+                    continue;
+    }
+                /* Don't enregister any parameters to variadicPrologRegs
+                 */
+                if (variadicPrologRegs & (1UL << reg))
+                {
+                    if (s.Sclass == SC.parameter || s.Sclass == SC.fastpar)
+                        continue;
+                    /* Win64 doesn't use the Posix variadic scheme, so we can skip SCshadowreg
+                     */
+                }
+    
+                /* Don't assign register parameter to another register parameter
+                 */
+                if ((s.Sclass == SC.fastpar || s.Sclass == SC.shadowreg) &&
+                    (1UL << reg) & regparams &&
+                    reg != s.Spreg)
+                    continue;
+    
+                if (!AArch64 &&
+                    s.Sflags & GTbyte &&
+                    !((1UL << reg) & BYTEREGS))
+                        continue;
+    
+                int benefit = cgreg_benefit(cg,s,reg,retsym);
+    
+                debug if (debugr)
+                {   printf(" %s",regstring[reg]);
+                    vec_print(regrange[reg]);
+                    printf(" %d\n",benefit);
+                }
+    
+                if (benefit > u.benefit)
+                {   // successful assigning of lsw
+                    reg_t regmsw = NOREG;
+    
+                    // Now assign MSW
+                    foreach (r2; pseqmsw[])
+                    {
+                        if (r2 == reg)              // can't assign msw and lsw to same reg
+                            continue;
+                        if ((s.Sclass == SC.fastpar || s.Sclass == SC.shadowreg) &&
+                            (1UL << r2) & regparams &&
+                            r2 != s.Spreg2)
+                            continue;
+    
+                        debug if (debugr)
+                        {   printf(".%s",regstring[r2]);
+                            vec_println(regrange[r2]);
+                        }
+    
+                        if (vec_disjoint(s.Slvreg,regrange[r2]))
+                        {
+                            regmsw = r2;
+                            break;
+                        }
+                    }
+                    if (regmsw == NOREG && pseqmsw.length)
+                        goto Ltried;                // tried and failed to assign MSW
+                    vec_copy(v,s.Slvreg);
+                    u.benefit = benefit;
+                    u.reglsw = reg;
+                    u.regmsw = regmsw;
+                }
+    Ltried:
+            }
+        return u;
+    }
 
-        if (u.benefit > t.benefit)
-        {   t = u;
-            vec_copy(t.sym.Slvreg,v);
+    /* The symbols' best assignments, each with the blocks where the symbol would
+     * be in the register
+     */
+    static struct Candidate
+    {
+        Reg u;
+        vec_t lvreg;
+    }
+    Barray!Candidate candidates;
+
+    /* Evaluate the symbols with live ranges apart from those of the symbols assigned
+     * so far
+     */
+    void evaluateAll()
+    {
+        foreach (ref c; candidates[])
+            vec_free(c.lvreg);
+        candidates.setLength(0);
+        foreach (s; globsym[])
+        {
+            if (flag && (!s.Srange || !vec_disjoint(s.Srange, assignedRange)))
+                continue;
+            Reg u = evaluate(s, v);
+            if (u.sym && u.benefit > 0)
+                candidates.push(Candidate(u, vec_clone(v)));
         }
     }
 
-    if (t.sym && t.benefit > 0)
+    /* An assignment changes regrange[] only in the blocks of the symbol's live range,
+     * so it changes the best assignments of the symbols with live ranges apart from
+     * it only by making a register no longer one that must be saved
+     */
+    evaluateAll();
+    while (1)
     {
+        // Find symbol t, which is the most 'deserving' symbol that should be
+        // placed into a register.
+        size_t best = size_t.max;
+        foreach (i, ref c; candidates[])
+        {
+            if (c.u.sym && (best == size_t.max || c.u.benefit > candidates[best].u.benefit))
+                best = i;
+        }
+        if (best == size_t.max)
+            break;
+        Reg t = candidates[best].u;
+        vec_copy(t.sym.Slvreg, candidates[best].lvreg);
+        const mfuncregBefore = cg.mfuncreg;
         cgreg_map(cg,t.sym,t.regmsw,t.reglsw);
         flag = true;
+        vec_orass(assignedRange, t.sym.Srange);
+
+        if (cg.mfuncreg != mfuncregBefore)
+            evaluateAll();
+        else
+        {
+            foreach (ref c; candidates[])
+            {
+                if (c.u.sym && !vec_disjoint(c.u.sym.Srange, assignedRange))
+                    c.u.sym = null;
+            }
+        }
     }
+    foreach (ref c; candidates[])
+        vec_free(c.lvreg);
+    candidates.dtor();
+    vec_free(assignedRange);
 
     /* See if any scratch registers have become available that we can use.
      * Scratch registers are cheaper, as they don't need save/restore.
