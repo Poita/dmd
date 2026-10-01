@@ -765,6 +765,28 @@ public void defIndexChanged(ref GlobalOptimizer go, elem* n)
  *      rdlist = if not null, append reaching defs to it
  */
 
+/* Returns: the index of the first bit at or after i set in both a and b, or n if none
+ */
+@trusted
+private size_t nextInBoth(size_t i, const vec_t a, const vec_t b, size_t n)
+{
+    enum bits = vec_base_t.sizeof * 8;
+    if (i >= n)
+        return n;
+    size_t w = i / bits;
+    const nw = (n + bits - 1) / bits;
+    vec_base_t x = a[w] & b[w] & (~cast(vec_base_t)0 << (i % bits));
+    while (!x)
+    {
+        if (++w == nw)
+            return n;
+        x = a[w] & b[w];
+    }
+    import core.bitop : bsf;
+    const r = w * bits + bsf(x);
+    return r < n ? r : n;
+}
+
 @trusted
 public
 void listrds(ref GlobalOptimizer go, vec_t IN, elem* e, vec_t f, Barray!(elem*)* rdlist)
@@ -805,9 +827,7 @@ void listrds(ref GlobalOptimizer go, vec_t IN, elem* e, vec_t f, Barray!(elem*)*
     size_t i = 0;               // next of mask & IN
     while (1)
     {
-        i = vec_index(i, IN);
-        while (i < go.defnod.length && !vec_testbit(i, mask))
-            i = vec_index(i + 1, IN);
+        i = nextInBoth(i, IN, mask, go.defnod.length);
         while (k < defs.length && !(vec_testbit(defs[k].i, IN) && vec_testbit(defs[k].i, defIndex.varDefs)))
             ++k;
         const fromMask = i < go.defnod.length;
