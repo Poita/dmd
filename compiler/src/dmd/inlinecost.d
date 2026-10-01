@@ -38,7 +38,7 @@ import dmd.tokens;
 import dmd.visitor;
 import dmd.visitor.postorder;
 
-enum COST_MAX = 250;
+enum COST_MAX = 500;
 
 private enum STATEMENT_COST = 0x1000;
 private enum STATEMENT_COST_MAX = 250 * STATEMENT_COST;
