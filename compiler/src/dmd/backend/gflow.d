@@ -95,11 +95,16 @@ void flowrd(ref GlobalOptimizer go, ref BlockOpt bo)
 
     bool anychng;
     vec_t tmp = vec_calloc(go.defnod.length);
+    Dirty dirty;                // only a change to the Boutrd of a predecessor changes Binrd
+    dirty.init(bo.dfo.length);
     do
     {
         anychng = false;
-        foreach (b; bo.dfo[])    // for each block
+        foreach (i, b; bo.dfo[])    // for each block
         {
+            if (!dirty.p[i])
+                continue;
+            dirty.p[i] = false;
             /* Binrd = union of Boutrds of all predecessors of b */
             vec_clear(b.Binrd);
             if (b.bc != BC.catch_ /*&& b.bc != BC.jcatch*/)
@@ -114,11 +119,15 @@ void flowrd(ref GlobalOptimizer go, ref BlockOpt bo)
             /* Bout = (Bin - Bkill) | Bgen */
             vec_sub(tmp,b.Binrd,b.Bkill);
             vec_orass(tmp,b.Bgen);
-            if (!anychng)
-                anychng = !vec_equal(tmp,b.Boutrd);
+            if (!vec_equal(tmp,b.Boutrd))
+            {
+                anychng = true;
+                dirty.mark(bo, b.Bsucc[]);
+            }
             vec_copy(b.Boutrd,tmp);
         }
     } while (anychng);              /* while any changes to Boutrd  */
+    dirty.free();
     vec_free(tmp);
 
     static if (0)
@@ -131,6 +140,37 @@ void flowrd(ref GlobalOptimizer go, ref BlockOpt bo)
             dbg_printf("  Bgen "); vec_println(b.Bgen);
             dbg_printf(" Bkill "); vec_println(b.Bkill);
             dbg_printf("  Bout "); vec_println(b.Boutrd);
+        }
+    }
+}
+
+/* Whether each block of bo.dfo[] needs its data flow equation evaluated again,
+ * because the IN or OUT of a block next to it changed
+ */
+private struct Dirty
+{
+    bool* p;
+    size_t n;
+
+    @trusted nothrow void init(size_t n)
+    {
+        this.n = n;
+        p = cast(bool*)malloc(n ? n : 1);
+        if (!p)
+            err_nomem();
+        p[0 .. n] = true;
+    }
+
+    @trusted nothrow void free() { .free(p); }
+
+    /// Mark the blocks in `blocks` that are in bo.dfo[]
+    @trusted nothrow void mark(ref BlockOpt bo, block*[] blocks)
+    {
+        foreach (b; blocks)
+        {
+            const i = b.Bdfoidx;
+            if (i < n && bo.dfo[i] is b)
+                p[i] = true;
         }
     }
 }
@@ -2092,13 +2132,18 @@ void flowlv(ref BlockOpt bo)
     vec_t tmp = vec_calloc(globsym.length);
     uint cnt = 0;
     bool anychng;
+    Dirty dirty;                // only a change to the Binlv of a successor changes Boutlv
+    dirty.init(bo.dfo.length);
     do
     {
         anychng = false;
 
         /* For each block B in reverse DFO order        */
-        foreach_reverse (b; bo.dfo[])
+        foreach_reverse (i, b; bo.dfo[])
         {
+            if (!dirty.p[i])
+                continue;
+            dirty.p[i] = false;
             /* Bout = union of Bins of all successors to B. */
             bool first = true;
             foreach (bl; b.Bsucc[])
@@ -2119,14 +2164,18 @@ void flowlv(ref BlockOpt bo)
             /* Bin = (Bout - Bkill) | Bgen                  */
             vec_sub(tmp,b.Boutlv,b.Bkill);
             vec_orass(tmp,b.Bgen);
-            if (!anychng)
-                anychng = !vec_equal(tmp,b.Binlv);
+            if (!vec_equal(tmp,b.Binlv))
+            {
+                anychng = true;
+                dirty.mark(bo, b.Bpred[]);
+            }
             vec_copy(b.Binlv,tmp);
         }
         cnt++;
         assert(cnt < 50);
     } while (anychng);
 
+    dirty.free();
     vec_free(tmp);
     vec_free(livexit);
 
