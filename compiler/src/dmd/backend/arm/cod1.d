@@ -1150,14 +1150,28 @@ void getlvalue(ref CGstate cg,ref CodeBuilder cdb,ref code pcs,elem* e,regm_t ke
             if (e1isadd && !e1.Ecount && e12.Eoper == OPconst && sz <= 8 &&
                 tysize(e1ty) == REGSIZE)
             {
-                const c = el_tolong(e12);
+                long c = el_tolong(e12);
                 if (c >= 0 && c < 0x1000)
                 {
-                    scodelem(cg,cdb, e11, idxregs, keepmsk, true);  // load index register
-                    pcs.base = findreg(idxregs);
-                    pcs.IEV1.Voffset = cast(targ_size_t)c;
                     freenode(e12);
                     freenode(e1);
+                    // add in the constants of nested additions
+                    elem* eb = e11;
+                    while (eb.Eoper == OPadd && !eb.Ecount && eb.E2.Eoper == OPconst &&
+                           tysize(eb.Ety) == REGSIZE)
+                    {
+                        const c2 = c + el_tolong(eb.E2);
+                        if (!(c2 >= 0 && c2 < 0x1000))
+                            break;
+                        c = c2;
+                        elem* t = eb.E1;
+                        freenode(eb.E2);
+                        freenode(eb);
+                        eb = t;
+                    }
+                    scodelem(cg,cdb, eb, idxregs, keepmsk, true);  // load index register
+                    pcs.base = findreg(idxregs);
+                    pcs.IEV1.Voffset = cast(targ_size_t)c;
                     return Lptr();
                 }
             }

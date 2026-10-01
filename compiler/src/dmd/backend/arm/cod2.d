@@ -1422,22 +1422,21 @@ void cdind(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
     bool isPair = isRegisterPair(true, tym, 0);
 
     /* Load *(p + c) with LDR Rt,[Rp,#c] when c is a multiple of the size that
-     * fits the scaled immediate
+     * fits the scaled immediate, where c may be the sum of nested constants
      */
     elem* eaddr = e.E1;
     uint offset = 0;
-    if (eaddr.Eoper == OPadd && !eaddr.Ecount && eaddr.E2.Eoper == OPconst &&
+    while (eaddr.Eoper == OPadd && !eaddr.Ecount && eaddr.E2.Eoper == OPconst &&
         !isPair && sz && sz <= 8 && tysize(eaddr.Ety) == REGSIZE)
     {
-        const c = el_tolong(eaddr.E2);
-        if (c > 0 && c % sz == 0 && c / sz < 0x1000)
-        {
-            offset = cast(uint)c;
-            elem* p = eaddr.E1;
-            freenode(eaddr.E2);
-            freenode(eaddr);
-            eaddr = p;
-        }
+        const c = offset + el_tolong(eaddr.E2);
+        if (!(c > 0 && c % sz == 0 && c / sz < 0x1000))
+            break;
+        offset = cast(uint)c;
+        elem* p = eaddr.E1;
+        freenode(eaddr.E2);
+        freenode(eaddr);
+        eaddr = p;
     }
 
     /* Load *(p + (i << log2(sz))) or *(p + i) with LDR Rt,[Rp,Ri{, LSL #log2(sz)}]
