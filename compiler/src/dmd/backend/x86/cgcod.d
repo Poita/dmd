@@ -172,7 +172,15 @@ void codgenx(ref CGstate cg, Symbol* sfunc)
 
         for (block* b = bo.startblock; b; b = b.Bnext)
         {
-            memset(&b.Bregcon,0,b.Bregcon.sizeof);       // Clear out values in registers
+            // Clear out values in registers: the values are valid only where the masks say so
+            b.Bregcon.cse.mval = 0;
+            b.Bregcon.cse.mops = 0;
+            b.Bregcon.immed.mval = 0;
+            b.Bregcon.mvar = 0;
+            b.Bregcon.mpvar = 0;
+            b.Bregcon.indexregs = 0;
+            b.Bregcon.used = 0;
+            b.Bregcon.params = 0;
             if (b.Belem)
                 resetEcomsub(b.Belem);     // reset all the Ecomsubs
             if (b.bc == BC.asm_)
