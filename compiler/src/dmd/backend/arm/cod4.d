@@ -140,7 +140,10 @@ void cdeq(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
             {
                 getregs(cdb, mask(cs.reg));
                 const p = cast(targ_size_t*) &(e2.EV);
-                movregconst(cg,cdb,cs.reg,*p,(sz == 8) ? 64 : 0);
+                if (cs.reg >= 32)       // floating point register variable
+                    loadFloatRegConst(cdb,cs.reg,sz == 4 ? e2.EV.Vfloat : e2.EV.Vdouble,sz);
+                else
+                    movregconst(cg,cdb,cs.reg,*p,(sz == 8) ? 64 : 0);
             }
             else
             {
