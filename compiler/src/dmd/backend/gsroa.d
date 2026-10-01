@@ -578,9 +578,10 @@ private int getSize(const(elem)* e)
 }
 
 /***************************************
- * AArch64: split each local struct of 2 to 4 floats or 2 to 4 doubles that is
+ * AArch64: split each local struct of 2 to 4 floats or 2 to 4 doubles, and
+ * each 16 byte pair of integers or pointers such as a dynamic array, that is
  * mostly accessed an element at a time into a variable per element, so that
- * each element can be a register variable in a V register.
+ * each element can be a register variable.
  * An assignment of the whole struct from or to another such struct, a
  * constant, or memory through a pointer becomes an assignment of each
  * element. Any other use of the whole struct goes through a copy in memory,
@@ -602,6 +603,8 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
         bool can;       // the symbol can be split
         ubyte n;        // number of elements
         ubyte esz;      // size of each element
+        bool isInt;     // the elements are integers or pointers, not floating point
+        tym_t[4] ety;   // type of each element
         uint elems;     // number of element accesses
         uint wholes;    // number of accesses of the whole that go through memory
         SYMIDX si0;     // index of the first element's symbol after splitting
@@ -625,7 +628,33 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
         if (s.Sclass != SC.auto_ && s.Sclass != SC.register)
             continue;
         type* t = s.Stype;
-        if (tybasic(t.Tty) != TYstruct || t.Ttag.Sstruct.Sflags & STRbitfields)
+        const tyt = tybasic(t.Tty);
+        if (tyt == TYdarray || tyt == TYdelegate ||
+            tyt == TYstruct && type_size(t) == 16 && !(t.Ttag.Sstruct.Sflags & STRbitfields))
+        {
+            // two integers or pointers of 8 bytes
+            tym_t ty0 = tyt == TYdarray ? TYsize_t : TYnptr;
+            tym_t ty1 = TYnptr;
+            if (tyt == TYstruct)
+            {
+                const a1 = t.Ttag.Sstruct.Sarg1type;
+                const a2 = t.Ttag.Sstruct.Sarg2type;
+                if (!a1 || !a2 || type_size(a1) != 8 || type_size(a2) != 8 ||
+                    tyfloating(a1.Tty) || tyfloating(a2.Tty) || tyaggregate(a1.Tty) || tyaggregate(a2.Tty))
+                    continue;
+                ty0 = tybasic(a1.Tty);
+                ty1 = tybasic(a2.Tty);
+            }
+            info[si].can = true;
+            info[si].n = 2;
+            info[si].esz = 8;
+            info[si].isInt = true;
+            info[si].ety[0] = ty0;
+            info[si].ety[1] = ty1;
+            any = true;
+            continue;
+        }
+        if (tyt != TYstruct || t.Ttag.Sstruct.Sflags & STRbitfields)
             continue;
         const a = aarch64Aggregate(t);
         if (a.kind != AggregateABI.Kind.hfa || a.nregs < 2 || a.nregs > 4 ||
@@ -639,14 +668,20 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
     if (!any)
         return;
 
-    static tym_t elemTy(const ref Info inf) { return inf.esz == 4 ? TYfloat : TYdouble; }
+    static tym_t elemTy(const ref Info inf, uint k)
+    {
+        return inf.isInt ? inf.ety[k] : inf.esz == 4 ? TYfloat : TYdouble;
+    }
 
     /* Whether e is an access of one element */
     static bool isElement(const(elem)* e, const ref Info inf)
     {
+        if (e.Voffset % inf.esz || e.Voffset < 0 || e.Voffset >= inf.n * inf.esz)
+            return false;
         const ty = tybasic(e.Ety);
-        return (ty == elemTy(inf) || ty == (inf.esz == 4 ? TYifloat : TYidouble)) &&
-               e.Voffset % inf.esz == 0 && e.Voffset >= 0 && e.Voffset < inf.n * inf.esz;
+        if (inf.isInt)
+            return !tyfloating(ty) && !tyaggregate(ty) && tysize(ty) == 8;
+        return ty == elemTy(inf, 0) || ty == (inf.esz == 4 ? TYifloat : TYidouble);
     }
 
     /* Whether e is an access of the whole */
@@ -659,7 +694,7 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
                                           : tysize(e.Ety) == size;
     }
 
-    enum Form { none, copy, constant, load, store }
+    enum Form { none, copy, constant, load, store, pair }
 
     /* How an assignment e of a whole, whose value is not used, splits into
      * element assignments, given the Info of e.E1 and e.E2 if they are vars
@@ -671,7 +706,12 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
         const whole1 = inf1 && isWhole(e1, *inf1);
         const whole2 = inf2 && isWhole(e2, *inf2);
         if (whole1 && whole2)
-            return e1.Vsym !is e2.Vsym && inf1.n == inf2.n && inf1.esz == inf2.esz ? Form.copy : Form.none;
+            return e1.Vsym !is e2.Vsym && inf1.n == inf2.n && inf1.esz == inf2.esz && inf1.isInt == inf2.isInt
+                ? Form.copy : Form.none;
+        if (whole1 && e2.Eoper == OPpair && !e2.Ecount && inf1.n == 2 &&
+            tysize(e2.E1.Ety) == inf1.esz && tysize(e2.E2.Ety) == inf1.esz &&
+            (tyfloating(e2.E1.Ety) != 0) == !inf1.isInt && (tyfloating(e2.E2.Ety) != 0) == !inf1.isInt)
+            return Form.pair;
         if (whole1 && e2.Eoper == OPconst && e.Eoper == OPeq && (tysize(e2.Ety) == 8 || tysize(e2.Ety) == 16))
             return Form.constant;
         if (whole1 && e2.Eoper == OPind && !e2.Ecount && !(e2.Ety & mTYvolatile) && !el_sideeffect(e2.E1))
@@ -701,7 +741,13 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
                         if (isElement(e, *inf))
                             ++inf.elems;
                         else if (isWhole(e, *inf))
-                            ++inf.wholes;       // read through the copy in memory
+                        {
+                            // read as a pair of the integer elements, or through the copy in memory
+                            if (inf.isInt)
+                                ++inf.elems;
+                            else
+                                ++inf.wholes;
+                        }
                         else
                             inf.can = false;
                     }
@@ -730,6 +776,7 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
                             case Form.constant: inf1.elems += inf1.n; return;
                             case Form.load:     inf1.elems += inf1.n; gather(e.E2.E1, true); return;
                             case Form.store:    inf2.elems += inf2.n; gather(e.E1.E1, true); return;
+                            case Form.pair:     inf1.elems += inf1.n; gather(e.E2.E1, true); gather(e.E2.E2, true); return;
                             case Form.none:     break;
                         }
                         if (inf1 && isWhole(e.E1, *inf1))
@@ -799,7 +846,6 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
         Symbol* sold = symtab[si + added];
         inf.si0 = si + added;
         inf.t = sold.Stype;                     // keep the struct type for the copy in memory
-        const tyf = elemTy(*inf);
         foreach (k; 1 .. inf.n)
         {
             const idlen = 2 + strlen(sold.Sident.ptr) + 2;
@@ -812,12 +858,12 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
             snew.Sclass = sold.Sclass;
             snew.Sfl = sold.Sfl;
             snew.Sflags = sold.Sflags | GTregcand;
-            snew.Stype = type_fake(tyf);
+            snew.Stype = type_fake(elemTy(*inf, k));
             snew.Stype.Tcount++;
             ++added;
             symbol_insert(symtab, snew, si + added);
         }
-        sold.Stype = type_fake(tyf);
+        sold.Stype = type_fake(elemTy(*inf, 0));
         sold.Stype.Tcount++;
         sold.Sflags |= GTregcand;
     }
@@ -857,7 +903,7 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
             inf.tmp.Sfl = FL.auto_;
         }
         elem* e = el_var(inf.tmp);
-        e.Ety = elemTy(inf);
+        e.Ety = elemTy(inf, k);
         e.ET = null;
         e.Voffset = k * inf.esz;
         return e;
@@ -897,12 +943,21 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
                             e.Vsym = symtab[inf.si0 + k];
                             e.Voffset = 0;
                         }
+                        else if (inf.isInt)
+                        {
+                            // (e.0 OPpair e.1)
+                            elem* lo = elemVar(*inf, 0);
+                            elem* hi = elemVar(*inf, 1);
+                            e.Eoper = OPpair;
+                            e.E1 = lo;
+                            e.E2 = hi;
+                        }
                         else
                         {
                             // (tmp.0 = e.0, ..., tmp)
                             elem*[5] a;
                             foreach (k; 0 .. inf.n)
-                                a[k] = el_bin(OPeq, elemTy(*inf), tmpElem(*inf, k), elemVar(*inf, k));
+                                a[k] = el_bin(OPeq, elemTy(*inf, k), tmpElem(*inf, k), elemVar(*inf, k));
                             elem* w = el_calloc();
                             el_copy(w, e);
                             w.Vsym = inf.tmp;
@@ -946,7 +1001,7 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
                                 el_free(e.E1);
                                 a[0] = eqt;
                                 foreach (k; 0 .. inf1.n)
-                                    a[k + 1] = el_bin(OPeq, elemTy(*inf1), elemVar(*inf1, k), tmpElem(*inf1, k));
+                                    a[k + 1] = el_bin(OPeq, elemTy(*inf1, k), elemVar(*inf1, k), tmpElem(*inf1, k));
                                 become(e, chain(a[0 .. inf1.n + 1]));
                                 return;
                             }
@@ -956,8 +1011,20 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
                         {
                             case Form.copy:
                                 foreach (k; 0 .. inf1.n)
-                                    a[k] = el_bin(OPeq, elemTy(*inf1), elemVar(*inf1, k), elemVar(*inf2, k));
+                                    a[k] = el_bin(OPeq, elemTy(*inf1, k), elemVar(*inf1, k), elemVar(*inf2, k));
                                 break;
+
+                            case Form.pair:
+                            {
+                                elem* ep = e.E2;
+                                replace(ep.E1, true);
+                                replace(ep.E2, true);
+                                a[0] = el_bin(OPeq, elemTy(*inf1, 0), elemVar(*inf1, 0), ep.E1);
+                                a[1] = el_bin(OPeq, elemTy(*inf1, 1), elemVar(*inf1, 1), ep.E2);
+                                ep.E1 = null;
+                                ep.E2 = null;
+                                break;
+                            }
 
                             case Form.constant:
                             {
@@ -973,14 +1040,21 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
                                         const ulong half = tysize(ec.Ety) == 16 && k >= 2 ? ec.Vcent.hi : ec.Vcent.lo;
                                         bits = (k & 1) ? half >> 32 : half & 0xFFFF_FFFF;
                                     }
-                                    if (inf1.esz == 8)
-                                        c.Vdouble = *cast(double*)&bits;
+                                    elem* ek;
+                                    if (inf1.isInt)
+                                        ek = el_long(elemTy(*inf1, k), bits);
                                     else
                                     {
-                                        uint b32 = cast(uint)bits;
-                                        c.Vfloat = *cast(float*)&b32;
+                                        if (inf1.esz == 8)
+                                            c.Vdouble = *cast(double*)&bits;
+                                        else
+                                        {
+                                            uint b32 = cast(uint)bits;
+                                            c.Vfloat = *cast(float*)&b32;
+                                        }
+                                        ek = el_const(elemTy(*inf1, k), c);
                                     }
-                                    a[k] = el_bin(OPeq, elemTy(*inf1), elemVar(*inf1, k), el_const(elemTy(*inf1), c));
+                                    a[k] = el_bin(OPeq, elemTy(*inf1, k), elemVar(*inf1, k), ek);
                                 }
                                 break;
                             }
@@ -996,9 +1070,9 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
                                     elem* p = k == 0 ? ep : el_copytree(ep);
                                     if (k)
                                         p = el_bin(OPadd, ep.Ety, p, el_long(TYsize_t, k * inf.esz));
-                                    elem* m = el_una(OPind, elemTy(*inf), p);
-                                    a[k] = form == Form.load ? el_bin(OPeq, elemTy(*inf), elemVar(*inf, k), m)
-                                                             : el_bin(OPeq, elemTy(*inf), m, elemVar(*inf, k));
+                                    elem* m = el_una(OPind, elemTy(*inf, k), p);
+                                    a[k] = form == Form.load ? el_bin(OPeq, elemTy(*inf, k), elemVar(*inf, k), m)
+                                                             : el_bin(OPeq, elemTy(*inf, k), m, elemVar(*inf, k));
                                 }
                                 // detach the pointer, which is now in the element assignments
                                 if (form == Form.load)
