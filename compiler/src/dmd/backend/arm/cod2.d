@@ -2067,9 +2067,28 @@ void cdmemcmp(ref CGstate cg,ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
 void cdmemcpy(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
 {
     //printf("cdmemcpy()\n");
-    /*  Generate the following:
+    /*  Generate the following, copying 8 bytes at a time, then 4, then 1:
         CBZ  Xn,L2
         MOV  x5,#0
+        CMP  Xn,#8
+        B.LO L4
+      L8:
+        LDR  x4,[Xs,x5]
+        STR  x4,[Xd,x5]
+        ADD  x5,x5,#8
+        SUB  x4,Xn,x5
+        CMP  x4,#8
+        B.HS L8
+      L4:
+        SUB  x4,Xn,x5
+        CMP  x4,#4
+        B.LO L1T
+        LDR  w4,[Xs,x5]
+        STR  w4,[Xd,x5]
+        ADD  x5,x5,#4
+      L1T:
+        CMP  Xn,x5
+        B.EQ L2
       L1:
         LDRB w4,[Xs,x5]
         STRB w4,[Xd,x5]
@@ -2127,9 +2146,43 @@ void cdmemcpy(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
 
     code cs;
     cs.reg = NOREG;
-    cs.base = Xs;
     cs.index = R5;
     cs.Sextend = Extend.LSL;
+
+    code* cnop4 = gen1(null, INSTR.nop);
+    code* cnop1t = gen1(null, INSTR.nop);
+
+    cdb.gen1(INSTR.cmp_imm(1,0,8,Xn));                  // CMP  Xn,#8
+    genBranch(cdb,COND.cc,FL.code,cast(block*) cnop4);  // B.LO L4
+    cs.base = Xs;
+    loadFromEA(cs,R4,8,8);                              // LDR  x4,[Xs,x5]
+    cdb.gen(&cs);
+    code* L8 = cdb.last();
+    cs.base = Xd;
+    storeToEA(cs,R4,8);                                 // STR  x4,[Xd,x5]
+    cdb.gen(&cs);
+    cdb.gen1(INSTR.addsub_imm(1,0,0,0,8,R5,R5));        // ADD  x5,x5,#8
+    cdb.gen1(INSTR.addsub_shift(1,1,0,0,R5,0,Xn,R4));   // SUB  x4,Xn,x5
+    cdb.gen1(INSTR.cmp_imm(1,0,8,R4));                  // CMP  x4,#8
+    genBranch(cdb,COND.cs,FL.code,cast(block*) L8);     // B.HS L8
+
+    cdb.append(cnop4);                                  // L4:
+    cdb.gen1(INSTR.addsub_shift(1,1,0,0,R5,0,Xn,R4));   // SUB  x4,Xn,x5
+    cdb.gen1(INSTR.cmp_imm(1,0,4,R4));                  // CMP  x4,#4
+    genBranch(cdb,COND.cc,FL.code,cast(block*) cnop1t); // B.LO L1T
+    cs.base = Xs;
+    loadFromEA(cs,R4,4,4);                              // LDR  w4,[Xs,x5]
+    cdb.gen(&cs);
+    cs.base = Xd;
+    storeToEA(cs,R4,4);                                 // STR  w4,[Xd,x5]
+    cdb.gen(&cs);
+    cdb.gen1(INSTR.addsub_imm(1,0,0,0,4,R5,R5));        // ADD  x5,x5,#4
+
+    cdb.append(cnop1t);                                 // L1T:
+    cdb.gen1(INSTR.cmp_subs_addsub_shift(1,R5,0,0,Xn)); // CMP  Xn,x5
+    genBranch(cdb,COND.eq,FL.code,cast(block*) cnop2);  // B.EQ L2
+
+    cs.base = Xs;
     loadFromEA(cs,R4,1,1);                              // LDRB w4,[Xs,x5]
     cdb.gen(&cs);
     code* L1 = cdb.last();
