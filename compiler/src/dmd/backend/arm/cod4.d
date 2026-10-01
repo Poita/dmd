@@ -2304,10 +2304,14 @@ void cdlngsht(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
     }
 
     regm_t retregs;
+    /* The operand is only read, as the result is its low part in the same
+     * register, unless the result is a common subexpression the register then holds
+     */
+    const bool readOnly = !e.Ecount;
     if (e.Eoper == OP16_8)
     {
         retregs = pretregs ? cg.allregs : 0;
-        codelem(cg,cdb,e.E1,retregs,false);
+        codelem(cg,cdb,e.E1,retregs,readOnly);
     }
     else
     {
@@ -2316,7 +2320,7 @@ void cdlngsht(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         else
         {
             retregs = pretregs ? cg.allregs : 0;
-            codelem(cg,cdb,e.E1,retregs,false);
+            codelem(cg,cdb,e.E1,retregs,readOnly);
             bool isOff = e.Eoper == OPoffset;
             if (isOff || e.Eoper == OP128_64)
                 retregs &= INSTR.LSW;                // want LSW only
