@@ -1632,8 +1632,19 @@ void cdcnvt(ref CGstate cg, ref CodeBuilder cdb,elem* e, ref regm_t pretregs)
         case OPd_u32:                               // fcvtzu w0,d31
         case OPd_u64:                               // fcvtzu x0,d31
         L2:
+            /* Converting a float to double is exact, so (int)(double)f converts
+             * f directly
+             */
+            elem* src = e.E1;
+            if (src.Eoper == OPf_d && !src.Ecount)
+            {
+                src = src.E1;
+                ftype = 0;
+            }
             regm_t retregs1 = INSTR.FLOATREGS;
-            codelem(cg,cdb,e.E1,retregs1,false);
+            codelem(cg,cdb,src,retregs1,false);
+            if (src !is e.E1)
+                freenode(e.E1);
             const reg_t V1 = findreg(retregs1);         // source floating point register
 
             regm_t retregs = pretregs & cg.allregs;
@@ -1649,10 +1660,10 @@ void cdcnvt(ref CGstate cg, ref CodeBuilder cdb,elem* e, ref regm_t pretregs)
                     cdb.gen1(INSTR.sxth_sbfm(0,Rd,Rd));                 // sxth Rd,Rd
                     break;
                 case OPd_s32:
-                    cdb.gen1(INSTR.fcvtzs(0,1,V1,Rd));                  // fcvtzs Rd,V1
+                    cdb.gen1(INSTR.fcvtzs(0,ftype,V1,Rd));              // fcvtzs Rd,V1
                     break;
                 case OPd_s64:
-                    cdb.gen1(INSTR.fcvtzs(1,1,V1,Rd));                  // fcvtzs Rd,V1
+                    cdb.gen1(INSTR.fcvtzs(1,ftype,V1,Rd));              // fcvtzs Rd,V1
                     break;
                 case OPd_u16:
                     cdb.gen1(INSTR.fcvtzu(0,ftype,V1,Rd));              // fcvtzu Rd,V1
@@ -1661,10 +1672,10 @@ void cdcnvt(ref CGstate cg, ref CodeBuilder cdb,elem* e, ref regm_t pretregs)
                     cdb.gen1(INSTR.log_imm(0,0,0,immr,imms,Rd,Rd));     // and Rd,Rd,#0xFFFF
                     break;
                 case OPd_u32:
-                    cdb.gen1(INSTR.fcvtzu(0,1,V1,Rd));                  // fcvtzu Rd,V1
+                    cdb.gen1(INSTR.fcvtzu(0,ftype,V1,Rd));              // fcvtzu Rd,V1
                     break;
                 case OPd_u64:
-                    cdb.gen1(INSTR.fcvtzu(1,1,V1,Rd));                  // fcvtzu Rd,V1
+                    cdb.gen1(INSTR.fcvtzu(1,ftype,V1,Rd));              // fcvtzu Rd,V1
                     break;
                 default:
                     assert(0);
@@ -1721,6 +1732,28 @@ void cdcnvt(ref CGstate cg, ref CodeBuilder cdb,elem* e, ref regm_t pretregs)
 
         case OPd_f:     // fcvt d31,s31
         case OPf_d:     // fcvt s31,d31
+            if (e.Eoper == OPd_f && !e.E1.Ecount &&
+                (e.E1.Eoper == OPs32_d || e.E1.Eoper == OPu32_d))
+            {
+                /* Converting a 32 bit integer to double is exact, so
+                 * (float)(double)i converts i directly
+                 */
+                elem* e1 = e.E1;
+                regm_t retregsi = INSTR.ALLREGS;
+                codelem(cg,cdb,e1.E1,retregsi,false);
+                const reg_t Rn = findreg(retregsi);
+                freenode(e1);
+                regm_t retregs = pretregs & INSTR.FLOATREGS;
+                if (retregs == 0)
+                    retregs = INSTR.FLOATREGS;
+                const reg_t Vd = allocreg(cdb,retregs,tybasic(e.Ety));
+                if (e1.Eoper == OPs32_d)
+                    cdb.gen1(INSTR.scvtf_float_int(0,0,Rn,Vd));    // scvtf Sd,Wn
+                else
+                    cdb.gen1(INSTR.ucvtf_float_int(0,0,Rn,Vd));    // ucvtf Sd,Wn
+                fixresult(cg,cdb,e,retregs,pretregs);
+                break;
+            }
             regm_t retregs1 = INSTR.FLOATREGS;
             codelem(cg,cdb,e.E1,retregs1,false);
             const reg_t V1 = findreg(retregs1);         // source floating point register
