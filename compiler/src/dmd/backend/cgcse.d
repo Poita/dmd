@@ -48,6 +48,7 @@ struct CSE
     code    csimple;        // if CSEsimple, this is the code to regenerate it
     regm_t  regm;           // mask of register stored there
     int     slot;           // slot number
+    int     packed;         // index of the stack slot, once finish() packs the loaded CSEs
     ubyte   flags;          // flag bytes
 
   nothrow:
@@ -82,16 +83,9 @@ struct CSE
     static CSE* add()
     {
         //printf("CSE.add()\n");
-        foreach (ref cse; csextab)
-        {
-            if (cse.e == null)  // can share with previously used one
-            {
-                cse.flags &= CSEload;
-                return &cse;
-            }
-        }
-
-        // create new one
+        /* Each entry is a separate save, so a save that is never loaded
+         * can be dropped even when other saves are loaded
+         */
         const slot = cast(int)csextab.length;
         CSE cse;
         cse.slot = slot;
@@ -208,8 +202,12 @@ struct CSE
     @trusted
     static void finish()
     {
-        while (csextab.length != 0 && (csextab[csextab.length - 1].flags & CSEload) == 0)
-            csextab.setLength(csextab.length - 1);
+        numPacked = 0;
+        foreach (ref cse; csextab[])
+        {
+            if (cse.flags & CSEload)
+                cse.packed = numPacked++;
+        }
     }
 
     /**** The rest of the functions can be called only after finish() ****/
@@ -221,7 +219,7 @@ struct CSE
     @trusted
     static uint size()
     {
-        return cast(uint)csextab.length * CSE.slotSize;
+        return numPacked * CSE.slotSize;
     }
 
     /*********************
@@ -238,35 +236,27 @@ struct CSE
     @trusted
     static uint offset(int i)
     {
-        return i * slotSize;
+        return csextab[i].packed * slotSize;
     }
 
     /// Returns: true if CSE was ever loaded
     @trusted
     static bool loaded(int i)
     {
-        return i < csextab.length &&   // array could be shrunk for non-CSEload entries
-               (csextab[i].flags & CSEload);
+        return i < csextab.length && (csextab[i].flags & CSEload);
     }
 
   private:
   __gshared:
     Barray!CSE csextab;     // CSE table (allocated for each function)
     uint slotSize;          // size of each slot in table
+    uint numPacked;         // number of stack slots, one for each loaded CSE
     uint alignment_;        // alignment for the table
 }
 
 
 /********************
- * The above implementation of CSE is inefficient:
- * 1. the optimization to not store CSE's that are never reloaded is based on the slot number,
- * not the CSE. This means that when a slot is shared among multiple CSEs, it is treated
- * as "reloaded" even if only one of the CSEs in that slot is reloaded.
- * 2. updateSizeAndAlign should only be run when reloading when (1) is fixed.
- * 3. all slots are aligned to worst case alignment of any slot.
- * 4. unused slots still get memory allocated to them if they aren't at the end of the
- * slot table.
- *
- * The slot number should be unique to each CSE, and allocation of actual slots should be
- * done after the code is generated, not during generation.
+ * Remaining inefficiencies of the above implementation of CSE:
+ * 1. updateSizeAndAlign is run for every save rather than only for loaded ones.
+ * 2. all slots are aligned to worst case alignment of any slot.
  */
