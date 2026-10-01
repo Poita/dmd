@@ -570,11 +570,31 @@ void prolog_saveregs(ref CGstate cg, ref CodeBuilder cdb, regm_t topush, int cfa
     {
         reg_t reg = findreg(topush);
         topush &= ~mask(reg);
+        const bool isfloat = (mask(reg) & INSTR.FLOATREGS) != 0;
 
-        const ins = (mask(reg) & INSTR.FLOATREGS)
-            // https://www.scs.stanford.edu/~zyedidia/arm64/str_imm_fpsimd.html
-            ? INSTR.str_imm_fpsimd(3,0,cast(uint)gpoffset >> 3,fp,reg) // STR reg,[fp,#offset]
-            : INSTR.str_imm_gen(1, reg, fp, gpoffset);            // STR reg,[fp,#offset]
+        /* Save two registers of the same kind with one STP when the offset fits
+         */
+        reg_t reg2 = NOREG;
+        if (topush && gpoffset / 8 < 63)
+        {
+            reg_t r = findreg(topush);
+            if (((mask(r) & INSTR.FLOATREGS) != 0) == isfloat)
+            {
+                reg2 = r;
+                topush &= ~mask(r);
+            }
+        }
+
+        uint ins;
+        if (reg2 != NOREG)
+            // https://www.scs.stanford.edu/~zyedidia/arm64/stp_gen.html
+            ins = INSTR.ldstpair_off(isfloat ? 1 : 2, isfloat, 0, cast(uint)gpoffset / 8,
+                                     cast(ubyte)(reg2 & 31), cast(ubyte)fp, cast(ubyte)(reg & 31)); // STP reg,reg2,[fp,#offset]
+        else
+            ins = isfloat
+                // https://www.scs.stanford.edu/~zyedidia/arm64/str_imm_fpsimd.html
+                ? INSTR.str_imm_fpsimd(3,0,cast(uint)gpoffset >> 3,fp,reg) // STR reg,[fp,#offset]
+                : INSTR.str_imm_gen(1, reg, fp, gpoffset);            // STR reg,[fp,#offset]
         cdb.gen1(ins);
 
         if (config.fulltypes == CVDWARF_C || config.fulltypes == CVDWARF_D ||
@@ -583,10 +603,12 @@ void prolog_saveregs(ref CGstate cg, ref CodeBuilder cdb, regm_t topush, int cfa
             code* c = cdb.finish();
             dwarf_CFA_set_loc(calcblksize(c));  // address after save
             dwarf_CFA_offset(reg, cast(int)(gpoffset - cfa_offset));
+            if (reg2 != NOREG)
+                dwarf_CFA_offset(reg2, cast(int)(gpoffset + REGSIZE - cfa_offset));
             cdb.reset();
             cdb.append(c);
         }
-        gpoffset += REGSIZE;
+        gpoffset += reg2 != NOREG ? 2 * REGSIZE : REGSIZE;
     }
 }
 
@@ -626,13 +648,32 @@ private void epilog_restoreregs(ref CGstate cg, ref CodeBuilder cdb, regm_t topo
     {
         reg_t reg = findreg(topop);
         topop &= ~mask(reg);
+        const bool isfloat = (mask(reg) & INSTR.FLOATREGS) != 0;
 
-        const ins = (mask(reg) & INSTR.FLOATREGS)
-            // https://www.scs.stanford.edu/~zyedidia/arm64/ldr_imm_fpsimd.html
-            ? INSTR.ldr_imm_fpsimd(3,1,cast(uint)gpoffset >> 3,fp,reg) // LDR reg,[fp,#offset]
-            : INSTR.ldr_imm_gen(1, reg, fp, gpoffset);            // LDR reg,[fp,#offset]
+        // restore the same pairs prolog_saveregs() saved with STP
+        reg_t reg2 = NOREG;
+        if (topop && gpoffset / 8 < 63)
+        {
+            reg_t r = findreg(topop);
+            if (((mask(r) & INSTR.FLOATREGS) != 0) == isfloat)
+            {
+                reg2 = r;
+                topop &= ~mask(r);
+            }
+        }
+
+        uint ins;
+        if (reg2 != NOREG)
+            // https://www.scs.stanford.edu/~zyedidia/arm64/ldp_gen.html
+            ins = INSTR.ldstpair_off(isfloat ? 1 : 2, isfloat, 1, cast(uint)gpoffset / 8,
+                                     cast(ubyte)(reg2 & 31), cast(ubyte)fp, cast(ubyte)(reg & 31)); // LDP reg,reg2,[fp,#offset]
+        else
+            ins = isfloat
+                // https://www.scs.stanford.edu/~zyedidia/arm64/ldr_imm_fpsimd.html
+                ? INSTR.ldr_imm_fpsimd(3,1,cast(uint)gpoffset >> 3,fp,reg) // LDR reg,[fp,#offset]
+                : INSTR.ldr_imm_gen(1, reg, fp, gpoffset);            // LDR reg,[fp,#offset]
         cdb.gen1(ins);
-        gpoffset += REGSIZE;
+        gpoffset += reg2 != NOREG ? 2 * REGSIZE : REGSIZE;
     }
 }
 
