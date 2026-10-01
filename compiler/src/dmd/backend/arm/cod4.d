@@ -2022,9 +2022,26 @@ void cdshtlng(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         {
             pretregs &= ~mPSW;                 // flags are set by eval of e1
             codelem(cg,cdb,e1,retregs,false);
-            /* Determine if high 32 bits are already 0
+            /* Determine if high 32 bits are already 0: they are after an
+             * instruction writing the 32 bit register, unless the register
+             * holds a common subexpression, which this result can not share
              */
-            if (e1.Eoper == OPu16_32 && !e1.Ecount)
+            static bool written32(const(elem)* x)
+            {
+                if (_tysize[tybasic(x.Ety)] != 4 || !tyintegral(x.Ety))
+                    return false;
+                switch (x.Eoper)
+                {
+                    case OPadd: case OPmin: case OPmul: case OPdiv: case OPmod:
+                    case OPand: case OPor: case OPxor:
+                    case OPshl: case OPshr: case OPashr:
+                    case OPneg: case OPcom:
+                        return true;
+                    default:
+                        return false;
+                }
+            }
+            if (!e1.Ecount && (e1.Eoper == OPu16_32 || written32(e1)))
             {
             }
             else
