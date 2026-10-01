@@ -1079,15 +1079,67 @@ private void blident(ref BlockOpt bo, ref uint changes)
     debug if (debugc) printf("blident()\n");
     assert(bo.startblock);
 
-    block* bnext;
-    for (block* bn = bo.startblock; bn; bn = bnext)
+    /* A block can be identical only to one with the same exit condition and
+     * successors, so blocks are compared only when a signature of those match
+     */
+    static ulong signature(const block* b)
     {
-        bnext = bn.Bnext;
+        ulong h = b.bc | (cast(ulong)b.Bsucc.length << 56);
+        foreach (s; b.Bsucc[])
+            h = (h ^ cast(size_t)s) * 0x100000001B3UL;
+        return h;
+    }
+    Barray!(block*) blocks;             // the blocks in list order
+    Barray!ulong sigs;                  // their signatures
+    for (block* b = bo.startblock; b; b = b.Bnext)
+    {
+        blocks.push(b);
+        sigs.push(signature(b));
+    }
+
+    /* Indices in blocks[] by block address, for updating signatures
+     */
+    static struct Pos { block* b; size_t i; }
+    Barray!Pos byAddress;
+    foreach (i, b; blocks[])
+        byAddress.push(Pos(b, i));
+    extern (C) static int cmp(scope const void* x, scope const void* y) nothrow
+    {
+        auto a = (cast(const Pos*)x).b, c = (cast(const Pos*)y).b;
+        return a < c ? -1 : a > c;
+    }
+    qsort(byAddress[].ptr, byAddress.length, Pos.sizeof, &cmp);
+    size_t indexOf(block* b)
+    {
+        size_t lo = 0, hi = byAddress.length;
+        while (lo < hi)
+        {
+            const mid = (lo + hi) / 2;
+            if (byAddress[mid].b < b)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        assert(lo < byAddress.length && byAddress[lo].b is b);
+        return byAddress[lo].i;
+    }
+    scope (exit)
+    {
+        blocks.dtor();
+        sigs.dtor();
+        byAddress.dtor();
+    }
+
+    foreach (kn, bn; blocks[])
+    {
         if (bn.Bflags & BFL.separate)
             continue;
 
-        for (block* b = bnext; b; b = b.Bnext)
+        foreach (kb; kn + 1 .. blocks.length)
         {
+            if (sigs[kb] != sigs[kn])
+                continue;
+            block* b = blocks[kb];
             /* Blocks are identical if:                 */
             /*  BC match                                */
             /*  not optimized for time or it's a return */
@@ -1175,6 +1227,8 @@ private void blident(ref BlockOpt bo, ref uint changes)
                             bp.Bsucc[i] = b;
                             b.Bpred.push(bp);
                         }
+                    const kp = indexOf(bp);
+                    sigs[kp] = signature(bp);
                 }
 
                 /* Entirely remove predecessor list from bn.            */
