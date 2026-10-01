@@ -361,12 +361,10 @@ size_t vec_index(size_t b, const vec_t vec)
         size_t starv = *v >> bit;
         while (1)
         {
-            while (starv)
+            if (starv)
             {
-                if (starv & 1)
-                    return b;
-                b++;
-                starv >>= 1;
+                import core.bitop : bsf;
+                return b + bsf(starv);
             }
             b = (b + VECBITS) & ~VECMASK;   // round up to next word
             if (++v >= vtop)
