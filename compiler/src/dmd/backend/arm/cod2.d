@@ -139,12 +139,17 @@ void cdorth(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
 
     regm_t posregs = tyfloating(ty1) ? INSTR.FLOATREGS : cg.allregs;
 
+    /* The operands are only read, as the result goes to Rd, except that a
+     * narrower integer left operand is widened in place. A register variable
+     * as the left operand is copied if evaluating the right one could change it.
+     */
+    const bool widen1 = !tyfloating(ty1) && _tysize[ty1] < sz;
     regm_t retregs1 = posregs;
-    codelem(cg, cdb, e1, retregs1, false);
+    codelem(cg, cdb, e1, retregs1, !widen1 && !el_sideeffect(e2));
     reg_t Rn = findreg(retregs1);
 
     regm_t retregs2 = posregs & ~retregs1;
-    scodelem(cg, cdb, e2, retregs2, retregs1, false);
+    scodelem(cg, cdb, e2, retregs2, retregs1, true);
     reg_t Rm = findreg(retregs2);
 
     regm_t retregs = pretregs & posregs;
@@ -495,9 +500,10 @@ void cdmul(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
 
     regm_t retregs1 = posregs;
 
-    codelem(cg, cdb, e1, retregs1, false);
+    // the operands are only read, as the result goes to Rd, unless the right one changes the left
+    codelem(cg, cdb, e1, retregs1, !el_sideeffect(e2));
     regm_t retregs2 = cg.allregs & ~retregs1;
-    scodelem(cg, cdb, e2, retregs2, retregs1, false);
+    scodelem(cg, cdb, e2, retregs2, retregs1, true);
 
     regm_t retregs = pretregs & cg.allregs;
     if (retregs == 0)                   /* if no return regs speced     */
@@ -571,9 +577,10 @@ void cddiv(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
 
     regm_t retregs1 = posregs;
 
-    codelem(cg, cdb, e1, retregs1, false);
+    // the operands are only read, as the results go to other registers, unless the right one changes the left
+    codelem(cg, cdb, e1, retregs1, !el_sideeffect(e2));
     regm_t retregs2 = cg.allregs & ~retregs1;
-    scodelem(cg, cdb, e2, retregs2, retregs1, false);
+    scodelem(cg, cdb, e2, retregs2, retregs1, true);
 
     regm_t retregs = pretregs & cg.allregs;
     if (retregs == 0)                   // if no return regs speced (i.e. flags only)
@@ -1310,7 +1317,7 @@ void cdshift(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         if (amount < bits)
         {
             regm_t retregs1 = posregs;
-            codelem(cg, cdb, e1, retregs1, false);
+            codelem(cg, cdb, e1, retregs1, true);     // only read
             const reg_t Rn = findreg(retregs1);
             regm_t retregs = pretregs & cg.allregs;
             if (retregs == 0)
@@ -1333,9 +1340,9 @@ void cdshift(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
     }
 
     regm_t retregs1 = posregs;
-    codelem(cg, cdb, e1, retregs1, false);
+    codelem(cg, cdb, e1, retregs1, !el_sideeffect(e2)); // only read, unless e2 changes it
     regm_t retregs2 = cg.allregs & ~retregs1;
-    scodelem(cg, cdb, e2, retregs2, retregs1, false);
+    scodelem(cg, cdb, e2, retregs2, retregs1, true);
 
     regm_t retregs = pretregs & cg.allregs;
     if (retregs == 0)                   /* if no return regs speced     */
