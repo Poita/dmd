@@ -789,6 +789,8 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
         return si != SYMIDX.max && si < len && info[si].can ? &info[si] : null;
     }
 
+    uint w = 1;         // weight of each access in the current block
+
     void gather(const(elem)* e, bool valueUsed) nothrow
     {
         void argument(const(elem)* x) nothrow
@@ -797,7 +799,7 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
                 if (auto inf = candidate(x))
                     if (!inf.isInt && isWhole(x, *inf))
                     {
-                        inf.elems += inf.n;
+                        inf.elems += inf.n * w;
                         return;
                     }
             gather(x, true);
@@ -811,14 +813,14 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
                     if (auto inf = candidate(e))
                     {
                         if (isElement(e, *inf))
-                            ++inf.elems;
+                            inf.elems += w;
                         else if (isWhole(e, *inf))
                         {
                             // read as a pair of the integer elements, or through the copy in memory
                             if (inf.isInt)
-                                ++inf.elems;
+                                inf.elems += w;
                             else
-                                ++inf.wholes;
+                                inf.wholes += w;
                         }
                         else
                             inf.can = false;
@@ -883,14 +885,14 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
                             inf1.assigned = true;
                         final switch (form)
                         {
-                            case Form.copy:     inf1.elems += inf1.n; inf2.elems += inf2.n; return;
-                            case Form.constant: inf1.elems += inf1.n; return;
-                            case Form.partial:  inf1.elems += tysize(e.E1.Ety) / inf1.esz; return;
-                            case Form.load:     inf1.elems += inf1.n; gather(e.E2.E1, true); return;
-                            case Form.store:    inf2.elems += inf2.n; gather(e.E1.E1, true); return;
-                            case Form.pair:     inf1.elems += inf1.n; gather(e.E2.E1, true); gather(e.E2.E2, true); return;
-                            case Form.result:   inf1.elems += inf1.n; gather(e.E2.E1, false); return;
-                            case Form.storeVar: inf2.elems += inf2.n; return;
+                            case Form.copy:     inf1.elems += inf1.n * w; inf2.elems += inf2.n * w; return;
+                            case Form.constant: inf1.elems += inf1.n * w; return;
+                            case Form.partial:  inf1.elems += tysize(e.E1.Ety) / inf1.esz * w; return;
+                            case Form.load:     inf1.elems += inf1.n * w; gather(e.E2.E1, true); return;
+                            case Form.store:    inf2.elems += inf2.n * w; gather(e.E1.E1, true); return;
+                            case Form.pair:     inf1.elems += inf1.n * w; gather(e.E2.E1, true); gather(e.E2.E2, true); return;
+                            case Form.result:   inf1.elems += inf1.n * w; gather(e.E2.E1, false); return;
+                            case Form.storeVar: inf2.elems += inf2.n * w; return;
                             case Form.none:     break;
                         }
                         // a struct copy needs the address of a whole it copies
@@ -899,7 +901,7 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
                         if (inf1 && isWhole(e.E1, *inf1))
                         {
                             inf1.assigned = true;
-                            ++inf1.wholes;      // written through the copy in memory
+                            inf1.wholes += w;      // written through the copy in memory
                             e = e.E2;
                             valueUsed = true;
                             continue;
@@ -943,10 +945,34 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
         return !(b.bc == BC.goto_ || b.bc == BC.ret || b.bc == BC.exit);
     }
 
+    /* Weight the accesses in each block by its loop nesting depth, found
+     * from the back edges of the depth first order
+     */
+    import dmd.backend.blockopt : bo, compdfo;
+    compdfo(bo.dfo, startblock);
+    const nblocks = bo.dfo.length;
+    uint* depth = cast(uint*)calloc(nblocks ? nblocks : 1, uint.sizeof);
+    if (!depth)
+        err_nomem();
+    scope (exit) free(depth);
+    foreach (b; bo.dfo[])
+    {
+        foreach (h; b.Bsucc[])
+        {
+            if (h.Bdfoidx <= b.Bdfoidx)
+                foreach (i; h.Bdfoidx .. b.Bdfoidx + 1)
+                    ++depth[i];
+        }
+    }
+
     foreach (b; BlockRange(startblock))
     {
         if (b.bc == BC.asm_)
             return;
+        w = 1;
+        if (b.Bdfoidx < nblocks && bo.dfo[b.Bdfoidx] is b)  // unreachable blocks are not in dfo[]
+            foreach (d; 0 .. depth[b.Bdfoidx] < 3 ? depth[b.Bdfoidx] : 3)
+                w *= 8;
         if (b.Belem)
             gather(b.Belem, blockValueUsed(b));
     }
