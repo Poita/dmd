@@ -3295,6 +3295,10 @@ void loaddata(ref CGstate cg, ref CodeBuilder cdb, elem* e, ref regm_t outretreg
     if (outretregs == mPSW)
     {
         regm_t retregs = tyfloating(tym) ? INSTR.FLOATREGS : INSTR.ALLREGS;
+        // a register variable is tested in its own register
+        if (e.Eoper == OPvar && e.Vsym.Sfl == FL.reg && e.Voffset == 0 && !tyfloating(tym) &&
+            (_tysize[tym] == 4 || _tysize[tym] == 8) && _tysize[tym] == tysize(e.Vsym.Stype.Tty))
+            retregs = e.Vsym.Sregm;
         loaddata(cg, cdb, e, retregs);
         fixresult(cg, cdb, e, retregs, outretregs);
         return;
