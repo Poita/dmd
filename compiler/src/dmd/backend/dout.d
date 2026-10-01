@@ -819,6 +819,41 @@ void writefunc(Symbol* sfunc)
     cstate.CSpsymtab = null;
 }
 
+/// Functions with more elem nodes than this are not globally optimized.
+enum maxOptimizedElems = 1500;
+
+/// Returns: whether the block list holds more than `limit` elem nodes.
+@trusted
+bool exceedsElemCount(const(block)* startblock, size_t limit)
+{
+    size_t n;
+
+    void count(const(elem)* e)
+    {
+        while (e)
+        {
+            ++n;
+            if (OTbinary(e.Eoper))
+            {
+                count(e.E2);
+                e = e.E1;
+            }
+            else if (OTunary(e.Eoper))
+                e = e.E1;
+            else
+                break;
+        }
+    }
+
+    for (const(block)* b = startblock; b; b = b.Bnext)
+    {
+        count(b.Belem);
+        if (n > limit)
+            return true;
+    }
+    return false;
+}
+
 @trusted private
 void writefunc2(Symbol* sfunc, ref GlobalOptimizer go, ref BlockOpt bo)
 {
@@ -959,6 +994,22 @@ void writefunc2(Symbol* sfunc, ref GlobalOptimizer go, ref BlockOpt bo)
         {
             WRfunc("codegen", funcsym_p, bo.startblock);
         }
+    }
+
+    /* The global optimizer and register allocator scale superlinearly with
+     * function size, so very large functions get only block optimization.
+     */
+    const mfoptimSave = go.mfoptim;
+    const flags4Save = config.flags4;
+    scope (exit)
+    {
+        go.mfoptim = mfoptimSave;
+        config.flags4 = flags4Save;
+    }
+    if (go.mfoptim && exceedsElemCount(bo.startblock, maxOptimizedElems))
+    {
+        go.mfoptim = 0;
+        config.flags4 &= ~CFG4optimized;
     }
 
     if (go.mfoptim)
