@@ -365,7 +365,7 @@ void cdaddass(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
 
     reg_t reg;
     code cs;
-    elem* e2;
+    elem* e2 = e.E2;
     uint jop;
 
 
