@@ -3721,6 +3721,11 @@ bool loopunroll(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
         ++n;
     if (n != numblocks) assert(0);
 }
+    if (numblocks < 2)
+    {
+        if (log) printf("\tonly %d block\n", numblocks);
+        return false;
+    }
     if (numblocks != 2)
     {
         /* Blocks that follow each other in a straight line from the head to
