@@ -5457,6 +5457,12 @@ private elem* elshr(elem* e, Goal goal)
     elem* e1 = e.E1;
     elem* e2 = e.E2;
 
+    /* On 64 bit targets a shift is cheaper than keeping the variable out of
+     * a register to address part of it
+     */
+    if (I64)
+        return e;
+
     // (x >> 16) replaced with ((shtlng) x+2)
     if (OPTIMIZER &&
         e2.Eoper == OPconst && e2.Vshort == SHORTSIZE * 8 &&
@@ -5531,7 +5537,7 @@ elem* elmsw(elem* e, Goal goal)
     tym_t ty = e.Ety;
     elem* e1 = e.E1;
 
-    if (OPTIMIZER &&
+    if (OPTIMIZER && !I64 &&    // on 64 bit targets x stays a register candidate
         tysize(e1.Ety) == LLONGSIZE &&
         tysize(ty) == LONGSIZE)
     {
