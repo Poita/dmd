@@ -794,7 +794,9 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
 
                 case OPrelconst:
                 {
-                    // the address is taken
+                    // the address, unused at the end of an initialization, is not taken
+                    if (!valueUsed)
+                        return;
                     const si = e.Vsym.Ssymnum;
                     if (si != SYMIDX.max && si < len)
                         info[si].can = false;
@@ -1045,6 +1047,15 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
                             a[inf.n] = w;
                             become(e, chain(a[0 .. inf.n + 1]));
                         }
+                    }
+                    return;
+
+                case OPrelconst:
+                    // the unused address of a split symbol
+                    if (!valueUsed && e.Vsym.Ssymnum != SYMIDX.max && e.Vsym.Ssymnum < nsyms && byNum[e.Vsym.Ssymnum])
+                    {
+                        e.Eoper = OPconst;
+                        e.Vllong = 0;
                     }
                     return;
 
