@@ -221,6 +221,7 @@ void codgenx(ref CGstate cg, Symbol* sfunc)
             assert(bo.dfo);
 
             cgreg_reset();
+            findRegSymbols();
             foreach (i, b; bo.dfo[])
             {
                 cg.dfoidx = cast(int)i;
@@ -1422,6 +1423,50 @@ private void mergePredRegcon(ref con_t regcon, block* bl)
     assert(regcon.immed.mval == mask(1) && regcon.immed.value[1] == 5);
 }
 
+/* The globsym[] indices of the symbols in registers or spilled, which are
+ * the same for all the blocks of a code generation pass
+ */
+private __gshared Barray!uint regSymbols;
+
+@trusted
+private void findRegSymbols()
+{
+    regSymbols.setLength(0);
+    foreach (i, s; globsym[])
+    {
+        if (s.Sfl == FL.reg || s.Sflags & SFLspill)
+            regSymbols.push(cast(uint)i);
+    }
+}
+
+/* With the environment variable DMD_CHECK_REG_SYMBOLS set, check regSymbols
+ * against globsym[]
+ */
+@trusted
+private void checkRegSymbols()
+{
+    import core.stdc.stdlib : getenv;
+    __gshared int check = -1;
+    if (check < 0)
+        check = getenv("DMD_CHECK_REG_SYMBOLS") !is null;
+    if (!check)
+        return;
+    size_t k;
+    foreach (i, s; globsym[])
+    {
+        if (s.Sfl == FL.reg || s.Sflags & SFLspill)
+        {
+            if (k >= regSymbols.length || regSymbols[k] != i)
+            {
+                printf("regSymbols mismatch at %d in %s\n", cast(int)i, funcsym_p.Sident.ptr);
+                assert(0);
+            }
+            ++k;
+        }
+    }
+    assert(k == regSymbols.length);
+}
+
 /****************************
  * Generate code for a block.
  * Params:
@@ -1455,19 +1500,26 @@ private void blcodgen(ref CGstate cg, block* bl)
         CodeBuilder cdbload; cdbload.ctor();
         CodeBuilder cdbstore; cdbstore.ctor();
 
-        // BUG AArch64 alloca() not implemented yet for AArch64
-        //sflsave = cast(FL*) alloca(globsym.length * FL.sizeof);
-        sflsave = cast(FL*) mem_malloc(globsym.length * FL.sizeof);
-        foreach (i, s; globsym[])
-        {
-            sflsave[i] = s.Sfl;
-            if (regParamInPreg(*s) &&
-                cg.regcon.params & s.Spregm() &&
-                vec_testbit(cg.dfoidx,s.Srange))
-            {
-//                cg.regcon.used |= s.Spregm();
-            }
+        checkRegSymbols();
 
+        /* Only the symbols in registers or spilled matter here; the Sfl of the
+         * symbols below the last one spilled in this block are restored at its end
+         */
+        foreach (i; regSymbols[])
+        {
+            Symbol* s = globsym[i];
+            if (s.Sfl != FL.reg && s.Sflags & SFLspill && vec_testbit(cg.dfoidx,s.Srange))
+                anyspill = cast(int)(i + 1);
+        }
+        if (anyspill)
+        {
+            sflsave = cast(FL*) mem_malloc(anyspill * FL.sizeof);
+            foreach (i, s; globsym[0 .. anyspill])
+                sflsave[i] = s.Sfl;
+        }
+        foreach (i; regSymbols[])
+        {
+            Symbol* s = globsym[i];
             if (s.Sfl == FL.reg)
             {
                 if (vec_testbit(cg.dfoidx,s.Srange))
@@ -1481,7 +1533,6 @@ private void blcodgen(ref CGstate cg, block* bl)
             {
                 if (vec_testbit(cg.dfoidx,s.Srange))
                 {
-                    anyspill = cast(int)(i + 1);
                     cgreg_spillreg_prolog(bl,s,cdbstore,cdbload);
                     if (vec_testbit(cg.dfoidx,s.Slvreg))
                     {
