@@ -290,6 +290,48 @@ Lp:
  * Generate code for += -= &= |= ^= negass
  */
 
+/*****************************
+ * Whether adding (or subtracting, if `sub`) integer constant e2 to a value of
+ * size sz fits ADD/SUB (immediate), and with what fields.
+ * Params:
+ *      e2 = the constant
+ *      sz = size of the operation, 4 or 8
+ *      sub = whether e2 is subtracted
+ *      flags = whether the flags are wanted, which keeps the sign of the constant
+ *      subtract = set to whether the instruction is SUB
+ *      sh = set to whether imm12 is shifted left by 12
+ *      imm12 = set to the immediate
+ */
+@trusted
+bool addSubImmediate(elem* e2, uint sz, bool sub, bool flags,
+    uint* subtract = null, uint* sh = null, uint* imm12 = null)
+{
+    long c = el_tolong(e2);
+    if (sz == 4)
+        c = cast(int)c;
+    uint op = sub;
+    if (c < 0 && c != long.min && !flags)       // the carry would differ
+    {
+        c = -c;
+        op ^= 1;
+    }
+    uint shift = 0;
+    if (c >= 0x1000 && (c & 0xFFF) == 0)
+    {
+        c >>= 12;
+        shift = 1;
+    }
+    if (c < 0 || c >= 0x1000)
+        return false;
+    if (subtract)
+    {
+        *subtract = op;
+        *sh = shift;
+        *imm12 = cast(uint)c;
+    }
+    return true;
+}
+
 @trusted
 void cdaddass(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
 {
@@ -412,6 +454,36 @@ void cdaddass(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         cs.IEV2.Vsize_t = (jop == JC) ? 0 : ~cast(targ_size_t)0;
         cdb.gen(&cs);
         retregs = 0;            // to trigger a bug if we attempt to use it
+    }
+    else if ((op == OPaddass || op == OPminass) && e2.Eoper == OPconst &&
+             (sz == 4 || sz == 8) && addSubImmediate(e2, sz, op == OPminass, forccs != 0))
+    {
+        /* Add or subtract a constant that fits an immediate field:
+         *  ADD/SUB reg1,reg1,#imm12{, LSL #12}
+         */
+        uint subtract, sh, imm12;
+        addSubImmediate(e2, sz, op == OPminass, forccs != 0, &subtract, &sh, &imm12);
+        getlvalue(cg,cdb,cs,e1,0);                // get lvalue
+        reg_t reg1;
+        if (cs.reg != NOREG)
+            reg1 = cs.reg;
+        else
+        {
+            regm_t posregs = cg.allregs & ~(mask(cs.base) | mask(cs.index));
+            reg1 = allocreg(cdb,posregs,tyml);
+        }
+        getregs(cdb,mask(reg1));
+        loadFromEA(cs,reg1,sz == 8 ? 8 : 4, sz);
+        cdb.gen(&cs);
+        cdb.gen1(INSTR.addsub_imm(sz == 8,subtract,forccs != 0,sh,imm12,reg1,reg1));
+        if (forccs)
+            pretregs &= ~mPSW;                  // flags are already set
+        storeToEA(cs,reg1,sz);
+        if (forccs)
+            cs.Iflags |= CF.psw;
+        cdb.gen(&cs);
+        retregs = mask(reg1);
+        freenode(e2);
     }
     else // evaluate e2 into register
     {
