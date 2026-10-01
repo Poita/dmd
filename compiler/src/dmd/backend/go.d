@@ -33,7 +33,7 @@ import dmd.backend.backconfig : debugb, debugc, debuge, debugf;
 import dmd.backend.blockopt : BlockOpt, bo;
 import dmd.backend.blockopt : bc_goal, block_optimizer_free, blockopt;
 import dmd.backend.cg : localgot;
-import dmd.backend.cgelem : doptelem, postoptelem;
+import dmd.backend.cgelem : combineByteLoads, doptelem, postoptelem;
 import dmd.backend.debugprint : WRfunc;
 import dmd.backend.dout : out_regcand;
 import dmd.backend.util2 : binary;
@@ -448,7 +448,10 @@ void optfunc(ref GlobalOptimizer go, ref BlockOpt bo)
     for (block* b = bo.startblock; b; b = b.Bnext)
     {
         if (b.Belem)
+        {
             postoptelem(b.Belem);
+            combineByteLoads(b.Belem, !(b.bc == BC.goto_ || b.bc == BC.exit));
+        }
     }
     if (go.mfoptim & MFli)
         loopConstants(bo);

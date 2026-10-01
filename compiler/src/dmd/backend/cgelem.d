@@ -6395,6 +6395,205 @@ elem* doptelem(elem* e, Goal goal)
     return e;
 }
 
+/***************************************
+ * AArch64: an unsigned integer of n = 2, 4 or 8 bytes assembled from n
+ * consecutive bytes in little endian order, either as statements
+ *      v = p[0], v |= p[1] << 8, ..., v |= p[n-1] << 8*(n-1)
+ * or as an expression
+ *      p[0] | p[1] << 8 | ... | p[n-1] << 8*(n-1)
+ * is loaded with a single unaligned load of the n bytes.
+ * Params:
+ *      e = expression of a block
+ *      valueUsed = the value of e is used
+ */
+@trusted
+void combineByteLoads(elem* e, bool valueUsed)
+{
+    if (config.target_cpu != TARGET_AArch64)
+        return;
+
+    /* Whether x is a byte p[off] zero extended and shifted left by shift, giving its
+     * address p and offset off
+     */
+    static bool byteTerm(elem* x, out elem* base, out long off, out uint shift)
+    {
+        if (x.Eoper == OPshl && !x.Ecount && x.E2.Eoper == OPconst)
+        {
+            const c = el_tolong(x.E2);
+            if (c < 0 || c >= 64 || c % 8)
+                return false;
+            shift = cast(uint)c;
+            x = x.E1;
+        }
+        while ((x.Eoper == OPu8_16 || x.Eoper == OPu16_32 || x.Eoper == OPu32_64) && !x.Ecount)
+            x = x.E1;
+        if (x.Eoper != OPind || x.Ecount || tysize(x.Ety) != 1 || x.Ety & mTYvolatile)
+            return false;
+        elem* a = x.E1;
+        if (a.Eoper == OPadd && a.E2.Eoper == OPconst && tysize(a.Ety) == REGSIZE)
+        {
+            off = el_tolong(a.E2);
+            a = a.E1;
+        }
+        if (tysize(a.Ety) != REGSIZE || el_sideeffect(a) || a.Ecount)
+            return false;
+        base = a;
+        return true;
+    }
+
+    /* Whether the n terms cover bytes off0 .. off0+n-1 of the same base,
+     * byte i shifted by 8*i, giving the base and off0
+     */
+    static bool covers(elem*[] terms, out elem* base, out long off0)
+    {
+        const n = terms.length;
+        if (n != 2 && n != 4 && n != 8)
+            return false;
+        elem*[8] bases;
+        long[8] offs;
+        uint[8] shifts;
+        foreach (i, t; terms)
+            if (!byteTerm(t, bases[i], offs[i], shifts[i]))
+                return false;
+        // the term with shift 0 gives the lowest address
+        size_t lo = n;
+        foreach (i; 0 .. n)
+            if (shifts[i] == 0)
+                lo = i;
+        if (lo == n)
+            return false;
+        bool[8] seen;
+        foreach (i; 0 .. n)
+        {
+            const k = shifts[i] / 8;
+            if (k >= n || seen[k] || offs[i] != offs[lo] + k || !el_match(bases[i], bases[lo]))
+                return false;
+            seen[k] = true;
+        }
+        base = bases[lo];
+        off0 = offs[lo];
+        return true;
+    }
+
+    // the address of n bytes at base + off0
+    static elem* address(elem* base, long off0)
+    {
+        elem* a = el_copytree(base);
+        if (off0)
+            a = el_bin(OPadd, a.Ety, a, el_long(TYsize_t, off0));
+        return a;
+    }
+
+    static bool unsignedInt(tym_t ty, size_t n)
+    {
+        return tyintegral(ty) && tysize(ty) == n;
+    }
+
+    // the expression form
+    static void exprs(elem* e)
+    {
+        while (1)
+        {
+            if (e.Eoper == OPor && !e.Ecount && (tysize(e.Ety) == 2 || tysize(e.Ety) == 4 || tysize(e.Ety) == 8) &&
+                tyintegral(e.Ety))
+            {
+                elem*[8] terms;
+                size_t n = 0;
+                bool gather(elem* x)
+                {
+                    if (x.Eoper == OPor && !x.Ecount)
+                        return gather(x.E1) && gather(x.E2);
+                    if (n == terms.length)
+                        return false;
+                    terms[n++] = x;
+                    return true;
+                }
+                elem* base;
+                long off0;
+                if (gather(e) && n == tysize(e.Ety) && covers(terms[0 .. n], base, off0))
+                {
+                    elem* a = address(base, off0);
+                    el_free(e.E1);
+                    el_free(e.E2);
+                    e.Eoper = OPind;
+                    e.E1 = a;
+                    e.E2 = null;
+                    return;
+                }
+            }
+            if (OTbinary(e.Eoper))
+            {
+                exprs(e.E2);
+                e = e.E1;
+            }
+            else if (OTunary(e.Eoper))
+                e = e.E1;
+            else
+                return;
+        }
+    }
+
+    // the statement form: the statements of the comma expression in order
+    import dmd.backend.barray : Barray;
+    Barray!(elem*) stmts;
+    void flatten(elem* x)
+    {
+        while (x.Eoper == OPcomma && !x.Ecount)
+        {
+            flatten(x.E1);
+            x = x.E2;
+        }
+        stmts.push(x);
+    }
+    flatten(e);
+    // the last statement is the value of e
+    const last = valueUsed ? stmts.length - 1 : stmts.length;
+    for (size_t k = 0; k + 1 < last; ++k)
+    {
+        elem* s = stmts[k];
+        if (s.Eoper != OPeq || s.Ecount || s.E1.Eoper != OPvar || s.E1.Ecount)
+            continue;
+        const ty = tybasic(s.E1.Ety);
+        const n = tysize(ty);
+        if (!unsignedInt(ty, n) || (n != 2 && n != 4 && n != 8) || k + n > last)
+            continue;
+        elem*[8] terms;
+        terms[0] = s.E2;
+        size_t i = 1;
+        for (; i < n; ++i)
+        {
+            elem* t = stmts[k + i];
+            if (t.Eoper != OPorass || t.Ecount || t.E1.Eoper != OPvar || t.E1.Ecount ||
+                t.E1.Vsym != s.E1.Vsym || t.E1.Voffset != s.E1.Voffset || tybasic(t.E1.Ety) != ty)
+                break;
+            terms[i] = t.E2;
+        }
+        elem* base;
+        long off0;
+        if (i != n || !covers(terms[0 .. n], base, off0))
+            continue;
+        // the variable is not part of the address nor reachable through it
+        if (el_appears(base, s.E1.Vsym) || !(s.E1.Vsym.Sflags & SFLdistinct))
+            continue;
+        elem* l = el_una(OPind, ty, address(base, off0));
+        el_free(s.E2);
+        s.E2 = l;
+        foreach (j; 1 .. n)
+        {
+            elem* t = stmts[k + j];
+            el_free(t.E1);
+            el_free(t.E2);
+            t.Eoper = OPconst;
+            t.Ety = TYint;
+            t.Vllong = 0;
+        }
+        k += n - 1;
+    }
+    stmts.dtor();
+
+    exprs(e);
+}
+
 /****************************************
  * Do optimizations after bltailrecursion() and before common subexpressions.
  */
