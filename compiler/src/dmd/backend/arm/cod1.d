@@ -1209,7 +1209,8 @@ void getlvalue(ref CGstate cg,ref CodeBuilder cdb,ref code pcs,elem* e,regm_t ke
 
         case FL.auto_:
         case FL.fast:
-            if (regParamInPreg(*s))
+            // a parameter that is not a register variable may still be in the register it came in
+            if (s.Sclass == SC.fastpar || s.Sclass == SC.shadowreg)
             {
 //printf("regParamInPreg()\n");
                 regm_t pregm = s.Spregm();
@@ -3452,7 +3453,7 @@ void loaddata(ref CGstate cg, ref CodeBuilder cdb, elem* e, ref regm_t outretreg
         // See if we can use register that parameter was passed in
         //printf("xyzzy1 %s %d %d\n", e.Vsym.Sident.ptr, cast(int)cg.regcon.params, regParamInPreg(e.Vsym));
         if (cg.regcon.params &&
-            regParamInPreg(*e.Vsym) &&
+            (e.Vsym.Sclass == SC.fastpar || e.Vsym.Sclass == SC.shadowreg) && e.Vsym.Sfl != FL.reg &&
             !cg.anyiasm &&   // may have written to the memory for the parameter
             (cg.regcon.params & mask(e.Vsym.Spreg) && e.Voffset == 0 ||
              cg.regcon.params & mask(e.Vsym.Spreg2) && e.Voffset == REGSIZE) &&
