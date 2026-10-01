@@ -4012,6 +4012,15 @@ void loopConstants(ref BlockOpt bo)
             el_free(v);
         }
 
+        /* Across a call a variable is in one of the few registers a call
+         * preserves, or in memory, so then only a constant taking several
+         * instructions is worth one
+         */
+        bool calls;
+        for (uint i = 0; (i = cast(uint) vec_index(i, l.Lloop)) < bo.dfo.length; ++i)
+            if (bo.dfo[i].Belem && returningCall(bo.dfo[i].Belem))
+                calls = true;
+
         void scan(elem* e)
         {
             while (!OTleaf(e.Eoper))
@@ -4020,7 +4029,7 @@ void loopConstants(ref BlockOpt bo)
                 {
                     if (e.E2.Eoper == OPconst)
                     {
-                        if (loadedConstant(e, e.E2, true))
+                        if (loadedConstant(e, e.E2, true, !calls))
                             replace(e.E2);
                     }
                     else
@@ -4028,7 +4037,7 @@ void loopConstants(ref BlockOpt bo)
                 }
                 if (e.E1.Eoper == OPconst)
                 {
-                    if (loadedConstant(e, e.E1, false))
+                    if (loadedConstant(e, e.E1, false, !calls))
                         replace(e.E1);
                     return;
                 }
@@ -4044,6 +4053,32 @@ void loopConstants(ref BlockOpt bo)
         }
     }
     freeloop(loops);
+}
+
+/* Whether e calls a function that returns
+ */
+@trusted
+private bool returningCall(const(elem)* e)
+{
+    while (1)
+    {
+        if (OTcall(e.Eoper) && tybasic(e.Ety) != TYnoreturn)
+        {
+            const(elem)* f = e.E1;
+            if (!(f.Eoper == OPvar && f.Vsym.Sfunc && f.Vsym.Sflags & SFLexit))
+                return true;
+        }
+        if (OTbinary(e.Eoper))
+        {
+            if (returningCall(e.E2))
+                return true;
+            e = e.E1;
+        }
+        else if (OTunary(e.Eoper))
+            e = e.E1;
+        else
+            return false;
+    }
 }
 
 /* Put assignment e at the start of block b, ahead of what b evaluates for
@@ -4079,7 +4114,7 @@ private ulong constBits(const(elem)* c)
  * before a loop: e has no form taking it as an immediate
  */
 @trusted
-private bool loadedConstant(const(elem)* e, const(elem)* c, bool isE2)
+private bool loadedConstant(const(elem)* e, const(elem)* c, bool isE2, bool cheapToo)
 {
     const ty = tybasic(c.Ety);
     const op = e.Eoper;
@@ -4108,7 +4143,9 @@ private bool loadedConstant(const(elem)* e, const(elem)* c, bool isE2)
         if (d == 0 && OTrel(op))
             return false;               // FCMP Vn,#0.0
         // even FMOV Vd,#imm is an instruction each time round the loop
-        return true;
+        import dmd.backend.arm.disasmarm : encodeHFD;
+        ubyte imm8;
+        return cheapToo || !encodeHFD(d, imm8);
     }
 
     if (!tyintegral(ty) || tysize(ty) != 4 && tysize(ty) != 8)
@@ -4143,5 +4180,15 @@ private bool loadedConstant(const(elem)* e, const(elem)* c, bool isE2)
     }
     else if (v == 0)
         return false;                   // the zero register
-    return true;
+    if (cheapToo)
+        return true;
+    // instructions MOVZ or MOVN take, with a MOVK for each other 16 bits
+    uint nonzero, nonones;
+    foreach (k; 0 .. sz / 2)
+    {
+        const chunk = (v >> (k * 16)) & 0xFFFF;
+        nonzero += chunk != 0;
+        nonones += chunk != 0xFFFF;
+    }
+    return (nonzero < nonones ? nonzero : nonones) >= 2;
 }

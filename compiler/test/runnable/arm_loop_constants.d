@@ -78,8 +78,31 @@ pragma(inline, false) int cheap(int[] a, float[] f)
     return r;
 }
 
+pragma(inline, false) float twice(float x) { return x * 2; }
+
+pragma(inline, false) float withCalls(int n)
+{
+    float s = 0, g = 1;
+    foreach (i; 0 .. n)
+    {
+        s += twice(g) * 0.6f + 1.0f;
+        g = g * 0.8f - 0.1f;
+    }
+    return s + g * 3.3f;
+}
+
 void main()
 {
+    {
+        float s = 0, g = 1;
+        foreach (i; 0 .. 4)
+        {
+            s += (g * 2) * 0.6f + 1.0f;
+            g = g * 0.8f - 0.1f;
+        }
+        assert(withCalls(4) == s + g * 3.3f);
+    }
+
     int[2] ci = [1, 2];
     float[2] cf = [0.25f, 4];
     assert(cheap(ci, cf) == 61 * 3 - 1 && ci[1] == 7 && cf[0] == 0.625f && cf[1] == 10);
