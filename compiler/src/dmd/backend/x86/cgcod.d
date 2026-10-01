@@ -1939,9 +1939,11 @@ L3:
                         else
                             break;
                     }
-                    if (r & ~cg.mfuncreg)
-                        r &= ~cg.mfuncreg;
                 }
+                // a register the function would have to save and restore is the last choice
+                const regm_t unsaved = cg.fregsaved & ~cg.regcon.used;
+                if (r & ~unsaved)
+                    r &= ~unsaved;
                 reg = findreg(r);
                 retregs = mask(reg);
             }
