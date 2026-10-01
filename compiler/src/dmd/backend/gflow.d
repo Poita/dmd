@@ -503,6 +503,18 @@ void flowae(ref GlobalOptimizer go, ref BlockOpt bo)
     flowaecp(go, bo);
 }
 
+/****************************************
+ * Number the available expressions in go.expnod[] and compute go.defkill,
+ * go.starkill and go.vptrkill as flowae() does, without the data flow, for
+ * walks that look at the expressions available within extended basic blocks.
+ */
+@trusted
+void numberae(ref GlobalOptimizer go, ref BlockOpt bo)
+{
+    go.flowxx = AE;
+    aecpgenkill(go, bo, false);
+}
+
 /**************************** COPY PROPAGATION ************************/
 
 /***************************************
@@ -1146,7 +1158,7 @@ private void buildKillIndex(ref GlobalOptimizer go)
 }
 
 @trusted
-private void aecpgenkill(ref GlobalOptimizer go, ref BlockOpt bo)
+private void aecpgenkill(ref GlobalOptimizer go, ref BlockOpt bo, bool genkill = true)
 {
     block* this_block;
 
@@ -1276,6 +1288,8 @@ private void aecpgenkill(ref GlobalOptimizer go, ref BlockOpt bo)
         return;
 
     defstarkill(go);                  /* compute go.defkill and go.starkill */
+    if (!genkill)
+        return;
     buildKillIndex(go);
 
     static if (0)

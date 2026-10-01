@@ -40,7 +40,7 @@ import dmd.backend.util2 : binary;
 import dmd.backend.inliner;
 
 public import dmd.backend.gdag : builddags, boolopt;
-public import dmd.backend.gflow : flowrd, flowlv, flowvbe, flowcp, flowae, genkillae;
+public import dmd.backend.gflow : flowrd, flowlv, flowvbe, flowcp, flowae, genkillae, numberae;
 public import dmd.backend.glocal : localize;
 public import dmd.backend.gloop : blockinit, compdom, loopopt, updaterd;
 public import dmd.backend.gother : constprop, copyprop, rmdeadass, elimass, deadvar, verybusyexp, listrds;

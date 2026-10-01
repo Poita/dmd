@@ -59,7 +59,7 @@ void builddags(ref GlobalOptimizer go, ref BlockOpt bo)
 
     debug if (debugc) printf("builddags()\n");
     assert(bo.dfo);
-    flowae(go, bo);                   /* compute available expressions */
+    numberae(go, bo);                 // number the available expressions
     if (go.exptop <= 1)             /* if no AEs                     */
         return;
     go.aetype = Aetype.cse;
@@ -84,6 +84,7 @@ void builddags(ref GlobalOptimizer go, ref BlockOpt bo)
     {
         /* This is the 'correct' algorithm for CSEs. We can't use it    */
         /* till we fix the code generator.                              */
+        /* It needs the data flow of flowae() in place of numberae().   */
         foreach (i, b; dfo[])
         {
             if (b.Belem)
@@ -672,7 +673,7 @@ void boolopt(ref GlobalOptimizer go, ref BlockOpt bo)
     debug if (debugc) printf("boolopt()\n");
     if (!bo.dfo.length)
         compdfo(bo.dfo, bo.startblock);
-    flowae(go, bo);                 /* compute available expressions */
+    numberae(go, bo);               // number the available expressions
     if (go.exptop <= 1)             /* if no AEs                     */
         return;
     static if (0)
