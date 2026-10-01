@@ -625,12 +625,15 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
         Symbol* s = symtab[si];
         if (!(s.Sflags & SFLdistinct))           // address was taken
             continue;
-        if (s.Sclass != SC.auto_ && s.Sclass != SC.register)
+        // a parameter in V registers is split into a parameter per register
+        const bool vparam = s.Sclass == SC.fastpar && s.Spreg >= 32 && s.Spreg != NOREG &&
+                            s.Spreg2 == s.Spreg + 1;
+        if (s.Sclass != SC.auto_ && s.Sclass != SC.register && !vparam)
             continue;
         type* t = s.Stype;
         const tyt = tybasic(t.Tty);
-        if (tyt == TYdarray || tyt == TYdelegate ||
-            tyt == TYstruct && type_size(t) == 16 && !(t.Ttag.Sstruct.Sflags & STRbitfields))
+        if (!vparam && (tyt == TYdarray || tyt == TYdelegate ||
+            tyt == TYstruct && type_size(t) == 16 && !(t.Ttag.Sstruct.Sflags & STRbitfields)))
         {
             // two integers or pointers of 8 bytes
             tym_t ty0 = tyt == TYdarray ? TYsize_t : TYnptr;
@@ -860,11 +863,24 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
             snew.Sflags = sold.Sflags | GTregcand;
             snew.Stype = type_fake(elemTy(*inf, k));
             snew.Stype.Tcount++;
+            if (sold.Sclass == SC.fastpar)
+            {
+                snew.Spreg = cast(reg_t)(sold.Spreg + k);
+                snew.Spreg2 = NOREG;
+            }
             ++added;
             symbol_insert(symtab, snew, si + added);
         }
         sold.Stype = type_fake(elemTy(*inf, 0));
         sold.Stype.Tcount++;
+        if (sold.Sclass == SC.fastpar)
+        {
+            sold.Spreg2 = NOREG;
+            /* The back end inliner matches the arguments of a call to the
+             * parameters, which no longer match the function's signature
+             */
+            funcsym_p.Sfunc.Fflags &= ~Finline;
+        }
         sold.Sflags |= GTregcand;
     }
     if (!added)
