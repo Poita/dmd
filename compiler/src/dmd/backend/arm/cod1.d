@@ -1077,6 +1077,27 @@ void getlvalue(ref CGstate cg,ref CodeBuilder cdb,ref code pcs,elem* e,regm_t ke
              * word.
              */
             assert(e1free);
+
+            /* Replace *(e + c) with
+             *      MOV     idxreg,e
+             *      EA =    [idxreg, #c]
+             * where assignaddrc() puts c in the addressing mode
+             */
+            if (e1isadd && !e1.Ecount && e12.Eoper == OPconst && sz <= 8 &&
+                tysize(e1ty) == REGSIZE)
+            {
+                const c = el_tolong(e12);
+                if (c >= 0 && c < 0x1000)
+                {
+                    scodelem(cg,cdb, e11, idxregs, keepmsk, true);  // load index register
+                    pcs.base = findreg(idxregs);
+                    pcs.IEV1.Voffset = cast(targ_size_t)c;
+                    freenode(e12);
+                    freenode(e1);
+                    return Lptr();
+                }
+            }
+
             scodelem(cg,cdb, e1, idxregs, keepmsk, true);  // load index register
             pcs.base = findreg(idxregs);
 

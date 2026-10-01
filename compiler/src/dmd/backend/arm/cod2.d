@@ -1392,12 +1392,31 @@ void cdind(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
     const tym1 = tybasic(e.E1.Ety);
     const sz1  = _tysize[tym1];
 
+    bool isPair = isRegisterPair(true, tym, 0);
+
+    /* Load *(p + c) with LDR Rt,[Rp,#c] when c is a multiple of the size that
+     * fits the scaled immediate
+     */
+    elem* eaddr = e.E1;
+    uint offset = 0;
+    if (eaddr.Eoper == OPadd && !eaddr.Ecount && eaddr.E2.Eoper == OPconst &&
+        !isPair && sz && sz <= 8 && tysize(eaddr.Ety) == REGSIZE)
+    {
+        const c = el_tolong(eaddr.E2);
+        if (c > 0 && c % sz == 0 && c / sz < 0x1000)
+        {
+            offset = cast(uint)c;
+            elem* p = eaddr.E1;
+            freenode(eaddr.E2);
+            freenode(eaddr);
+            eaddr = p;
+        }
+    }
+
     const posregs = cg.allregs;
     regm_t retregs1 = posregs;
-    codelem(cg,cdb,e.E1,retregs1,false);
+    codelem(cg,cdb,eaddr,retregs1,false);
     const Rn = findreg(retregs1);           // Rn is the pointer
-
-    bool isPair = isRegisterPair(true, tym, 0);
 
     if (tyfloating(tym))
     {
@@ -1425,6 +1444,13 @@ void cdind(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
                 cdb.gen1(INSTR.ldst_pos(size,1,opc,imm12  ,Rn,Rlsw));
                 cdb.gen1(INSTR.ldst_pos(size,1,opc,imm12+1,Rn,Rmsw));
             }
+        }
+        else if (offset)
+        {
+            reg_t Rt = allocreg(cdb, retregs, tym);
+            uint size, opc;
+            INSTR.szToSizeOpcLdr(sz, size, opc);
+            cdb.gen1(INSTR.ldst_pos(size,1,opc,offset / sz,Rn,Rt)); // LDR Rt,[Rn,#offset]
         }
         else
         {
@@ -1512,7 +1538,7 @@ void cdind(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
     }
 
     uint VR = 0;
-    uint imm12 = 0;
+    uint imm12 = offset >> size;
     cdb.gen1(INSTR.ldst_pos(size,VR,opc,imm12,Rn,Rt));
 
     fixresult(cg,cdb,e,retregs,pretregs);
