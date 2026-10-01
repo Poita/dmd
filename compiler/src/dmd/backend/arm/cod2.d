@@ -97,6 +97,46 @@ void cdorth(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
     tym_t ty2 = tybasic(e2.Ety);
     const sz = _tysize[ty];
 
+    /* Add or subtract an integer constant that fits an immediate field:
+     *  ADD/SUB Rd,Rn,#imm12{, LSL #12}
+     */
+    if ((e.Eoper == OPadd || e.Eoper == OPmin) &&
+        e2.Eoper == OPconst && tyintegral(ty) && (sz == 4 || sz == 8) &&
+        _tysize[ty1] == sz && !isRegisterPair(true, ty, 0))
+    {
+        long c = el_tolong(e2);
+        if (sz == 4)
+            c = cast(int)c;
+        uint op = e.Eoper == OPmin;
+        const PSW = pretregs & mPSW;
+        if (c < 0 && c != long.min && !PSW)    // the carry would differ
+        {
+            c = -c;
+            op ^= 1;
+        }
+        uint sh = 0;
+        if (c >= 0x1000 && (c & 0xFFF) == 0)
+        {
+            c >>= 12;
+            sh = 1;
+        }
+        if (c >= 0 && c < 0x1000)
+        {
+            regm_t retregs1 = cg.allregs;
+            codelem(cg, cdb, e1, retregs1, false);
+            const reg_t Rn = findreg(retregs1);
+            regm_t retregs = pretregs & cg.allregs;
+            if (retregs == 0)
+                retregs = cg.allregs;
+            const reg_t Rd = allocreg(cdb, retregs, ty);
+            cdb.gen1(INSTR.addsub_imm(sz == 8, op, PSW != 0, sh, cast(uint)c, Rn, Rd));
+            freenode(e2);
+            pretregs = retregs | PSW;
+            fixresult(cg,cdb,e,mask(Rd),pretregs);
+            return;
+        }
+    }
+
     regm_t posregs = tyfloating(ty1) ? INSTR.FLOATREGS : cg.allregs;
 
     regm_t retregs1 = posregs;
@@ -1257,6 +1297,41 @@ void cdshift(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
     assert(!tyfloating(tyml));
 
     regm_t posregs = cg.allregs;
+
+    /* Shift by a constant amount:
+     *  LSL/LSR/ASR Rd,Rn,#shift as UBFM/SBFM, ROR Rd,Rn,#shift as EXTR
+     */
+    if (e2.Eoper == OPconst && (sz == 4 || sz == 8))
+    {
+        const uint bits = sz * 8;
+        ulong amount = el_tolong(e2);
+        if (e.Eoper == OPror)
+            amount &= bits - 1;         // rotating is modulo the size
+        if (amount < bits)
+        {
+            regm_t retregs1 = posregs;
+            codelem(cg, cdb, e1, retregs1, false);
+            const reg_t Rn = findreg(retregs1);
+            regm_t retregs = pretregs & cg.allregs;
+            if (retregs == 0)
+                retregs = INSTR.ALLREGS & posregs;
+            const reg_t Rd = allocreg(cdb, retregs, tyml);
+            const uint sf = sz == 8;
+            const uint n = cast(uint)amount;
+            switch (e.Eoper)
+            {
+                case OPshl:     cdb.gen1(INSTR.ubfm(sf, sf, (bits - n) & (bits - 1), bits - 1 - n, Rn, Rd)); break;
+                case OPshr:     cdb.gen1(INSTR.ubfm(sf, sf, n, bits - 1, Rn, Rd)); break;
+                case OPashr:    cdb.gen1(INSTR.sbfm(sf, sf, n, bits - 1, Rn, Rd)); break;
+                case OPror:     cdb.gen1(INSTR.extract(sf, 0, sf, 0, Rn, n, Rn, Rd)); break;
+                default:        assert(0);
+            }
+            freenode(e2);
+            fixresult(cg,cdb,e,retregs,pretregs);
+            return;
+        }
+    }
+
     regm_t retregs1 = posregs;
     codelem(cg, cdb, e1, retregs1, false);
     regm_t retregs2 = cg.allregs & ~retregs1;
