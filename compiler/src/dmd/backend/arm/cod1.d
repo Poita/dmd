@@ -1170,9 +1170,14 @@ void getlvalue(ref CGstate cg,ref CodeBuilder cdb,ref code pcs,elem* e,regm_t ke
                     return x.Eoper == OPshl && !x.Ecount && x.E2.Eoper == OPconst &&
                            el_tolong(x.E2) == log2sz && tysize(x.E1.Ety) == 8;
                 }
+                bool isExtended(elem* x)
+                {
+                    return (x.Eoper == OPu32_64 || x.Eoper == OPs32_64) && !x.Ecount;
+                }
                 elem* a = e11;
                 elem* b = e12;
-                if (isScaledIndex(a) && !isScaledIndex(b))
+                if (isScaledIndex(a) && !isScaledIndex(b) ||
+                    !isScaledIndex(b) && isExtended(a) && !isExtended(b))
                 {
                     elem* t = a; a = b; b = t;
                 }

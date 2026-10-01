@@ -1772,7 +1772,12 @@ void cdind(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         }
         elem* a = eaddr.E1;
         elem* b = eaddr.E2;
-        if (isScaledIndex(a) && !isScaledIndex(b))
+        bool isExtended(elem* x)
+        {
+            return (x.Eoper == OPu32_64 || x.Eoper == OPs32_64) && !x.Ecount;
+        }
+        if (isScaledIndex(a) && !isScaledIndex(b) ||
+            !isScaledIndex(b) && isExtended(a) && !isExtended(b))
         {
             elem* t = a; a = b; b = t;
         }
