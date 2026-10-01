@@ -42,7 +42,7 @@ import dmd.backend.inliner;
 public import dmd.backend.gdag : builddags, boolopt;
 public import dmd.backend.gflow : flowrd, flowlv, flowvbe, flowcp, flowae, genkillae, numberae;
 public import dmd.backend.glocal : localize;
-public import dmd.backend.gloop : blockinit, compdom, loopopt, updaterd;
+public import dmd.backend.gloop : blockinit, compdom, loopopt, loopConstants, updaterd;
 public import dmd.backend.gother : constprop, copyprop, rmdeadass, elimass, deadvar, verybusyexp, listrds;
 public import dmd.backend.gsroa : sliceStructs, sliceFloatStructs;
 
@@ -450,6 +450,8 @@ void optfunc(ref GlobalOptimizer go, ref BlockOpt bo)
         if (b.Belem)
             postoptelem(b.Belem);
     }
+    if (go.mfoptim & MFli)
+        loopConstants(bo);
     if (go.mfoptim & MFvbe)
         verybusyexp(go, bo, go.changes); /* very busy expressions         */
     if (go.mfoptim & MFcse)

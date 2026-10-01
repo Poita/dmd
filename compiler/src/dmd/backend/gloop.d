@@ -3931,3 +3931,224 @@ private int el_length(elem* e)
     }
     return n;
 }
+
+/*************************************
+ * AArch64: a constant that takes more than one instruction to load, used in
+ * a loop, is loaded once into a variable assigned in the loop's preheader,
+ * which the loop then uses. Done after the other optimizations, which would
+ * propagate the constant back into the loop.
+ */
+@trusted
+void loopConstants(ref BlockOpt bo)
+{
+    if (config.target_cpu != TARGET_AArch64)
+        return;
+    compdfo(bo.dfo, bo.startblock);
+    if (blockinit(bo))                  // can't handle ASM blocks
+        return;
+    compdom(bo);
+    Loops loops;
+    findloops(bo, bo.dfo[], loops);
+
+    static struct Loaded
+    {
+        tym_t ty;
+        ulong bits;
+        Symbol* s;
+    }
+    enum maxLoaded = 16;                // per loop, so as not to crowd out other register variables
+
+    // outermost loops first, so a constant is loaded as few times as possible
+    foreach (ref l; loops)
+    {
+        /* The block that enters the loop, which may also branch around it as
+         * assigning a constant does nothing else
+         */
+        block* pre = l.Lpreheader;
+        if (!pre)
+        {
+            foreach (b; l.Lhead.Bpred[])
+            {
+                if (vec_testbit(b.Bdfoidx, l.Lloop))
+                    continue;
+                if (pre)
+                {
+                    pre = null;
+                    break;
+                }
+                pre = b;
+            }
+            if (!pre || pre.bc == BC.asm_ || pre.bc == BC.switch_ && pre.Belem is null)
+                continue;
+        }
+        Loaded[maxLoaded] loaded;
+        size_t nloaded;
+
+        void replace(elem* c)
+        {
+            const ty = tybasic(c.Ety);
+            const ulong bits = constBits(c);
+            Symbol* s;
+            foreach (ref ld; loaded[0 .. nloaded])
+            {
+                if (ld.ty == ty && ld.bits == bits)
+                {
+                    s = ld.s;
+                    break;
+                }
+            }
+            if (!s)
+            {
+                if (nloaded == maxLoaded)
+                    return;
+                elem* t = el_alloctmp(ty);
+                s = t.Vsym;
+                prependConst(el_bin(OPeq, ty, t, el_copytree(c)), pre);
+                loaded[nloaded++] = Loaded(ty, bits, s);
+            }
+            elem* v = el_var(s);
+            v.Ety = c.Ety;
+            el_copy(c, v);
+            el_free(v);
+        }
+
+        void scan(elem* e)
+        {
+            while (!OTleaf(e.Eoper))
+            {
+                if (OTbinary(e.Eoper))
+                {
+                    if (e.E2.Eoper == OPconst)
+                    {
+                        if (loadedConstant(e, e.E2, true))
+                            replace(e.E2);
+                    }
+                    else
+                        scan(e.E2);
+                }
+                if (e.E1.Eoper == OPconst)
+                {
+                    if (loadedConstant(e, e.E1, false))
+                        replace(e.E1);
+                    return;
+                }
+                e = e.E1;
+            }
+        }
+
+        for (uint i = 0; (i = cast(uint) vec_index(i, l.Lloop)) < bo.dfo.length; ++i)
+        {
+            block* b = bo.dfo[i];
+            if (b.Belem && b.Btry is pre.Btry)
+                scan(b.Belem);
+        }
+    }
+    freeloop(loops);
+}
+
+/* Put assignment e at the start of block b, ahead of what b evaluates for
+ * how it exits
+ */
+@trusted
+private void prependConst(elem* e, block* b)
+{
+    b.Belem = b.Belem ? el_bin(OPcomma, b.Belem.Ety, e, b.Belem) : e;
+}
+
+/* The bits of constant c, as many as its type has
+ */
+@trusted
+private ulong constBits(const(elem)* c)
+{
+    const sz = tysize(c.Ety);
+    if (tybasic(c.Ety) == TYfloat || tybasic(c.Ety) == TYifloat)
+    {
+        float f = c.Vfloat;
+        return *cast(uint*)&f;
+    }
+    if (tybasic(c.Ety) == TYdouble || tybasic(c.Ety) == TYidouble || tybasic(c.Ety) == TYdouble_alias)
+    {
+        double d = c.Vdouble;
+        return *cast(ulong*)&d;
+    }
+    const ulong v = c.Vullong;
+    return sz == 8 ? v : v & ((1UL << (sz * 8)) - 1);
+}
+
+/* Whether constant c, an operand of e, is worth loading into a variable
+ * before a loop: it takes more than one instruction to load, and e has no
+ * form taking it as an immediate
+ */
+@trusted
+private bool loadedConstant(const(elem)* e, const(elem)* c, bool isE2)
+{
+    import dmd.backend.arm.disasmarm : encodeHFD;
+
+    const ty = tybasic(c.Ety);
+    const op = e.Eoper;
+    switch (op)
+    {
+        case OPadd: case OPmin: case OPmul: case OPdiv:
+        case OPand: case OPor: case OPxor:
+        case OPaddass: case OPminass: case OPmulass: case OPdivass:
+        case OPandass: case OPorass: case OPxorass:
+        case OPparam: case OPcolon: case OPcolon2:
+            break;
+        case OPeq:
+        case OPcall: case OPcallns:
+            if (!isE2)
+                return false;
+            break;
+        default:
+            if (!OTrel(op))
+                return false;
+            break;
+    }
+
+    if (ty == TYfloat || ty == TYdouble || ty == TYdouble_alias)
+    {
+        const double d = ty == TYfloat ? c.Vfloat : c.Vdouble;
+        ubyte imm8;
+        if (encodeHFD(d, imm8))
+            return false;               // FMOV Vd,#imm
+        if (d == 0 && OTrel(op))
+            return false;               // FCMP Vn,#0.0
+        return true;
+    }
+
+    if (!tyintegral(ty) || tysize(ty) != 4 && tysize(ty) != 8)
+        return false;
+    // division by a constant is a multiplication, and shift counts are immediates
+    if (op == OPdiv || op == OPdivass)
+        return false;
+    const sz = tysize(ty);
+    const ulong v = constBits(c);
+    // instructions MOVZ or MOVN take, with a MOVK for each other 16 bits
+    uint nonzero, nonones;
+    foreach (k; 0 .. sz / 2)
+    {
+        const chunk = (v >> (k * 16)) & 0xFFFF;
+        nonzero += chunk != 0;
+        nonones += chunk != 0xFFFF;
+    }
+    const cost = nonzero < nonones ? nonzero : nonones;
+    if (cost < 2)
+        return false;
+    // ADD/SUB/CMP/CMN (immediate) take 12 bits, shifted by 12 or not
+    if (op == OPadd || op == OPmin || op == OPaddass || op == OPminass || OTrel(op))
+    {
+        const ulong n = sz == 8 ? -v : (-v) & 0xFFFF_FFFF;
+        foreach (x; [v, n])
+            if ((x & ~0xFFFUL) == 0 || (x & ~0xFFF000UL) == 0)
+                return false;
+    }
+    // AND/ORR/EOR (immediate) take bit masks
+    if (op == OPand || op == OPor || op == OPxor || op == OPandass || op == OPorass || op == OPxorass)
+    {
+        import dmd.backend.arm.instr : encodeNImmrImms;
+        uint N, immr, imms;
+        if (encodeNImmrImms(sz == 8 ? v : v | (v << 32), N, immr, imms))
+            return false;
+    }
+    return true;
+}
