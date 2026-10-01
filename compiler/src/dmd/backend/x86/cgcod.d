@@ -2961,6 +2961,12 @@ void codelem(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs,uin
 
     regm_t tmask = cg.AArch64 ? (INSTR.ALLREGS | INSTR.FLOATREGS)
                               : (mES | ALLREGS | mBP | XMMREGS);
+    /* An AArch64 integer register variable read at a narrower size is extended
+     * into the destination register, which therefore cannot be the variable's own
+     */
+    if (cg.AArch64 && constflag & 1 && e.Eoper == OPvar && e.Vsym.Sfl == FL.reg &&
+        !tyfloating(e.Ety) && tysize(e.Ety) < REGSIZE && tysize(e.Ety) < tysize(e.Vsym.Stype.Tty))
+        constflag &= ~1;
     if (!(constflag & 1) && pretregs & tmask & ~cg.regcon.mvar)
         pretregs &= ~cg.regcon.mvar;                      /* can't use register vars */
 
