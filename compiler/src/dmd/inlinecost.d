@@ -37,6 +37,7 @@ import dmd.statement;
 import dmd.tokens;
 import dmd.visitor;
 import dmd.visitor.postorder;
+import dmd.inline : restEndsWithReturn;
 
 enum COST_MAX = 500;
 
@@ -174,17 +175,15 @@ public:
                 /* Specifically allow:
                  *  if (condition)
                  *      return exp1;
-                 *  return exp2;
+                 *  statements ending with return exp2;
+                 * the statements being visited next
                  */
                 IfStatement ifs;
-                Statement s3;
                 if ((ifs = s2.isIfStatement()) !is null &&
                     ifs.ifbody &&
                     ifs.ifbody.endsWithReturnStatement() &&
                     !ifs.elsebody &&
-                    i + 1 < s.statements.length &&
-                    (s3 = s.statements[i + 1]) !is null &&
-                    s3.endsWithReturnStatement()
+                    restEndsWithReturn(s.statements, i + 1)
                    )
                 {
                     if (ifs.param)       // if variables are declared
@@ -192,9 +191,8 @@ public:
                         cost = COST_MAX;
                         return;
                     }
-                    expressionInlineCost(ifs.condition);
-                    ifs.ifbody.accept(this);
-                    s3.accept(this);
+                    icv.expressionInlineCost(ifs.condition);
+                    ifs.ifbody.accept(icv);
                 }
                 else
                     s2.accept(icv);

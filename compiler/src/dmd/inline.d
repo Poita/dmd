@@ -197,25 +197,30 @@ public:
                 /* Specifically allow:
                  *  if (condition)
                  *      return exp1;
-                 *  return exp2;
+                 *  statements ending with return exp2;
                  */
                 IfStatement ifs;
-                Statement s3;
                 if ((ifs = sx.isIfStatement()) !is null &&
                     ifs.ifbody &&
                     ifs.ifbody.endsWithReturnStatement() &&
                     !ifs.elsebody &&
-                    i + 1 < s.statements.length &&
-                    (s3 = s.statements[i + 1]) !is null &&
-                    s3.endsWithReturnStatement()
+                    restEndsWithReturn(s.statements, i + 1)
                    )
                 {
-                    /* Rewrite as ?:
+                    /* Rewrite as condition ? exp1 : (statements, exp2)
                      */
                     auto econd = doInlineAs!Expression(ifs.condition, ids);
                     assert(econd);
                     auto e1 = doInlineAs!Expression(ifs.ifbody, ids);
                     assert(ids.foundReturn);
+                    Statement s3 = s.statements[i + 1];
+                    if (i + 2 < s.statements.length)
+                    {
+                        auto rest = Statements();
+                        foreach (st; s.statements[i + 1 .. $])
+                            rest.push(st);
+                        s3 = new CompoundStatement(s3.loc, rest.move());
+                    }
                     auto e2 = doInlineAs!Expression(s3, ids);
                     assert(e2);
                     Expression e = new CondExp(econd.loc, econd, e1, e2);
@@ -1912,6 +1917,20 @@ private void inlineScanModule(Module m, PASS pass, ErrorSink eSink)
     }
 
     m.semanticRun = pass;
+}
+
+/***********************************************************
+ * Whether the statements from index i on end with a return statement,
+ * the last of them being one.
+ */
+bool restEndsWithReturn(ref Statements statements, size_t i)
+{
+    if (i >= statements.length)
+        return false;
+    foreach (st; statements[i .. $])
+        if (!st)
+            return false;
+    return statements[$ - 1].endsWithReturnStatement() !is null;
 }
 
 /***********************************************************
