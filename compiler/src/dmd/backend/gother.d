@@ -1511,12 +1511,7 @@ public void copyprop(ref GlobalOptimizer go, ref BlockOpt bo)
     alias cs = cpState;
     if (!copyPropFlow(go, bo))
         return;             // none available
-
-    /* A long chain of copies takes a walk for each copy in it, so the walks
-     * are bounded
-     */
-    enum maxWalks = 17;
-    foreach (walk; 0 .. maxWalks)
+    while (1)
     {
         uint recalc;
         foreach (i, b; bo.dfo[])    // for each block
