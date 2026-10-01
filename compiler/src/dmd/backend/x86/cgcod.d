@@ -673,7 +673,17 @@ void prolog(ref CGstate cg, ref CodeBuilder cdb)
         }
     }
 
-    if (config.flags & CFGalwaysframe ||
+    /* An AArch64 function that calls nothing needs no frame record, as x30
+     * holds its return address throughout, unless it has a stack frame for
+     * other reasons, decided once its size is known
+     */
+    const bool aarch64Leaf = cg.AArch64 && !cg.calledafunc && !cg.anyiasm && !cg.usednteh &&
+        !cg.accessedTLS && !(funcsym_p.Sfunc.Fflags & Ffakeeh) && !variadic(funcsym_p.Stype) &&
+        !(config.flags & CFGstack) && !(tyf & mTYnaked);
+    if (aarch64Leaf)
+    {
+    }
+    else if (config.flags & CFGalwaysframe ||
         funcsym_p.Sfunc.Fflags & Ffakeeh ||
         /* The exception stack unwinding mechanism relies on the EBP chain being intact,
          * so need frame if function can possibly throw
@@ -933,7 +943,7 @@ else
         // otherwise the return address is lost
         cg.needframe = 1;
     }
-    else if (config.flags & CFGalwaysframe)
+    else if (config.flags & CFGalwaysframe && !aarch64Leaf)
         cg.needframe = 1;
     else
     {
@@ -956,6 +966,9 @@ else
         if (cg.refparam && (cg.anyiasm || I16))
             cg.needframe = 1;
     }
+
+    if (aarch64Leaf && (localsize || topush || cg.Alloca.size || cg.enforcealign))
+        cg.needframe = 1;
 
     if (cg.needframe)
     {
