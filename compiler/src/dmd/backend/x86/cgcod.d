@@ -1374,6 +1374,19 @@ void stackoffsets(ref CGstate cg, ref symtab_t symtab, bool estimate)
  *      regcon = register state to set
  *      bl = block being entered
  */
+/* Copy the immediate values in registers of `from` to `to`; the values are
+ * valid only where the mask says so
+ */
+private void copyImmed(ref immed_t to, ref const immed_t from)
+{
+    to.mval = from.mval;
+    for (regm_t m = from.mval; m; m &= m - 1)
+    {
+        const r = bsf(m);
+        to.value[r] = from.value[r];
+    }
+}
+
 @trusted
 private void mergePredRegcon(ref con_t regcon, block* bl)
 {
@@ -1383,19 +1396,19 @@ private void mergePredRegcon(ref con_t regcon, block* bl)
         // the same predecessor can appear more than once, e.g. for switch cases
         if (i == 0)
         {
-            regcon.immed = bp.Bregcon.immed;
+            copyImmed(regcon.immed, bp.Bregcon.immed);
             regcon.params = bp.Bregcon.params;
         }
         else
         {
             regcon.params &= bp.Bregcon.params;
-            if ((regcon.immed.mval &= bp.Bregcon.immed.mval) != 0)
-                // Actual values must match, too
-                foreach (r; 0 .. REGMAX)
-                {
-                    if (regcon.immed.value[r] != bp.Bregcon.immed.value[r])
-                        regcon.immed.mval &= ~mask(r);
-                }
+            // Actual values must match, too
+            for (regm_t m = regcon.immed.mval &= bp.Bregcon.immed.mval; m; m &= m - 1)
+            {
+                const r = bsf(m);
+                if (regcon.immed.value[r] != bp.Bregcon.immed.value[r])
+                    regcon.immed.mval &= ~mask(r);
+            }
         }
     }
 }
@@ -1596,8 +1609,9 @@ private void blcodgen(ref CGstate cg, block* bl)
     if (cg.refparam)
         bl.Bflags |= BFL.refparam;
     cg.refparam |= refparamsave;
-    bl.Bregcon.immed = cg.regcon.immed;
-    bl.Bregcon.cse = cg.regcon.cse;
+    copyImmed(bl.Bregcon.immed, cg.regcon.immed);
+    bl.Bregcon.cse.mval = cg.regcon.cse.mval;   // only the masks of the CSEs are looked at
+    bl.Bregcon.cse.mops = cg.regcon.cse.mops;
     bl.Bregcon.used = cg.regcon.used;
     assert(!(bl.Bregcon.used & mPSW));
     bl.Bregcon.params = cg.regcon.params;
