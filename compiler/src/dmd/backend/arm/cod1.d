@@ -1121,12 +1121,21 @@ void getlvalue(ref CGstate cg,ref CodeBuilder cdb,ref code pcs,elem* e,regm_t ke
                     eindex = b;
                 if (eindex)
                 {
+                    // a 32 bit index is extended by the addressing mode
+                    Extend extend = Extend.LSL;
+                    if ((eindex.Eoper == OPu32_64 || eindex.Eoper == OPs32_64) && !eindex.Ecount)
+                    {
+                        extend = eindex.Eoper == OPu32_64 ? Extend.UXTW : Extend.SXTW;
+                        elem* x = eindex.E1;
+                        freenode(eindex);
+                        eindex = x;
+                    }
                     scodelem(cg,cdb, a, idxregs, keepmsk, true);
                     regm_t idxregs2 = cg.allregs & ~(idxregs | keepmsk);
                     scodelem(cg,cdb, eindex, idxregs2, keepmsk | idxregs, true);
                     pcs.base = findreg(idxregs);
                     pcs.index = findreg(idxregs2);
-                    pcs.Sextend = cast(ubyte)(Extend.LSL | (scaled << 3));
+                    pcs.Sextend = cast(ubyte)(extend | (scaled << 3));
                     pcs.IFL1 = FL.const_;       // nothing for assignaddrc() to add
                     freenode(e1);
                     return Lptr();

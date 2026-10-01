@@ -1444,6 +1444,7 @@ void cdind(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
      */
     elem* eindex = null;
     uint scaled = 0;            // S field: shift the index by the size
+    Extend indexExtend = Extend.LSL;
     if (!offset && eaddr.Eoper == OPadd && !eaddr.Ecount && !isPair && sz && sz <= 8 &&
         tysize(eaddr.Ety) == REGSIZE && eaddr.E2.Eoper != OPconst)
     {
@@ -1472,18 +1473,27 @@ void cdind(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         {
             freenode(eaddr);
             eaddr = a;
+            // a 32 bit index is extended by the addressing mode
+            if ((eindex.Eoper == OPu32_64 || eindex.Eoper == OPs32_64) && !eindex.Ecount)
+            {
+                indexExtend = eindex.Eoper == OPu32_64 ? Extend.UXTW : Extend.SXTW;
+                elem* x = eindex.E1;
+                freenode(eindex);
+                eindex = x;
+            }
         }
     }
 
+    // the pointer and the index are only read
     const posregs = cg.allregs;
     regm_t retregs1 = posregs;
-    codelem(cg,cdb,eaddr,retregs1,false);
+    codelem(cg,cdb,eaddr,retregs1,true);
     const Rn = findreg(retregs1);           // Rn is the pointer
     reg_t Ri = NOREG;                       // the index register
     if (eindex)
     {
-        regm_t retregsi = posregs & ~retregs1;
-        scodelem(cg,cdb,eindex,retregsi,retregs1,false);
+        regm_t retregsi = readOnlyRegs2(eaddr, eindex, posregs, retregs1);
+        scodelem(cg,cdb,eindex,retregsi,retregs1,true);
         Ri = findreg(retregsi);
     }
 
@@ -1520,7 +1530,7 @@ void cdind(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
             uint size, opc;
             INSTR.szToSizeOpcLdr(sz, size, opc);
             if (Ri != NOREG)
-                cdb.gen1(INSTR.ldst_regoff(size,1,opc,Ri,3,scaled,Rn,Rt & 31)); // LDR Rt,[Rn,Ri{, LSL #size}]
+                cdb.gen1(INSTR.ldst_regoff(size,1,opc,Ri,indexExtend,scaled,Rn,Rt & 31)); // LDR Rt,[Rn,Ri{, extend #size}]
             else
                 cdb.gen1(INSTR.ldst_pos(size,1,opc,offset / sz,Rn,Rt)); // LDR Rt,[Rn,#offset]
         }
@@ -1611,7 +1621,7 @@ void cdind(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
 
     uint VR = 0;
     if (Ri != NOREG)
-        cdb.gen1(INSTR.ldst_regoff(size,VR,opc,Ri,3,scaled,Rn,Rt)); // LDR Rt,[Rn,Ri{, LSL #size}]
+        cdb.gen1(INSTR.ldst_regoff(size,VR,opc,Ri,indexExtend,scaled,Rn,Rt)); // LDR Rt,[Rn,Ri{, extend #size}]
     else
     {
         uint imm12 = offset >> size;
