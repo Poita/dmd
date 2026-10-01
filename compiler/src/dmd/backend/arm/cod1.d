@@ -2203,6 +2203,79 @@ void gprToHfa(ref CodeBuilder cdb, const ref AggregateABI a, reg_t rx, reg_t rv)
     }
 }
 
+/***********************************
+ * Recognize the value of a struct of floating point elements that is split
+ * into variables, as copied to a temporary to be used whole:
+ *      (t.0 = x0, t.1 = x1, ..., t)
+ * Params:
+ *      e = expression giving the struct
+ *      a = how the struct is passed
+ *      vals = set to the value of each element
+ * Returns:
+ *      true if e is that, with each element assigned once from an expression
+ *      without side effects
+ */
+@trusted
+bool hfaElementValues(elem* e, const ref AggregateABI a, ref elem*[4] vals)
+{
+    if (a.kind != AggregateABI.Kind.hfa || a.nregs > 4 || e.Eoper != OPcomma || e.Ecount ||
+        e.E2.Eoper != OPvar || e.E2.Ecount || e.E2.Voffset)
+        return false;
+    const Symbol* t = e.E2.Vsym;
+    vals[] = null;
+    bool collect(elem* x)
+    {
+        if (x.Ecount)
+            return false;
+        if (x.Eoper == OPcomma)
+            return collect(x.E1) && collect(x.E2);
+        if (x.Eoper != OPeq || x.E1.Eoper != OPvar || x.E1.Vsym !is t || !tyfloating(x.E1.Ety) ||
+            tysize(x.E1.Ety) != a.esz || x.E1.Voffset % a.esz || el_sideeffect(x.E2))
+            return false;
+        const k = x.E1.Voffset / a.esz;
+        if (k >= a.nregs || vals[k])
+            return false;
+        vals[k] = x.E2;
+        return true;
+    }
+    if (!collect(e.E1))
+        return false;
+    foreach (k; 0 .. a.nregs)
+        if (!vals[k])
+            return false;
+    return true;
+}
+
+/***********************************
+ * Evaluate the element values that hfaElementValues() found into the V
+ * registers from `rv` on. The rest of e is done with, without changing it,
+ * as code is generated from it again in later passes.
+ */
+@trusted
+void loadHfaElementValues(ref CGstate cg, ref CodeBuilder cdb, elem* e, const ref AggregateABI a,
+    ref elem*[4] vals, reg_t rv, regm_t keepmsk)
+{
+    regm_t loaded = 0;
+    foreach (k; 0 .. a.nregs)
+    {
+        regm_t r = mask(cast(reg_t)(rv + k));
+        scodelem(cg, cdb, vals[k], r, keepmsk | loaded, true);
+        loaded |= mask(cast(reg_t)(rv + k));
+    }
+    void done(elem* x)
+    {
+        if (x.Eoper == OPcomma)
+        {
+            done(x.E1);
+            done(x.E2);
+        }
+        else if (x.Eoper == OPeq)
+            freenode(x.E1);
+        freenode(x);
+    }
+    done(e);
+}
+
 /// Returns: the registers an aggregate is returned in
 regm_t aggregateRetRegs(const ref AggregateABI a)
 {
@@ -2587,7 +2660,15 @@ void cdfunc(ref CGstate cg, ref CodeBuilder cdb, elem* e, ref regm_t pretregs)
             elem* ev = ep;              // the value after any commas
             while (ev.Eoper == OPcomma && !ev.Ecount)
                 ev = ev.E2;
-            if (agg.kind == AggregateABI.Kind.hfa && !tyaggregate(ep.Ety) && agg.size <= 16 && !ev.Ecount &&
+            elem*[4] hvals;
+            if (agg.kind == AggregateABI.Kind.hfa && !tyaggregate(ep.Ety) && agg.size <= 16 &&
+                hfaElementValues(ep, agg, hvals))
+            {
+                // the element values go straight to the V registers
+                getregs(cdb, regs);
+                loadHfaElementValues(cg, cdb, ep, agg, hvals, preg, keepmsk);
+            }
+            else if (agg.kind == AggregateABI.Kind.hfa && !tyaggregate(ep.Ety) && agg.size <= 16 && !ev.Ecount &&
                 (ev.Eoper == OPvar && ev.Vsym.Sfl != FL.reg || ev.Eoper == OPind))
             {
                 // load the elements of an HFA in memory directly into the V registers

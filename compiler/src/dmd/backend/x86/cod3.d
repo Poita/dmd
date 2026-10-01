@@ -1363,13 +1363,26 @@ static if (NTEXCEPTIONS)
                     /* Load a small HFA in memory directly into the V registers
                      * it is returned in
                      */
-                    import dmd.backend.arm.cod1 : aarch64Aggregate, holdsAggregate, AggregateABI, getlvalue, loadFromEA;
-                    if (holdsAggregate(e.Ety, e.ET) && !tyaggregate(e.Ety))
+                    import dmd.backend.arm.cod1 : aarch64Aggregate, holdsAggregate, AggregateABI, getlvalue, loadFromEA,
+                        hfaElementValues, loadHfaElementValues;
+                    // the function's return type says how it is returned, which e's may no longer
+                    type* tret = funcsym_p.Stype.Tnext;
+                    if (!tyaggregate(e.Ety) && tret && tybasic(tret.Tty) == TYstruct && tysize(e.Ety) >= type_size(tret))
                     {
-                        const a = aarch64Aggregate(e.ET);
+                        const a = aarch64Aggregate(tret);
                         elem* ev = e;
                         while (ev.Eoper == OPcomma && !ev.Ecount)
                             ev = ev.E2;
+                        elem*[4] hvals;
+                        if (a.kind == AggregateABI.Kind.hfa && a.size <= 16 && hfaElementValues(e, a, hvals))
+                        {
+                            // the element values go straight to the V registers
+                            loadHfaElementValues(cg, cdb, e, a, hvals, 32, 0);
+                            retregs = 0;
+                            foreach (k; 0 .. a.nregs)
+                                retregs |= mask(cast(reg_t)(32 + k));
+                            goto L4;
+                        }
                         if (a.kind == AggregateABI.Kind.hfa && a.size <= 16 && !ev.Ecount &&
                             (ev.Eoper == OPvar && ev.Vsym.Sfl != FL.reg || ev.Eoper == OPind))
                         {

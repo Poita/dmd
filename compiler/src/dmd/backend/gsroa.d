@@ -624,7 +624,11 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
     foreach (si; 0 .. len)
     {
         Symbol* s = symtab[si];
-        if (!(s.Sflags & SFLdistinct))           // address was taken
+        /* A copy of a whole struct takes away SFLdistinct, so the address
+         * being taken is checked below instead; a variable a nested function
+         * refers to is volatile
+         */
+        if (s.ty() & (mTYvolatile | mTYshared))
             continue;
         // a parameter in V registers is split into a parameter per register
         const bool vparam = s.Sclass == SC.fastpar && s.Spreg >= 32 && s.Spreg != NOREG &&
@@ -698,7 +702,7 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
                                           : tysize(e.Ety) == size;
     }
 
-    enum Form { none, copy, constant, load, store, pair }
+    enum Form { none, copy, constant, load, store, pair, partial }
 
     /* Whether x refers to symbol s */
     static bool refersTo(const(elem)* x, const(Symbol)* s)
@@ -743,6 +747,12 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
             return Form.pair;
         if (whole1 && e2.Eoper == OPconst && e.Eoper == OPeq && (tysize(e2.Ety) == 8 || tysize(e2.Ety) == 16))
             return Form.constant;
+        // a constant assigned to some whole elements, as part of an initialization
+        if (inf1 && !whole1 && !isElement(e1, *inf1) && e2.Eoper == OPconst && e.Eoper == OPeq &&
+            !tyfloating(e1.Ety) && e1.Voffset >= 0 && e1.Voffset % inf1.esz == 0 &&
+            tysize(e1.Ety) >= inf1.esz && tysize(e1.Ety) <= 16 && tysize(e1.Ety) % inf1.esz == 0 &&
+            e1.Voffset + tysize(e1.Ety) <= inf1.n * inf1.esz)
+            return Form.partial;
         if (whole1 && e2.Eoper == OPind && !e2.Ecount && !(e2.Ety & mTYvolatile) && !el_sideeffect(e2.E1))
             return Form.load;
         if (whole2 && e1.Eoper == OPind && !e1.Ecount && !(e1.Ety & mTYvolatile) && !el_sideeffect(e1.E1))
@@ -783,9 +793,22 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
                     return;
 
                 case OPrelconst:
-                    if (auto inf = candidate(e))
-                        inf.can = false;
+                {
+                    // the address is taken
+                    const si = e.Vsym.Ssymnum;
+                    if (si != SYMIDX.max && si < len)
+                        info[si].can = false;
                     return;
+                }
+
+                case OPaddr:
+                    if (e.E1.Eoper == OPvar)
+                    {
+                        const si = e.E1.Vsym.Ssymnum;
+                        if (si != SYMIDX.max && si < len)
+                            info[si].can = false;
+                    }
+                    goto default;
 
                 case OPcomma:
                     gather(e.E1, false);
@@ -806,6 +829,7 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
                         {
                             case Form.copy:     inf1.elems += inf1.n; inf2.elems += inf2.n; return;
                             case Form.constant: inf1.elems += inf1.n; return;
+                            case Form.partial:  inf1.elems += tysize(e.E1.Ety) / inf1.esz; return;
                             case Form.load:     inf1.elems += inf1.n; gather(e.E2.E1, true); return;
                             case Form.store:    inf2.elems += inf2.n; gather(e.E1.E1, true); return;
                             case Form.pair:     inf1.elems += inf1.n; gather(e.E2.E1, true); gather(e.E2.E2, true); return;
@@ -895,7 +919,7 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
             free(id);
             snew.Sclass = sold.Sclass;
             snew.Sfl = sold.Sfl;
-            snew.Sflags = sold.Sflags | GTregcand;
+            snew.Sflags = sold.Sflags | GTregcand | SFLdistinct;
             snew.Stype = type_fake(elemTy(*inf, k));
             snew.Stype.Tcount++;
             if (sold.Sclass == SC.fastpar)
@@ -916,7 +940,7 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
              */
             funcsym_p.Sfunc.Fflags &= ~Finline;
         }
-        sold.Sflags |= GTregcand;
+        sold.Sflags |= GTregcand | SFLdistinct;
     }
     if (!added)
         return;
@@ -1064,6 +1088,7 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
                             }
                             goto default;
                         }
+                        uint nchain = 0;        // number of element assignments, if not all of them
                         final switch (form)
                         {
                             case Form.copy:
@@ -1084,18 +1109,24 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
                             }
 
                             case Form.constant:
+                            case Form.partial:
                             {
                                 const elem* ec = e.E2;
-                                foreach (k; 0 .. inf1.n)
+                                // the elements the constant covers, and the first of them
+                                const uint first = form == Form.partial ? cast(uint)(e.E1.Voffset / inf1.esz) : 0;
+                                const uint count = form == Form.partial ? cast(uint)(tysize(e.E1.Ety) / inf1.esz) : inf1.n;
+                                foreach (j; 0 .. count)
                                 {
+                                    const uint k = first + j;
                                     Vconst c;
                                     ulong bits;
+                                    // the bits of the j'th element in the constant
                                     if (inf1.esz == 8)
-                                        bits = k == 0 ? ec.Vcent.lo : ec.Vcent.hi;
+                                        bits = j == 0 ? ec.Vcent.lo : ec.Vcent.hi;
                                     else
                                     {
-                                        const ulong half = tysize(ec.Ety) == 16 && k >= 2 ? ec.Vcent.hi : ec.Vcent.lo;
-                                        bits = (k & 1) ? half >> 32 : half & 0xFFFF_FFFF;
+                                        const ulong half = tysize(ec.Ety) == 16 && j >= 2 ? ec.Vcent.hi : ec.Vcent.lo;
+                                        bits = (j & 1) ? half >> 32 : half & 0xFFFF_FFFF;
                                     }
                                     elem* ek;
                                     if (inf1.isInt)
@@ -1111,8 +1142,9 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
                                         }
                                         ek = el_const(elemTy(*inf1, k), c);
                                     }
-                                    a[k] = el_bin(OPeq, elemTy(*inf1, k), elemVar(*inf1, k), ek);
+                                    a[j] = el_bin(OPeq, elemTy(*inf1, k), elemVar(*inf1, k), ek);
                                 }
+                                nchain = count;
                                 break;
                             }
 
@@ -1142,10 +1174,11 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
                             case Form.none:
                                 assert(0);
                         }
-                        const n = (form == Form.store ? inf2 : inf1).n;
+                        if (!nchain)
+                            nchain = (form == Form.store ? inf2 : inf1).n;
                         el_free(e.E1);
                         el_free(e.E2);
-                        become(e, chain(a[0 .. n]));
+                        become(e, chain(a[0 .. nchain]));
                         return;
                     }
                     goto default;

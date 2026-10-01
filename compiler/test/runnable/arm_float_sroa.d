@@ -82,6 +82,38 @@ double dbl(double a)
     return useD(d) + e.x + e.y + e.z;
 }
 
+struct N3 { float v = 0, dx = 0, dy = 0; }
+
+pragma(inline, false) N3 initFields(float a, float b)
+{
+    N3 r;                           // default initialized, a constant over two elements
+    r.v = a + b;
+    r.dx = a * b;
+    return r;                       // returned from the element variables
+}
+
+pragma(inline, false) float takeN3(N3 n) { return n.v * 100 + n.dx * 10 + n.dy; }
+
+pragma(inline, false) float passN3(float a)
+{
+    N3 r;
+    r.dy = a;
+    r.v = a * 2;
+    N3 c = r;                       // copied whole
+    c.dx = 1;
+    return takeN3(c) + takeN3(r);   // passed from the element variables
+}
+
+pragma(inline, false) float copiedThenAddressed(float a)
+{
+    N3 r;
+    r.v = a;
+    N3 c = r;                       // copied whole
+    N3* p = &c;                     // and its address taken, so not split
+    p.dx = 5;
+    return c.v + c.dx;
+}
+
 float addressTaken(float a)
 {
     V2 t = V2(a, a);
@@ -111,5 +143,11 @@ int main()
     assert(dbl(2) == 2 + 1 + 2 + 6);
 
     assert(addressTaken(2) == 7);
+
+    const n3 = initFields(3, 2);
+    assert(n3.v == 5 && n3.dx == 6 && n3.dy == 0);
+    // c = (4, 1, 2), r = (4, 0, 2)
+    assert(passN3(2) == 412 + 402);
+    assert(copiedThenAddressed(3) == 8);
     return 0;
 }
