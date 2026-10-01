@@ -44,7 +44,7 @@ public import dmd.backend.gflow : flowrd, flowlv, flowvbe, flowcp, flowae, genki
 public import dmd.backend.glocal : localize;
 public import dmd.backend.gloop : blockinit, compdom, loopopt, updaterd;
 public import dmd.backend.gother : constprop, copyprop, rmdeadass, elimass, deadvar, verybusyexp, listrds;
-public import dmd.backend.gsroa : sliceStructs;
+public import dmd.backend.gsroa : sliceStructs, sliceFloatStructs;
 
 nothrow:
 @safe:
@@ -380,6 +380,8 @@ void optfunc(ref GlobalOptimizer go, ref BlockOpt bo)
         out_regcand(globsym[]);         // recompute register candidates
         go.changes = 0;                 // no changes yet
         sliceStructs(globsym, bo.startblock);
+        if (iter == 1)
+            sliceFloatStructs(globsym, bo.startblock);
         if (go.mfoptim & MFcnp)
             constprop(go, bo, go.changes);  /* make relationals unsigned     */
         if (go.mfoptim & (MFli | MFliv))

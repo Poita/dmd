@@ -576,3 +576,470 @@ private int getSize(const(elem)* e)
         sz = cast(int)type_size(e.ET);
     return sz;
 }
+
+/***************************************
+ * AArch64: split each local struct of 2 to 4 floats or 2 to 4 doubles that is
+ * mostly accessed an element at a time into a variable per element, so that
+ * each element can be a register variable in a V register.
+ * An assignment of the whole struct from or to another such struct, a
+ * constant, or memory through a pointer becomes an assignment of each
+ * element. Any other use of the whole struct goes through a copy in memory,
+ * which is only worth it when element accesses are much more common.
+ * Params:
+ *      symtab = symbol table
+ *      startblock = first block of the function
+ */
+@trusted
+void sliceFloatStructs(ref symtab_t symtab, block* startblock)
+{
+    if (config.target_cpu != TARGET_AArch64)
+        return;
+
+    import dmd.backend.arm.cod1 : aarch64Aggregate, AggregateABI;
+
+    static struct Info
+    {
+        bool can;       // the symbol can be split
+        ubyte n;        // number of elements
+        ubyte esz;      // size of each element
+        uint elems;     // number of element accesses
+        uint wholes;    // number of accesses of the whole that go through memory
+        SYMIDX si0;     // index of the first element's symbol after splitting
+        type* t;        // the struct type
+        Symbol* tmp;    // the copy in memory for accesses of the whole
+    }
+
+    const len = symtab.length;
+    Info* ip = cast(Info*)calloc(len ? len : 1, Info.sizeof);
+    if (!ip)
+        err_nomem();
+    scope (exit) free(ip);
+    Info[] info = ip[0 .. len];
+
+    bool any = false;
+    foreach (si; 0 .. len)
+    {
+        Symbol* s = symtab[si];
+        if (!(s.Sflags & SFLdistinct))           // address was taken
+            continue;
+        if (s.Sclass != SC.auto_ && s.Sclass != SC.register)
+            continue;
+        type* t = s.Stype;
+        if (tybasic(t.Tty) != TYstruct || t.Ttag.Sstruct.Sflags & STRbitfields)
+            continue;
+        const a = aarch64Aggregate(t);
+        if (a.kind != AggregateABI.Kind.hfa || a.nregs < 2 || a.nregs > 4 ||
+            (a.esz != 4 && a.esz != 8) || a.size != a.nregs * a.esz)
+            continue;
+        info[si].can = true;
+        info[si].n = a.nregs;
+        info[si].esz = a.esz;
+        any = true;
+    }
+    if (!any)
+        return;
+
+    static tym_t elemTy(const ref Info inf) { return inf.esz == 4 ? TYfloat : TYdouble; }
+
+    /* Whether e is an access of one element */
+    static bool isElement(const(elem)* e, const ref Info inf)
+    {
+        const ty = tybasic(e.Ety);
+        return (ty == elemTy(inf) || ty == (inf.esz == 4 ? TYifloat : TYidouble)) &&
+               e.Voffset % inf.esz == 0 && e.Voffset >= 0 && e.Voffset < inf.n * inf.esz;
+    }
+
+    /* Whether e is an access of the whole */
+    static bool isWhole(const(elem)* e, const ref Info inf)
+    {
+        if (e.Voffset || e.Ety & mTYvolatile)
+            return false;
+        const size = inf.n * inf.esz;
+        return tybasic(e.Ety) == TYstruct ? e.ET && type_size(e.ET) == size
+                                          : tysize(e.Ety) == size;
+    }
+
+    enum Form { none, copy, constant, load, store }
+
+    /* How an assignment e of a whole, whose value is not used, splits into
+     * element assignments, given the Info of e.E1 and e.E2 if they are vars
+     */
+    static Form assignForm(const(elem)* e, Info* inf1, Info* inf2)
+    {
+        const(elem)* e1 = e.E1;
+        const(elem)* e2 = e.E2;
+        const whole1 = inf1 && isWhole(e1, *inf1);
+        const whole2 = inf2 && isWhole(e2, *inf2);
+        if (whole1 && whole2)
+            return e1.Vsym !is e2.Vsym && inf1.n == inf2.n && inf1.esz == inf2.esz ? Form.copy : Form.none;
+        if (whole1 && e2.Eoper == OPconst && e.Eoper == OPeq && (tysize(e2.Ety) == 8 || tysize(e2.Ety) == 16))
+            return Form.constant;
+        if (whole1 && e2.Eoper == OPind && !e2.Ecount && !(e2.Ety & mTYvolatile) && !el_sideeffect(e2.E1))
+            return Form.load;
+        if (whole2 && e1.Eoper == OPind && !e1.Ecount && !(e1.Ety & mTYvolatile) && !el_sideeffect(e1.E1))
+            return Form.store;
+        return Form.none;
+    }
+
+    Info* candidate(const(elem)* e)
+    {
+        if (e.Eoper != OPvar)
+            return null;
+        const si = e.Vsym.Ssymnum;
+        return si != SYMIDX.max && si < len && info[si].can ? &info[si] : null;
+    }
+
+    void gather(const(elem)* e, bool valueUsed)
+    {
+        while (1)
+        {
+            switch (e.Eoper)
+            {
+                case OPvar:
+                    if (auto inf = candidate(e))
+                    {
+                        if (isElement(e, *inf))
+                            ++inf.elems;
+                        else if (isWhole(e, *inf))
+                            ++inf.wholes;       // read through the copy in memory
+                        else
+                            inf.can = false;
+                    }
+                    return;
+
+                case OPrelconst:
+                    if (auto inf = candidate(e))
+                        inf.can = false;
+                    return;
+
+                case OPcomma:
+                    gather(e.E1, false);
+                    e = e.E2;
+                    continue;
+
+                case OPeq:
+                case OPstreq:
+                {
+                    auto inf1 = candidate(e.E1);
+                    auto inf2 = candidate(e.E2);
+                    if (!valueUsed)
+                    {
+                        final switch (assignForm(e, inf1, inf2))
+                        {
+                            case Form.copy:     inf1.elems += inf1.n; inf2.elems += inf2.n; return;
+                            case Form.constant: inf1.elems += inf1.n; return;
+                            case Form.load:     inf1.elems += inf1.n; gather(e.E2.E1, true); return;
+                            case Form.store:    inf2.elems += inf2.n; gather(e.E1.E1, true); return;
+                            case Form.none:     break;
+                        }
+                        if (inf1 && isWhole(e.E1, *inf1))
+                        {
+                            ++inf1.wholes;      // written through the copy in memory
+                            e = e.E2;
+                            valueUsed = true;
+                            continue;
+                        }
+                    }
+                    if (inf1 && !isElement(e.E1, *inf1))
+                        inf1.can = false;
+                    goto default;
+                }
+
+                default:
+                    if (OTassign(e.Eoper) && e.Eoper != OPeq)
+                    {
+                        // an op= of the whole is not split
+                        if (auto inf = candidate(e.E1))
+                            if (!isElement(e.E1, *inf))
+                                inf.can = false;
+                    }
+                    if (OTbinary(e.Eoper))
+                    {
+                        gather(e.E2, true);
+                        e = e.E1;
+                        valueUsed = true;
+                        continue;
+                    }
+                    if (OTunary(e.Eoper))
+                    {
+                        e = e.E1;
+                        valueUsed = true;
+                        continue;
+                    }
+                    return;
+            }
+        }
+    }
+
+    static bool blockValueUsed(const block* b)
+    {
+        return !(b.bc == BC.goto_ || b.bc == BC.ret || b.bc == BC.exit);
+    }
+
+    foreach (b; BlockRange(startblock))
+    {
+        if (b.bc == BC.asm_)
+            return;
+        if (b.Belem)
+            gather(b.Belem, blockValueUsed(b));
+    }
+
+    /* Split each chosen symbol into a symbol per element, the first keeping
+     * the original symbol, the others inserted after it
+     */
+    int added = 0;
+    foreach (si; 0 .. len)
+    {
+        Info* inf = &info[si];
+        if (!inf.can || !inf.elems || inf.elems < 2 * inf.wholes * inf.n)
+        {
+            inf.can = false;
+            continue;
+        }
+        Symbol* sold = symtab[si + added];
+        inf.si0 = si + added;
+        inf.t = sold.Stype;                     // keep the struct type for the copy in memory
+        const tyf = elemTy(*inf);
+        foreach (k; 1 .. inf.n)
+        {
+            const idlen = 2 + strlen(sold.Sident.ptr) + 2;
+            char* id = cast(char*)malloc(idlen + 1);
+            if (!id)
+                err_nomem();
+            const idl = snprintf(id, idlen + 1, "__%s_%d", sold.Sident.ptr, k);
+            Symbol* snew = symbol_calloc(id[0 .. idl]);
+            free(id);
+            snew.Sclass = sold.Sclass;
+            snew.Sfl = sold.Sfl;
+            snew.Sflags = sold.Sflags | GTregcand;
+            snew.Stype = type_fake(tyf);
+            snew.Stype.Tcount++;
+            ++added;
+            symbol_insert(symtab, snew, si + added);
+        }
+        sold.Stype = type_fake(tyf);
+        sold.Stype.Tcount++;
+        sold.Sflags |= GTregcand;
+    }
+    if (!added)
+        return;
+
+    // the Info of each split symbol, by the symbol number of its first element
+    const nsyms = symtab.length;
+    Info** bp = cast(Info**)calloc(nsyms, (Info*).sizeof);
+    if (!bp)
+        err_nomem();
+    scope (exit) free(bp);
+    Info*[] byNum = bp[0 .. nsyms];
+    foreach (ref inf; info)
+        if (inf.can)
+            byNum[inf.si0] = &inf;
+
+    Info* splitInfo(const(elem)* e)
+    {
+        if (e.Eoper != OPvar)
+            return null;
+        const si = e.Vsym.Ssymnum;
+        return si != SYMIDX.max && si < nsyms ? byNum[si] : null;
+    }
+
+    elem* elemVar(const ref Info inf, uint k)
+    {
+        return el_var(symtab[inf.si0 + k]);
+    }
+
+    /* The copy in memory of a split symbol, as an element */
+    elem* tmpElem(ref Info inf, uint k)
+    {
+        if (!inf.tmp)
+        {
+            inf.tmp = symbol_genauto(inf.t);
+            inf.tmp.Sfl = FL.auto_;
+        }
+        elem* e = el_var(inf.tmp);
+        e.Ety = elemTy(inf);
+        e.ET = null;
+        e.Voffset = k * inf.esz;
+        return e;
+    }
+
+    /* Chain the element assignments in a[] with commas */
+    static elem* chain(elem*[] a)
+    {
+        elem* c = a[$ - 1];
+        foreach_reverse (x; a[0 .. $ - 1])
+            c = el_bin(OPcomma, c.Ety, x, c);
+        return c;
+    }
+
+    /* Replace e in place by r */
+    static void become(elem* e, elem* r)
+    {
+        el_copy(e, r);
+        r.E1 = null;
+        r.E2 = null;
+        r.Eoper = OPconst;
+        el_free(r);
+    }
+
+    void replace(elem* e, bool valueUsed)
+    {
+        while (1)
+        {
+            switch (e.Eoper)
+            {
+                case OPvar:
+                    if (auto inf = splitInfo(e))
+                    {
+                        if (isElement(e, *inf))
+                        {
+                            const k = cast(uint)(e.Voffset / inf.esz);
+                            e.Vsym = symtab[inf.si0 + k];
+                            e.Voffset = 0;
+                        }
+                        else
+                        {
+                            // (tmp.0 = e.0, ..., tmp)
+                            elem*[5] a;
+                            foreach (k; 0 .. inf.n)
+                                a[k] = el_bin(OPeq, elemTy(*inf), tmpElem(*inf, k), elemVar(*inf, k));
+                            elem* w = el_calloc();
+                            el_copy(w, e);
+                            w.Vsym = inf.tmp;
+                            a[inf.n] = w;
+                            become(e, chain(a[0 .. inf.n + 1]));
+                        }
+                    }
+                    return;
+
+                case OPcomma:
+                    replace(e.E1, false);
+                    e = e.E2;
+                    continue;
+
+                case OPeq:
+                case OPstreq:
+                {
+                    auto inf1 = splitInfo(e.E1);
+                    auto inf2 = splitInfo(e.E2);
+                    if (!valueUsed)
+                    {
+                        elem*[5] a;
+                        const form = assignForm(e, inf1, inf2);
+                        if (form == Form.none)
+                        {
+                            if (inf1 && isWhole(e.E1, *inf1))
+                            {
+                                // (tmp = e2, (e.0 = tmp.0, ...))
+                                replace(e.E2, true);
+                                elem* w = el_calloc();
+                                el_copy(w, e.E1);
+                                if (!inf1.tmp)
+                                {
+                                    inf1.tmp = symbol_genauto(inf1.t);
+                                    inf1.tmp.Sfl = FL.auto_;
+                                }
+                                w.Vsym = inf1.tmp;
+                                elem* eqt = el_bin(e.Eoper, e.Ety, w, e.E2);
+                                eqt.ET = e.ET;
+                                e.E2 = null;
+                                el_free(e.E1);
+                                a[0] = eqt;
+                                foreach (k; 0 .. inf1.n)
+                                    a[k + 1] = el_bin(OPeq, elemTy(*inf1), elemVar(*inf1, k), tmpElem(*inf1, k));
+                                become(e, chain(a[0 .. inf1.n + 1]));
+                                return;
+                            }
+                            goto default;
+                        }
+                        final switch (form)
+                        {
+                            case Form.copy:
+                                foreach (k; 0 .. inf1.n)
+                                    a[k] = el_bin(OPeq, elemTy(*inf1), elemVar(*inf1, k), elemVar(*inf2, k));
+                                break;
+
+                            case Form.constant:
+                            {
+                                const elem* ec = e.E2;
+                                foreach (k; 0 .. inf1.n)
+                                {
+                                    Vconst c;
+                                    ulong bits;
+                                    if (inf1.esz == 8)
+                                        bits = k == 0 ? ec.Vcent.lo : ec.Vcent.hi;
+                                    else
+                                    {
+                                        const ulong half = tysize(ec.Ety) == 16 && k >= 2 ? ec.Vcent.hi : ec.Vcent.lo;
+                                        bits = (k & 1) ? half >> 32 : half & 0xFFFF_FFFF;
+                                    }
+                                    if (inf1.esz == 8)
+                                        c.Vdouble = *cast(double*)&bits;
+                                    else
+                                    {
+                                        uint b32 = cast(uint)bits;
+                                        c.Vfloat = *cast(float*)&b32;
+                                    }
+                                    a[k] = el_bin(OPeq, elemTy(*inf1), elemVar(*inf1, k), el_const(elemTy(*inf1), c));
+                                }
+                                break;
+                            }
+
+                            case Form.load:
+                            case Form.store:
+                            {
+                                Info* inf = form == Form.load ? inf1 : inf2;
+                                elem* ep = form == Form.load ? e.E2.E1 : e.E1.E1;
+                                replace(ep, true);
+                                foreach (k; 0 .. inf.n)
+                                {
+                                    elem* p = k == 0 ? ep : el_copytree(ep);
+                                    if (k)
+                                        p = el_bin(OPadd, ep.Ety, p, el_long(TYsize_t, k * inf.esz));
+                                    elem* m = el_una(OPind, elemTy(*inf), p);
+                                    a[k] = form == Form.load ? el_bin(OPeq, elemTy(*inf), elemVar(*inf, k), m)
+                                                             : el_bin(OPeq, elemTy(*inf), m, elemVar(*inf, k));
+                                }
+                                // detach the pointer, which is now in the element assignments
+                                if (form == Form.load)
+                                    e.E2.E1 = null;
+                                else
+                                    e.E1.E1 = null;
+                                break;
+                            }
+
+                            case Form.none:
+                                assert(0);
+                        }
+                        const n = (form == Form.store ? inf2 : inf1).n;
+                        el_free(e.E1);
+                        el_free(e.E2);
+                        become(e, chain(a[0 .. n]));
+                        return;
+                    }
+                    goto default;
+                }
+
+                default:
+                    if (OTbinary(e.Eoper))
+                    {
+                        replace(e.E2, true);
+                        e = e.E1;
+                        valueUsed = true;
+                        continue;
+                    }
+                    if (OTunary(e.Eoper))
+                    {
+                        e = e.E1;
+                        valueUsed = true;
+                        continue;
+                    }
+                    return;
+            }
+        }
+    }
+
+    foreach (b; BlockRange(startblock))
+        if (b.Belem)
+            replace(b.Belem, blockValueUsed(b));
+}
