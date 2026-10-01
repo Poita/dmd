@@ -3723,8 +3723,34 @@ bool loopunroll(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
 }
     if (numblocks != 2)
     {
-        if (log) printf("\tnot 2 blocks, but %d\n", numblocks);
-        return false;
+        /* Blocks that follow each other in a straight line from the head to
+         * the tail run as one, so move their code into the head
+         */
+        int n = 1;
+        for (block* b = l.Lhead; b != l.Ltail; )
+        {
+            if (b.bc != BC.goto_ || b.Bsucc.length != 1 || b.Btry)
+            {
+                if (log) printf("\tnot 2 blocks, but %d\n", numblocks);
+                return false;
+            }
+            b = b.Bsucc[0];
+            if (!vec_testbit(b.Bdfoidx, l.Lloop) || (b != l.Ltail && b.Bpred.length != 1) || ++n > numblocks)
+            {
+                if (log) printf("\tnot 2 blocks, but %d\n", numblocks);
+                return false;
+            }
+        }
+        if (n != numblocks)
+        {
+            if (log) printf("\tnot a straight line of %d blocks\n", numblocks);
+            return false;
+        }
+        for (block* b = l.Lhead.Bsucc[0]; b != l.Ltail; b = b.Bsucc[0])
+        {
+            l.Lhead.Belem = el_combine(l.Lhead.Belem, b.Belem);
+            b.Belem = null;
+        }
     }
     assert(l.Lhead != l.Ltail);
 
@@ -3760,11 +3786,11 @@ bool loopunroll(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
     elem* e1 = etail.E1;
     elem* e2 = etail.E2;
 
+    // a signed v works the same, as its initial value is checked to be >= 0
     if (!tyintegral(e1.Ety) ||
-        tysize(e1.Ety) > targ_llong.sizeof ||
-        !(tyuns(e1.Ety) || tyuns(e2.Ety)))
+        tysize(e1.Ety) > targ_llong.sizeof)
     {
-        if (log) printf("\tnot (integral unsigned)\n");
+        if (log) printf("\tnot integral\n");
         return false;
     }
 
