@@ -244,8 +244,13 @@ void ecom(ref CGCS cgcs, ref elem* pe)
     const op = e.Eoper;
     switch (op)
     {
-        case OPconst:
         case OPrelconst:
+            // AArch64 calls a function by its address with BL, which needs no register
+            if (config.target_cpu == TARGET_AArch64 && tyfunc(e.Vsym.ty()))
+                return;
+            break;
+
+        case OPconst:
             break;
 
         case OPvar:

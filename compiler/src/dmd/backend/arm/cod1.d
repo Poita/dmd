@@ -2987,13 +2987,19 @@ private void funccall(ref CGstate cg, ref CodeBuilder cdb, elem* e, uint numpara
     CodeBuilder cdbe;
     cdbe.ctor();
 
-    if (e1.Eoper == OPvar)
+    /* A call through the address of a function, which a function in another
+     * object file is reached by, calls it directly as BL reaches any function
+     */
+    const bool viaAddress = e1.Eoper == OPind && !e1.Ecount && e1.E1.Eoper == OPrelconst && !e1.E1.Ecount &&
+        e1.E1.Voffset == 0 && tyfunc(e1.E1.Vsym.ty()) && tyfunc(tym1) &&
+        !(sytab[e1.E1.Vsym.Sclass] & SCSS) && !(e1.E1.Vsym.ty() & mTYthread);
+    if (e1.Eoper == OPvar || viaAddress)
     {   // Call function directly
 
         if (!tyfunc(tym1))
             printf("%s\n", tym_str(tym1));
         assert(tyfunc(tym1));
-        s = e1.Vsym;
+        s = viaAddress ? e1.E1.Vsym : e1.Vsym;
 
         // Function calls may throw Errors, unless marked that they don't
         if (s == funcsym_p || !s.Sfunc || !(s.Sfunc.Fflags & Fnothrow))
@@ -3045,6 +3051,8 @@ private void funccall(ref CGstate cg, ref CodeBuilder cdb, elem* e, uint numpara
             genmovreg(cdbe,INSTR.SP,r2,TYMAX);                 // MOV  SP,r2
 
             cdb.append(cdbe);
+            if (viaAddress)
+                freenode(e1.E1);
             freenode(e1);
 
             fixresult(cg,cdb,e,retregs,pretregs);
@@ -3136,6 +3144,8 @@ private void funccall(ref CGstate cg, ref CodeBuilder cdb, elem* e, uint numpara
         s = null;
     }
     cdb.append(cdbe);
+    if (viaAddress)
+        freenode(e1.E1);
     freenode(e1);
 
     /* See if we will need the frame pointer.

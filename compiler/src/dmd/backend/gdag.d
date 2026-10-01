@@ -258,7 +258,9 @@ private void aewalk(ref GlobalOptimizer go, ref elem* pn, vec_t ae)
     //printf("visiting  %d: (",n.Eexp); WReqn(pn); printf(")\n");
     //chkvecdim(go.exptop);
     const op = n.Eoper;
-    if (n.Eexp)                            // if an AE
+    // AArch64 calls a function by its address with BL, which needs no register
+    if (n.Eexp &&
+        !(op == OPrelconst && config.target_cpu == TARGET_AArch64 && tyfunc(n.Vsym.ty())))
     {   // Try to find an equivalent AE, and point to it instead
         assert(go.expnod[n.Eexp] == n);
         if (go.aetype == Aetype.cse)
