@@ -918,7 +918,10 @@ restart:
         }
         if (debugc) printf("...Loop %p done...\n",&l);
 
-        if (go.mfoptim & MFliv)
+        /* AArch64 addressing modes scale and add an index register, so
+         * eliminating induction variables does not pay for itself there
+         */
+        if (go.mfoptim & MFliv && config.target_cpu != TARGET_AArch64)
         {
             loopiv(go, bo, l);      /* induction variables          */
             if (addblk)             /* if we added a block          */
