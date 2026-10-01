@@ -156,6 +156,84 @@ void cdorth(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         }
     }
 
+    /* AND, ORR or EOR with a constant that is a bitmask immediate:
+     *  AND/ANDS/ORR/EOR Rd,Rn,#bitmask
+     */
+    if ((e.Eoper == OPand || e.Eoper == OPor || e.Eoper == OPxor) && e2.Eoper == OPconst &&
+        (tyintegral(ty) || typtr(ty)) && (sz == 4 || sz == 8) && _tysize[ty1] == sz &&
+        !isRegisterPair(true, ty, 0))
+    {
+        ulong c = el_tolong(e2);
+        if (sz == 4)
+        {
+            c &= 0xFFFF_FFFF;
+            c |= c << 32;               // the pattern repeats in 64 bits
+        }
+        uint N, immr, imms;
+        if (encodeNImmrImms(c, N, immr, imms) && (sz == 8 || N == 0))
+        {
+            const PSW = pretregs & mPSW;
+            const uint opc = e.Eoper == OPand ? (PSW ? 3 : 0) : e.Eoper == OPor ? 1 : 2;
+            regm_t retregs1 = cg.allregs;
+            codelem(cg, cdb, e1, retregs1, true);      // only read
+            const reg_t Rn = findreg(retregs1);
+            regm_t retregs = pretregs & cg.allregs;
+            if (retregs == 0)
+                retregs = cg.allregs;
+            const reg_t Rd = allocreg(cdb, retregs, ty);
+            cdb.gen1(INSTR.log_imm(sz == 8, opc, N, immr, imms, Rn, Rd));
+            freenode(e2);
+            // ANDS sets the flags, after ORR and EOR fixresult() tests the result
+            fixresult(cg,cdb,e,mask(Rd) | (opc == 3 ? mPSW : 0),pretregs);
+            return;
+        }
+    }
+
+    /* Multiply and add or subtract:
+     *  MADD Rd,Rn,Rm,Ra        Ra + Rn * Rm
+     *  MSUB Rd,Rn,Rm,Ra        Ra - Rn * Rm
+     */
+    if ((e.Eoper == OPadd || e.Eoper == OPmin) && !(pretregs & mPSW) &&
+        tyintegral(ty) && (sz == 4 || sz == 8) && !isRegisterPair(true, ty, 0))
+    {
+        static bool isMul(elem* x, uint sz)
+        {
+            return x.Eoper == OPmul && !x.Ecount && tyintegral(x.Ety) && _tysize[tybasic(x.Ety)] == sz &&
+                   _tysize[tybasic(x.E1.Ety)] == sz && _tysize[tybasic(x.E2.Ety)] == sz;
+        }
+        elem* ea = e1;          // the addend
+        elem* em = e2;          // the multiply
+        if (!isMul(em, sz) && e.Eoper == OPadd && isMul(e1, sz) && OTleaf(e2.Eoper) && !e2.Ecount &&
+            !(e2.Ety & mTYvolatile))
+        {
+            // the addend is a leaf, so evaluating it first changes nothing
+            ea = e2;
+            em = e1;
+        }
+        if (isMul(em, sz) && _tysize[tybasic(ea.Ety)] == sz && !tyfloating(ea.Ety))
+        {
+            const bool effects = el_sideeffect(em);
+            regm_t retregsa = cg.allregs;
+            codelem(cg, cdb, ea, retregsa, !effects);
+            regm_t retregsn = readOnlyRegs2(ea, em.E1, cg.allregs, retregsa);
+            scodelem(cg, cdb, em.E1, retregsn, retregsa, !el_sideeffect(em.E2));
+            regm_t retregsm = readOnlyRegs2(em.E1, em.E2, cg.allregs & ~retregsa, retregsn);
+            scodelem(cg, cdb, em.E2, retregsm, retregsa | retregsn, true);
+            regm_t retregs = pretregs & cg.allregs;
+            if (retregs == 0)
+                retregs = cg.allregs;
+            const reg_t Rd = allocreg(cdb, retregs, ty);
+            const reg_t Ra = findreg(retregsa);
+            const reg_t Rn = findreg(retregsn);
+            const reg_t Rm = findreg(retregsm);
+            cdb.gen1(e.Eoper == OPadd ? INSTR.madd(sz == 8, Rm, Ra, Rn, Rd)
+                                      : INSTR.msub(sz == 8, Rm, Ra, Rn, Rd));
+            freenode(em);
+            fixresult(cg,cdb,e,mask(Rd),pretregs);
+            return;
+        }
+    }
+
     /* Add or subtract an operand shifted left by up to 4, extending it first
      * if it is converted from 32 bits:
      *  ADD/SUB Rd,Rn,Rm{, extend} {#shift}
