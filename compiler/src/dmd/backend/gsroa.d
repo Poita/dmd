@@ -702,7 +702,7 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
                                           : tysize(e.Ety) == size;
     }
 
-    enum Form { none, copy, constant, load, store, pair, partial, result }
+    enum Form { none, copy, constant, load, store, pair, partial, result, storeVar }
 
     /* Whether x refers to symbol s */
     static bool refersTo(const(elem)* x, const(Symbol)* s)
@@ -773,6 +773,11 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
             return Form.result;
         if (whole2 && e1.Eoper == OPind && !e1.Ecount && !(e1.Ety & mTYvolatile) && !el_sideeffect(e1.E1))
             return Form.store;
+        // stored whole into a variable that is not split
+        if (whole2 && !inf1 && e1.Eoper == OPvar && !e1.Ecount && !(e1.Ety & mTYvolatile) && e1.Voffset >= 0 &&
+            (tybasic(e1.Ety) == TYstruct ? e1.ET && type_size(e1.ET) == inf2.n * inf2.esz
+                                         : tysize(e1.Ety) == inf2.n * inf2.esz))
+            return Form.storeVar;
         return Form.none;
     }
 
@@ -885,8 +890,12 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
                             case Form.store:    inf2.elems += inf2.n; gather(e.E1.E1, true); return;
                             case Form.pair:     inf1.elems += inf1.n; gather(e.E2.E1, true); gather(e.E2.E2, true); return;
                             case Form.result:   inf1.elems += inf1.n; gather(e.E2.E1, false); return;
+                            case Form.storeVar: inf2.elems += inf2.n; return;
                             case Form.none:     break;
                         }
+                        // a struct copy needs the address of a whole it copies
+                        if (e.Eoper == OPstreq && inf2 && inf2.isInt && isWhole(e.E2, *inf2))
+                            inf2.can = false;
                         if (inf1 && isWhole(e.E1, *inf1))
                         {
                             inf1.assigned = true;
@@ -1250,6 +1259,20 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
                                     a[k + 1] = el_bin(OPeq, elemTy(*inf1, k), elemVar(*inf1, k), t);
                                 }
                                 nchain = inf1.n + 1;
+                                break;
+                            }
+
+                            case Form.storeVar:
+                            {
+                                // (v.0 = e.0, v.1 = e.1, ...)
+                                foreach (k; 0 .. inf2.n)
+                                {
+                                    elem* t = el_var(e.E1.Vsym);
+                                    t.Ety = elemTy(*inf2, k);
+                                    t.Voffset = e.E1.Voffset + k * inf2.esz;
+                                    a[k] = el_bin(OPeq, elemTy(*inf2, k), t, elemVar(*inf2, k));
+                                }
+                                nchain = inf2.n;
                                 break;
                             }
 
