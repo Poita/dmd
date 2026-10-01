@@ -505,6 +505,12 @@ void floatOpAss(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
      *  *idxregs = retregs
      *  pretregs = retregs
      */
+    // a post increment or decrement whose result is not needed is an op=
+    OPER op = e.Eoper;
+    if (op == OPpostinc)
+        op = OPaddass;
+    else if (op == OPpostdec)
+        op = OPminass;
     elem* e1 = e.E1;
     tym_t ty1 = tybasic(e1.Ety);
     auto sz1 = _tysize[ty1];
@@ -518,7 +524,7 @@ void floatOpAss(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
     /* complex += real or imaginary: widen the right operand to a complex pair
      * with zero for the missing part
      */
-    if (isPair && (e.Eoper == OPaddass || e.Eoper == OPminass) && !tycomplex(e.E2.Ety))
+    if (isPair && (op == OPaddass || op == OPminass) && !tycomplex(e.E2.Ety))
     {
         Vconst zero;
         elem* ez = el_const(sz1 == 8 ? TYdouble : TYfloat, zero);
@@ -526,7 +532,7 @@ void floatOpAss(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
                                      : el_bin(OPpair, ty1, e.E2, ez);
     }
 
-    if (e.Eoper == OPnegass)
+    if (op == OPnegass)
     {
         bool regvar;
         getlvalue(cg,cdb,cs,e1,0);
@@ -617,7 +623,7 @@ void floatOpAss(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
     regm_t retregs2 = INSTR.FLOATREGS & ~pretregs;
     if (!retregs2)
         retregs2 = INSTR.FLOATREGS;
-    if (isPair && (e.Eoper == OPmulass || e.Eoper == OPdivass))
+    if (isPair && (op == OPmulass || op == OPdivass))
         retregs2 = mask(34)|mask(35);       // v2|v3
 
     codelem(cg,cdb,e2,retregs2,false); // eval right leaf
@@ -648,7 +654,7 @@ void floatOpAss(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         retregs = pretregs & INSTR.FLOATREGS & ~retregs2;
         if (!retregs)
             retregs = INSTR.FLOATREGS & ~retregs2;
-        if (isPair && (e.Eoper == OPmulass || e.Eoper == OPdivass))
+        if (isPair && (op == OPmulass || op == OPdivass))
             retregs = mask(32)|mask(33);            // v0|v1
         allocreg(cdb,retregs,ty1);
         reg = findreg(isPair ? retregs & INSTR.LSW : retregs);
@@ -666,7 +672,7 @@ void floatOpAss(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         const uint ftype = INSTR.szToFtype(sz1);
         uint clib;
         assert(sz1 != 2 && sz1 != 16);          // halffloat and float128
-        switch (e.Eoper)
+        switch (op)
         {
             // FADD/FSUB (extended register)
             // http://www.scs.stanford.edu/~zyedidia/arm64/encodingindex.html#floatdp2
@@ -688,7 +694,7 @@ void floatOpAss(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
                 loadFromEA(cs,reg,sz1,sz1);
                 cdb.gen(&cs);
                 Rd = reg, Rn = rreg, Rm = reg;                  // reg = rreg + reg
-                if (e.Eoper == OPaddass)
+                if (op == OPaddass)
                     cdb.gen1(INSTR.fadd_float(ftype,Rn,Rm,Rd));     // FADD Rd,Rn,Rm
                 else
                     cdb.gen1(INSTR.fsub_float(ftype,Rn,Rm,Rd));     // FSUB Rd,Rn,Rm
@@ -734,7 +740,7 @@ void floatOpAss(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
     else if (sz1 == 16)      // 128 bit float
     {
         CLIB_A clib;
-        switch (e.Eoper)
+        switch (op)
         {
             case OPaddass:      clib = CLIB_A.add; break;
             case OPminass:      clib = CLIB_A.min; break;
@@ -750,7 +756,7 @@ void floatOpAss(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
     {
         const reg_t Rd = reg, Rn = rreg, Rm = reg;
         uint ftype = INSTR.szToFtype(sz1);
-        switch (e.Eoper)
+        switch (op)
         {
             // FADD/FSUB (extended register)
             // http://www.scs.stanford.edu/~zyedidia/arm64/encodingindex.html#floatdp2
