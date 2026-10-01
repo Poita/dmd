@@ -203,11 +203,12 @@ void codgenx(ref CGstate cg, Symbol* sfunc)
                         // not e.g. the AArch64 hidden return pointer in x8,
                         // and not ones whose address is taken, as writes through it
                         // leave the register stale
-                        // and not an aggregate in floating point registers, whose
-                        // fields Spreg and Spreg2 do not describe
+                        // and not an aggregate or complex number in floating point
+                        // registers, whose parts Spreg and Spreg2 do not describe
                         if (!cg.AArch64 ||
                             s.Sflags & SFLdistinct &&
-                            !(tyaggregate(s.Stype.Tty) && s.Spregm() & INSTR.FLOATREGS))
+                            !((tyaggregate(s.Stype.Tty) || tycomplex(s.Stype.Tty)) &&
+                              s.Spregm() & INSTR.FLOATREGS))
                             cg.regcon.params |= s.Spregm() &
                                 (cg.AArch64 ? INSTR.ALLREGS | INSTR.FLOATREGS : ~cast(regm_t)0);
                         goto case SC.parameter;
