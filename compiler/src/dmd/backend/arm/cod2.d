@@ -72,6 +72,25 @@ regm_t idxregm(const ref code cs)
 }
 
 /*****************************
+ * Registers for the right operand `e2` of an operator that only reads its
+ * operands, after the left operand `e1` was evaluated into `retregs1`.
+ * A register variable stays in its own register, and `e2` that is the
+ * same common subexpression as `e1` shares its register.
+ */
+@trusted
+private regm_t readOnlyRegs2(elem* e1, elem* e2, regm_t posregs, regm_t retregs1)
+{
+    if (e2 == e1)
+        return retregs1;
+    regm_t retregs2 = posregs & ~retregs1;
+    if (e2.Eoper == OPvar && e2.Vsym.Sfl == FL.reg && e2.Voffset == 0 &&
+        tysize(e2.Ety) == tysize(e2.Vsym.Stype.Tty) && tysize(e2.Ety) <= REGSIZE &&
+        (e2.Vsym.Sregm & posregs) == e2.Vsym.Sregm)
+        retregs2 |= e2.Vsym.Sregm;
+    return retregs2;
+}
+
+/*****************************
  * Handle operators which are more or less orthogonal
  * OPadd, OPmin, OPand, OPor, OPxor
  */
@@ -123,7 +142,7 @@ void cdorth(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         if (c >= 0 && c < 0x1000)
         {
             regm_t retregs1 = cg.allregs;
-            codelem(cg, cdb, e1, retregs1, false);
+            codelem(cg, cdb, e1, retregs1, true);      // only read
             const reg_t Rn = findreg(retregs1);
             regm_t retregs = pretregs & cg.allregs;
             if (retregs == 0)
@@ -148,7 +167,8 @@ void cdorth(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
     codelem(cg, cdb, e1, retregs1, !widen1 && !el_sideeffect(e2));
     reg_t Rn = findreg(retregs1);
 
-    regm_t retregs2 = posregs & ~retregs1;
+    regm_t retregs2 = isRegisterPair(true, ty, 0) ? posregs & ~retregs1
+                                                  : readOnlyRegs2(e1, e2, posregs, retregs1);
     scodelem(cg, cdb, e2, retregs2, retregs1, true);
     reg_t Rm = findreg(retregs2);
 
@@ -502,7 +522,7 @@ void cdmul(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
 
     // the operands are only read, as the result goes to Rd, unless the right one changes the left
     codelem(cg, cdb, e1, retregs1, !el_sideeffect(e2));
-    regm_t retregs2 = cg.allregs & ~retregs1;
+    regm_t retregs2 = readOnlyRegs2(e1, e2, cg.allregs, retregs1);
     scodelem(cg, cdb, e2, retregs2, retregs1, true);
 
     regm_t retregs = pretregs & cg.allregs;
@@ -579,7 +599,7 @@ void cddiv(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
 
     // the operands are only read, as the results go to other registers, unless the right one changes the left
     codelem(cg, cdb, e1, retregs1, !el_sideeffect(e2));
-    regm_t retregs2 = cg.allregs & ~retregs1;
+    regm_t retregs2 = readOnlyRegs2(e1, e2, cg.allregs, retregs1);
     scodelem(cg, cdb, e2, retregs2, retregs1, true);
 
     regm_t retregs = pretregs & cg.allregs;
@@ -1341,7 +1361,7 @@ void cdshift(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
 
     regm_t retregs1 = posregs;
     codelem(cg, cdb, e1, retregs1, !el_sideeffect(e2)); // only read, unless e2 changes it
-    regm_t retregs2 = cg.allregs & ~retregs1;
+    regm_t retregs2 = readOnlyRegs2(e1, e2, cg.allregs, retregs1);
     scodelem(cg, cdb, e2, retregs2, retregs1, true);
 
     regm_t retregs = pretregs & cg.allregs;

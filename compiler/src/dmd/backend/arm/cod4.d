@@ -1718,7 +1718,7 @@ void cdcnvt(ref CGstate cg, ref CodeBuilder cdb,elem* e, ref regm_t pretregs)
                 ftype = 0;
             }
             regm_t retregs1 = INSTR.FLOATREGS;
-            codelem(cg,cdb,src,retregs1,false);
+            codelem(cg,cdb,src,retregs1,true);         // only read
             if (src !is e.E1)
                 freenode(e.E1);
             const reg_t V1 = findreg(retregs1);         // source floating point register
@@ -1767,7 +1767,8 @@ void cdcnvt(ref CGstate cg, ref CodeBuilder cdb,elem* e, ref regm_t pretregs)
         case OPu32_d:    // ucvtf d31,w0
         case OPu64_d:    // ucvtf d31,x0
             regm_t retregs1 = INSTR.ALLREGS;
-            codelem(cg,cdb,e.E1,retregs1,false);
+            // only read, except that a 16 bit source is extended in place
+            codelem(cg,cdb,e.E1,retregs1,e.Eoper != OPs16_d && e.Eoper != OPu16_d);
             reg_t Rn = findreg(retregs1);               // source integer register
 
             regm_t retregs = INSTR.FLOATREGS;
@@ -1816,7 +1817,7 @@ void cdcnvt(ref CGstate cg, ref CodeBuilder cdb,elem* e, ref regm_t pretregs)
                  */
                 elem* e1 = e.E1;
                 regm_t retregsi = INSTR.ALLREGS;
-                codelem(cg,cdb,e1.E1,retregsi,false);
+                codelem(cg,cdb,e1.E1,retregsi,true);   // only read
                 const reg_t Rn = findreg(retregsi);
                 freenode(e1);
                 regm_t retregs = pretregs & INSTR.FLOATREGS;
@@ -1831,7 +1832,8 @@ void cdcnvt(ref CGstate cg, ref CodeBuilder cdb,elem* e, ref regm_t pretregs)
                 break;
             }
             regm_t retregs1 = INSTR.FLOATREGS;
-            codelem(cg,cdb,e.E1,retregs1,false);
+            // only read, but the parts of a complex source could overlap the result's
+            codelem(cg,cdb,e.E1,retregs1,!tycomplex(e.E1.Ety));
             const reg_t V1 = findreg(retregs1);         // source floating point register
 
             regm_t retregs = pretregs & INSTR.FLOATREGS;
