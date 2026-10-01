@@ -43,6 +43,16 @@ long pairs(long x)
     return p.a + p.b + q.a + q.b;
 }
 
+// the new value is computed from the old, so it is assigned all at once
+size_t selfAssign()
+{
+    int[6] a;
+    int[] b;
+    b = a;
+    b = (b.ptr + b.length - 5)[0 .. b.ptr + b.length - 1 - a.ptr];
+    return (b.ptr - a.ptr) * 10 + b.length;
+}
+
 int delegates(int k)
 {
     int base = k;
@@ -62,5 +72,6 @@ int main()
     // p = (5, 6) -> b = 12; q = (15, 6)
     assert(pairs(5) == 5 + 12 + 15 + 6);
     assert(delegates(3) == 8 + 4);
+    assert(selfAssign() == 15);
     return 0;
 }

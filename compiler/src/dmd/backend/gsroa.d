@@ -700,6 +700,26 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
 
     enum Form { none, copy, constant, load, store, pair }
 
+    /* Whether x refers to symbol s */
+    static bool refersTo(const(elem)* x, const(Symbol)* s)
+    {
+        while (1)
+        {
+            if (x.Eoper == OPvar || x.Eoper == OPrelconst)
+                return x.Vsym is s;
+            if (OTbinary(x.Eoper))
+            {
+                if (refersTo(x.E2, s))
+                    return true;
+                x = x.E1;
+            }
+            else if (OTunary(x.Eoper))
+                x = x.E1;
+            else
+                return false;
+        }
+    }
+
     /* How an assignment e of a whole, whose value is not used, splits into
      * element assignments, given the Info of e.E1 and e.E2 if they are vars
      */
@@ -712,6 +732,11 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
         if (whole1 && whole2)
             return e1.Vsym !is e2.Vsym && inf1.n == inf2.n && inf1.esz == inf2.esz && inf1.isInt == inf2.isInt
                 ? Form.copy : Form.none;
+        /* The elements are assigned one at a time, so a value computed from
+         * the variable itself has to go through memory
+         */
+        if (whole1 && refersTo(e2, e1.Vsym))
+            return Form.none;
         if (whole1 && e2.Eoper == OPpair && !e2.Ecount && inf1.n == 2 &&
             tysize(e2.E1.Ety) == inf1.esz && tysize(e2.E2.Ety) == inf1.esz &&
             (tyfloating(e2.E1.Ety) != 0) == !inf1.isInt && (tyfloating(e2.E2.Ety) != 0) == !inf1.isInt)
