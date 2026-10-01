@@ -519,6 +519,7 @@ void flowcp(ref GlobalOptimizer go, ref BlockOpt bo)
 {
     go.flowxx = CP;
     flowaecp(go, bo);
+    copyBlocks.valid = false;
 }
 
 /*****************************************
@@ -668,6 +669,103 @@ bool copiesOf(const Symbol* s, out const(uint)[] list)
     return true;
 }
 
+/* Where the elems that can make a copy available or not are, for flowcpBit()
+ */
+private struct CopyBlocks
+{
+    bool valid;                 // built for the current flowcp()
+
+    /* For each globsym[] index i, defList[defStart[i] .. defStart[i + 1]] are the
+     * bo.dfo[] indices of the blocks with an unambiguous definition of globsym[i]
+     */
+    Barray!uint defStart;
+    Barray!uint defList;
+
+    Barray!bool ambig;          // for each block, whether it has an ambiguous definition
+    Barray!bool asmish;         // for each block, whether it has an OPasm or OPddtor
+    Barray!uint copyBlock;      // for each go.expnod[] index, the block of the copy
+}
+
+private __gshared CopyBlocks copyBlocks;
+
+@trusted
+private void buildCopyBlocks(ref GlobalOptimizer go, ref BlockOpt bo)
+{
+    alias cb = copyBlocks;
+    const nblocks = bo.dfo.length;
+    const nsyms = globsym.length;
+    cb.ambig.setLength(nblocks);
+    cb.ambig[][] = false;
+    cb.asmish.setLength(nblocks);
+    cb.asmish[][] = false;
+    cb.copyBlock.setLength(go.exptop);
+    cb.copyBlock[][] = uint.max;
+
+    Barray!ulong pairs;         // symbol index in the high half, block index in the low half
+    void walk(elem* n, uint bi)
+    {
+        while (1)
+        {
+            const op = n.Eoper;
+            if (op == OPasm || op == OPddtor)
+                cb.asmish[bi] = true;
+            if (OTdef(op))
+            {
+                if (!Eunambig(n))
+                    cb.ambig[bi] = true;
+                else
+                {
+                    const si = localIndex(n.E1.Vsym);
+                    if (si != size_t.max)
+                        pairs.push((cast(ulong)si << 32) | bi);
+                }
+            }
+            if ((op == OPeq || op == OPstreq) && n.Eexp)
+                cb.copyBlock[n.Eexp] = bi;
+            if (OTbinary(op))
+            {
+                walk(n.E2, bi);
+                n = n.E1;
+            }
+            else if (OTunary(op))
+                n = n.E1;
+            else
+                break;
+        }
+    }
+    foreach (i, b; bo.dfo[])
+    {
+        if (b.Belem)
+            walk(b.Belem, cast(uint)i);
+    }
+
+    cb.defStart.setLength(nsyms + 1);
+    cb.defStart[][] = 0;
+    foreach (pr; pairs[])
+        ++cb.defStart[cast(size_t)(pr >> 32) + 1];
+    foreach (k; 0 .. nsyms)
+        cb.defStart[k + 1] += cb.defStart[k];
+    cb.defList.setLength(pairs.length);
+    foreach (pr; pairs[])
+        cb.defList[cb.defStart[cast(size_t)(pr >> 32)]++] = cast(uint)pr;
+    foreach_reverse (k; 0 .. nsyms)
+        cb.defStart[k + 1] = cb.defStart[k];
+    cb.defStart[0] = 0;
+    pairs.dtor();
+    cb.valid = true;
+}
+
+/***************************************
+ * Returns: the bo.dfo[] index of the block with copy go.expnod[j], valid after flowcp()
+ */
+@trusted
+uint copyBlockOf(ref GlobalOptimizer go, ref BlockOpt bo, uint j)
+{
+    if (!copyBlocks.valid)
+        buildCopyBlocks(go, bo);
+    return copyBlocks.copyBlock[j];
+}
+
 /***************************************
  * Recompute after flowcp() whether copy go.expnod[j] reaches the start of each
  * block, as flowcp() would compute it for the current elem trees. The data flow
@@ -806,9 +904,41 @@ void flowcpBit(ref GlobalOptimizer go, ref BlockOpt bo, uint j, vec_t[] ins)
     bool* bout = bin + nblocks;
     bool* bout2 = bout + nblocks;
 
+    /* Only the blocks with a definition of an operand of copy j, an ambiguous
+     * definition killing it, an OPasm or OPddtor, or copy j itself can have a
+     * GEN or KILL of it
+     */
+    if (!copyBlocks.valid)
+        buildCopyBlocks(go, bo);
+    alias cb = copyBlocks;
+    bool* walkBlock = cast(bool*)calloc(nblocks, 1);
+    if (!walkBlock)
+        err_nomem();
+    scope (exit) free(walkBlock);
+    bool all;
+    const(Symbol)*[2] operands = [s1, s2];
+    foreach (sym; operands)
+    {
+        const si = localIndex(sym);
+        if (si == size_t.max)
+            all = true;
+        else
+            foreach (bi; cb.defList[cb.defStart[si] .. cb.defStart[si + 1]])
+                walkBlock[bi] = true;
+    }
+    foreach (i; 0 .. nblocks)
+    {
+        if (all || cb.asmish[i] || (defkilled && cb.ambig[i]))
+            walkBlock[i] = true;
+    }
+    if (cb.copyBlock[j] != uint.max)
+        walkBlock[cb.copyBlock[j]] = true;
+
     foreach (i, b; bo.dfo[])
     {
         assert(b.Bdfoidx == i);
+        if (!walkBlock[i] && b.bc != BC.asm_)
+            continue;           // GEN and KILL are 0
         bool g, k;
         switch (b.bc)
         {

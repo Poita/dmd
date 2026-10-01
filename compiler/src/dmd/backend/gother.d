@@ -29,7 +29,7 @@ import dmd.backend.dout : out_regcand;
 import dmd.backend.evalu8 : iftrue;
 import dmd.backend.gloop : dom;
 import dmd.backend.go;
-import dmd.backend.gflow : copiesOf, flowcpBit;
+import dmd.backend.gflow : copiesOf, copyBlockOf, flowcpBit;
 import dmd.backend.el;
 import dmd.backend.symbol;
 import dmd.backend.ty;
@@ -1272,6 +1272,12 @@ private struct CopyProp
 {
     Barray!vec_t ins;           // for each block in bo.dfo[], the copies reaching its start
 
+    /* For each block in bo.dfo[], whether walking it again could change it: it has
+     * not been walked through since a change to the copies reaching it, or the last
+     * walk through it changed it
+     */
+    Barray!bool dirty;
+
     /* The copies whose rvalue a walk changed to symbol globsym[i], as lists through
      * extraNext[] starting at extraHead[i], which copiesOf() does not know about
      */
@@ -1341,6 +1347,8 @@ private bool copyPropFlow(ref GlobalOptimizer go, ref BlockOpt bo)
         return false;
     foreach (b; bo.dfo[])
         cs.ins.push(vec_clone(b.Bin));
+    cs.dirty.setLength(bo.dfo.length);
+    cs.dirty[][] = true;
     return true;
 }
 
@@ -1351,6 +1359,16 @@ private void copyPropUpdate(ref GlobalOptimizer go, ref BlockOpt bo, uint j)
 {
     alias cs = cpState;
     elem* c = go.expnod[j];
+
+    /* The walks change only where copy j can be available, and at the copy
+     */
+    cs.dirty[copyBlockOf(go, bo, j)] = true;
+    foreach (i, v; cs.ins[])
+    {
+        if (vec_testbit(j, v))
+            cs.dirty[i] = true;
+    }
+
     if (!isCopy(c))
     {
         // flowcp() would no longer see it as a copy, so it never becomes available
@@ -1373,6 +1391,11 @@ private void copyPropUpdate(ref GlobalOptimizer go, ref BlockOpt bo, uint j)
             cs.extraHead[si] = cast(uint)(cs.extraCopy.length - 1);
         }
         flowcpBit(go, bo, j, cs.ins[]);
+        foreach (i, v; cs.ins[])
+        {
+            if (vec_testbit(j, v))
+                cs.dirty[i] = true;
+        }
     }
 
     if (checkCopyProp())
@@ -1434,9 +1457,10 @@ public void copyprop(ref GlobalOptimizer go, ref BlockOpt bo)
         uint recalc;
         foreach (i, b; bo.dfo[])    // for each block
         {
-            if (b.Belem)
+            if (b.Belem && cs.dirty[i])
             {
                 vec_copy(b.Bin, cs.ins[i]);
+                const changesBefore = go.changes;
                 recalc = copyPropWalk(go, b.Belem, b.Bin, go.changes);
                 /* b.Bin and b.Bout need not be equal here, as in:
                  *      a=b; d=a; a=b;
@@ -1447,6 +1471,7 @@ public void copyprop(ref GlobalOptimizer go, ref BlockOpt bo)
                  */
                 if (recalc)
                     break;
+                cs.dirty[i] = go.changes != changesBefore;
             }
         }
         if (!recalc)
