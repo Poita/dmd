@@ -2510,6 +2510,14 @@ void cdrelconst(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         return;
 
     assert(e);
+    /* A register variable has no address, so it has to be in memory when
+     * its address is taken
+     */
+    if (e.Eoper == OPvar && e.Vsym.Sfl == FL.reg)
+    {
+        import dmd.backend.x86.cgreg : cgreg_unregister;
+        cgreg_unregister(cg, e.Vsym.Sregm);
+    }
     tym_t tym = tybasic(e.Ety);
     switch (tym)
     {
