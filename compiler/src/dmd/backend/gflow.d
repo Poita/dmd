@@ -650,6 +650,261 @@ private void flowaecp(ref GlobalOptimizer go, ref BlockOpt bo)
     vec_free(tmp);
 }
 
+/***************************************
+ * Find the copies with `s` as an operand, valid after flowcp().
+ * Params:
+ *      s = symbol
+ *      list = set to the go.expnod[] indices of the copies, in increasing order
+ * Returns:
+ *      false if `s` is not in globsym[], so the copies are not indexed
+ */
+@trusted
+bool copiesOf(const Symbol* s, out const(uint)[] list)
+{
+    const si = localIndex(s);
+    if (si == size_t.max)
+        return false;
+    list = killIndex.symList[killIndex.symStart[si] .. killIndex.symStart[si + 1]];
+    return true;
+}
+
+/***************************************
+ * Recompute after flowcp() whether copy go.expnod[j] reaches the start of each
+ * block, as flowcp() would compute it for the current elem trees. The data flow
+ * of each copy is independent of the others, so this is the same as rerunning
+ * flowcp() when only copy j has changed.
+ * Params:
+ *      go = global optimizer state, with go.defkill updated for copy j
+ *      bo = blocks, in bo.dfo[] order
+ *      j = go.expnod[] index of the copy
+ *      ins = for each block in bo.dfo[], the copies reaching its start; bit j is updated
+ */
+@trusted
+void flowcpBit(ref GlobalOptimizer go, ref BlockOpt bo, uint j, vec_t[] ins)
+{
+    const elem* c = go.expnod[j];
+    const Symbol* s1 = c.E1.Vsym;
+    const Symbol* s2 = c.E2.Vsym;
+    const bool defkilled = vec_testbit(j, go.defkill) != 0;
+
+    /* GEN and KILL of copy j for elem n, following accumaecpx()
+     */
+    void accum(elem* n, ref bool gen, ref bool kill)
+    {
+        elem* t;
+        const op = n.Eoper;
+        switch (op)
+        {
+            case OPvar:
+            case OPconst:
+            case OPrelconst:
+                return;
+
+            case OPcolon:
+            case OPcolon2:
+            {
+                bool gl, kl, gr, kr;
+                accum(n.E1, gl, kl);
+                accum(n.E2, gr, kr);
+                kill |= kl | kr;
+                gen = ((gen && !kl) || gl) && ((gen && !kr) || gr);
+                break;
+            }
+
+            case OPandand:
+            case OPoror:
+            {
+                accum(n.E1, gen, kill);
+                bool gr, kr;
+                accum(n.E2, gr, kr);
+                if (el_returns(n.E2))
+                {
+                    kill |= kr;
+                    gen = gen && ((gen && !kr) || gr);
+                }
+                break;
+            }
+
+            case OPddtor:
+            case OPasm:
+                kill = true;
+                gen = false;
+                return;
+
+            case OPeq:
+            case OPstreq:
+                accum(n.E2, gen, kill);
+                goto case OPnegass;
+
+            case OPnegass:
+                accum(n.E1, gen, kill);
+                t = n.E1;
+                break;
+
+            case OPvp_fp:
+            case OPcvp_fp:
+                break;
+
+            case OPprefetch:
+                accum(n.E1, gen, kill);
+                break;
+
+            default:
+                if (OTunary(op))
+                    accum(n.E1, gen, kill);
+                else if (OTbinary(op))
+                {
+                    if (OTrtol(op) && ERTOL(n))
+                    {
+                        accum(n.E2, gen, kill);
+                        accum(n.E1, gen, kill);
+                    }
+                    else
+                    {
+                        accum(n.E1, gen, kill);
+                        accum(n.E2, gen, kill);
+                    }
+                    if (OTassign(op))
+                        t = n.E1;
+                }
+                break;
+        }
+
+        if (!OTdef(op))
+            return;
+        if (!Eunambig(n))
+        {
+            if (defkilled)
+            {
+                kill = true;
+                gen = false;
+            }
+        }
+        else if (t.Vsym == s1 || t.Vsym == s2)
+        {
+            kill = true;
+            gen = false;
+        }
+        if (n.Eexp == j)
+        {
+            gen = true;
+            kill = false;
+        }
+    }
+
+    /* GEN and KILL of each block, the second ones for the false branch of a BC.iftrue
+     */
+    const nblocks = bo.dfo.length;
+    auto gen = cast(bool*)calloc(nblocks, 8);
+    if (!gen)
+        err_nomem();
+    scope (exit) free(gen);
+    bool* kill = gen + nblocks;
+    bool* gen2 = kill + nblocks;
+    bool* kill2 = gen2 + nblocks;
+    bool* bin = kill2 + nblocks;
+    bool* bout = bin + nblocks;
+    bool* bout2 = bout + nblocks;
+
+    foreach (i, b; bo.dfo[])
+    {
+        assert(b.Bdfoidx == i);
+        bool g, k;
+        switch (b.bc)
+        {
+            case BC.iftrue:
+            {
+                elem* e;
+                for (e = b.Belem; e.Eoper == OPcomma; e = e.E2)
+                    accum(e.E1, g, k);
+                if (e.Eoper == OPandand || e.Eoper == OPoror)
+                {
+                    accum(e.E1, g, k);
+                    bool gr, kr;
+                    accum(e.E2, gr, kr);
+
+                    // the same combination as aecpgenkill()
+                    const k1 = k || kr;
+                    const g1 = g && ((g && !kr) || gr);
+                    const k2 = (k && !gr) || kr;
+                    const g2 = (g && !kr) || gr;
+                    if (e.Eoper == OPandand)
+                    {
+                        gen[i] = g2; kill[i] = k2;
+                        gen2[i] = g1; kill2[i] = k1;
+                    }
+                    else
+                    {
+                        gen[i] = g1; kill[i] = k1;
+                        gen2[i] = g2; kill2[i] = k2;
+                    }
+                }
+                else
+                {
+                    accum(e, g, k);
+                    gen[i] = gen2[i] = g;
+                    kill[i] = kill2[i] = k;
+                }
+                break;
+            }
+
+            case BC.asm_:
+                kill[i] = true;
+                break;
+
+            default:
+                if (b.Belem)
+                    accum(b.Belem, g, k);
+                gen[i] = g;
+                kill[i] = k;
+                break;
+        }
+    }
+
+    // The same iteration as flowaecp()
+    bout[0] = gen[0];
+    bout2[0] = gen2[0];
+    foreach (i; 1 .. nblocks)
+    {
+        bin[i] = true;
+        bout[i] = !kill[i] || gen[i];
+        bout2[i] = !kill2[i] || gen2[i];
+    }
+    bool anychng;
+    do
+    {
+        anychng = false;
+        foreach (i, b; bo.dfo[1 .. $])
+        {
+            ++i;
+            bool v = true;
+            foreach (bp; b.Bpred[])
+            {
+                const p = bp.Bdfoidx;
+                assert(p < nblocks && bo.dfo[p] is bp);
+                v &= (bp.bc == BC.iftrue && bp.Bsucc[0] != b) ? bout2[p] : bout[p];
+            }
+            if (b.bc == BC.jcatch)
+                v = false;
+            bin[i] = v;
+            const o = (v && !kill[i]) || gen[i];
+            const o2 = (v && !kill2[i]) || gen2[i];
+            if (o != bout[i] || (b.bc == BC.iftrue && o2 != bout2[i]))
+                anychng = true;
+            bout[i] = o;
+            bout2[i] = o2;
+        }
+    } while (anychng);
+
+    foreach (i; 0 .. nblocks)
+    {
+        if (bin[i])
+            vec_setbit(j, ins[i]);
+        else
+            vec_clearbit(j, ins[i]);
+    }
+}
+
 
 /***********************************
  * Compute Bgen and Bkill for AEs, CPs, and VBEs.

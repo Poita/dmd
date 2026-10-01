@@ -29,6 +29,7 @@ import dmd.backend.dout : out_regcand;
 import dmd.backend.evalu8 : iftrue;
 import dmd.backend.gloop : dom;
 import dmd.backend.go;
+import dmd.backend.gflow : copiesOf, flowcpBit;
 import dmd.backend.el;
 import dmd.backend.symbol;
 import dmd.backend.ty;
@@ -1265,6 +1266,159 @@ private int loopcheck(block* start,block* inc,block* rel)
  */
 
 
+/* State of copyprop() between walks of the blocks
+ */
+private struct CopyProp
+{
+    Barray!vec_t ins;           // for each block in bo.dfo[], the copies reaching its start
+
+    /* The copies whose rvalue a walk changed to symbol globsym[i], as lists through
+     * extraNext[] starting at extraHead[i], which copiesOf() does not know about
+     */
+    Barray!uint extraHead;
+    Barray!uint extraNext;
+    Barray!uint extraCopy;
+
+    /* Whether a walk turned an assignment of one variable to another into a copy,
+     * which only rerunning flowcp() adds to go.expnod[]
+     */
+    bool newCopy;
+}
+
+private __gshared CopyProp cpState;
+
+private enum uint noCopy = uint.max;
+
+/* Whether to check the incremental copy propagation data flow against flowcp(),
+ * set by the environment variable DMD_CHECK_CP_INCR
+ */
+private __gshared int checkCopyPropState = -1;
+
+@trusted
+private bool checkCopyProp()
+{
+    if (checkCopyPropState < 0)
+        checkCopyPropState = getenv("DMD_CHECK_CP_INCR") !is null;
+    return checkCopyPropState != 0;
+}
+
+/* Whether assignment n is one that flowcp() treats as a copy
+ */
+@trusted
+private bool isCopy(const elem* n)
+{
+    if (n.Eoper != OPeq && n.Eoper != OPstreq)
+        return false;
+    const e1 = n.E1;
+    const e2 = n.E2;
+    return e1.Eoper == OPvar &&
+           e2.Eoper == OPvar &&
+           !((e1.Ety | e2.Ety) & (mTYvolatile | mTYshared)) &&
+           (!config.fpxmmregs ||
+            (!tyfloating(e1.Vsym.Stype.Tty) == !tyfloating(e2.Vsym.Stype.Tty))) &&
+           e1.Vsym != e2.Vsym;
+}
+
+/* Compute the copies reaching each block with flowcp() and start the walks over
+ * Returns:
+ *      false if there are no copies
+ */
+@trusted
+private bool copyPropFlow(ref GlobalOptimizer go, ref BlockOpt bo)
+{
+    alias cs = cpState;
+    flowcp(go, bo);           /* compute available copy statements    */
+    assert(go.exptop == go.expnod.length);
+    foreach (v; cs.ins[])
+        vec_free(v);
+    cs.ins.setLength(0);
+    cs.extraHead.setLength(globsym.length);
+    cs.extraHead[][] = noCopy;
+    cs.extraNext.setLength(0);
+    cs.extraCopy.setLength(0);
+    cs.newCopy = false;
+    if (go.exptop <= 1)
+        return false;
+    foreach (b; bo.dfo[])
+        cs.ins.push(vec_clone(b.Bin));
+    return true;
+}
+
+/* Update the data flow after a walk changed the rvalue of copy go.expnod[j]
+ */
+@trusted
+private void copyPropUpdate(ref GlobalOptimizer go, ref BlockOpt bo, uint j)
+{
+    alias cs = cpState;
+    elem* c = go.expnod[j];
+    if (!isCopy(c))
+    {
+        // flowcp() would no longer see it as a copy, so it never becomes available
+        c.Eexp = 0;
+        foreach (v; cs.ins[])
+            vec_clearbit(j, v);
+    }
+    else
+    {
+        Symbol* s2 = c.E2.Vsym;
+        if (Symbol_isAffected(*c.E1.Vsym) || Symbol_isAffected(*s2))
+            vec_setbit(j, go.defkill);
+        else
+            vec_clearbit(j, go.defkill);
+        const si = s2.Ssymnum;
+        if (si < globsym.length && globsym[si] is s2)
+        {
+            cs.extraNext.push(cs.extraHead[si]);
+            cs.extraCopy.push(j);
+            cs.extraHead[si] = cast(uint)(cs.extraCopy.length - 1);
+        }
+        flowcpBit(go, bo, j, cs.ins[]);
+    }
+
+    if (checkCopyProp())
+    {
+        /* Rerun flowcp(), which renumbers the copies, and compare the copies
+         * reaching each block by their elems
+         */
+        Barray!(elem*) before;
+        foreach (e; go.expnod[])
+            before.push(e);
+        Barray!vec_t ins;
+        foreach (v; cs.ins[])
+            ins.push(vec_clone(v));
+        if (!copyPropFlow(go, bo))
+        {
+            foreach (v; ins[])
+                if (!vec_disjoint(v, v))
+                    goto Lmismatch;
+        }
+        else
+        {
+            foreach (i, v; ins[])
+            {
+                foreach (k, e; before[])
+                {
+                    if (!k)
+                        continue;
+                    const was = vec_testbit(k, v) != 0;
+                    const now = e.Eexp && go.expnod[e.Eexp] is e && vec_testbit(e.Eexp, cs.ins[i]);
+                    if (was != now)
+                        goto Lmismatch;
+                }
+            }
+        }
+        foreach (v; ins[])
+            vec_free(v);
+        ins.dtor();
+        before.dtor();
+        return;
+
+    Lmismatch:
+        fprintf(stderr, "copy propagation data flow mismatch in %s\n", funcsym_p ? funcsym_p.Sident.ptr : "?".ptr);
+        abort();
+    }
+}
+
 @trusted
 public void copyprop(ref GlobalOptimizer go, ref BlockOpt bo)
 {
@@ -1272,57 +1426,46 @@ public void copyprop(ref GlobalOptimizer go, ref BlockOpt bo)
     if (debugc) printf("copyprop()\n");
     assert(bo.dfo);
 
-Louter:
+    alias cs = cpState;
+    if (!copyPropFlow(go, bo))
+        return;             // none available
     while (1)
     {
-        flowcp(go, bo);           /* compute available copy statements    */
-        assert(go.exptop == go.expnod.length);
-        if (go.exptop <= 1)
-            return;             // none available
-        static if (0)
-        {
-            foreach (i; 1 .. go.exptop)
-            {
-                printf("go.expnod[%d] = (",i);
-                WReqn(go.expnod[i]);
-                printf(");\n");
-            }
-        }
+        uint recalc;
         foreach (i, b; bo.dfo[])    // for each block
         {
             if (b.Belem)
             {
-                bool recalc;
-                static if (0)
-                {
-                    printf("B%d, elem (",i);
-                    WReqn(b.Belem); printf(")\nBin  ");
-                    vec_println(b.Bin);
-                    recalc = copyPropWalk(b.Belem,b.Bin);
-                    printf("Bino ");
-                    vec_println(b.Bin);
-                    printf("Bout ");
-                    vec_println(b.Bout);
-                }
-                else
-                {
-                    recalc = copyPropWalk(go, b.Belem, b.Bin, go.changes);
-                }
-                /*assert(vec_equal(b.Bin,b.Bout));              */
-                /* The previous assert() is correct except      */
-                /* for the following case:                      */
-                /*      a=b; d=a; a=b;                          */
-                /* The vectors don't match because the          */
-                /* equations changed to:                        */
-                /*      a=b; d=b; a=b;                          */
-                /* and the d=b copy elem now reaches the end    */
-                /* of the block (the d=a elem didn't).          */
+                vec_copy(b.Bin, cs.ins[i]);
+                recalc = copyPropWalk(go, b.Belem, b.Bin, go.changes);
+                /* b.Bin and b.Bout need not be equal here, as in:
+                 *      a=b; d=a; a=b;
+                 * The equations changed to:
+                 *      a=b; d=b; a=b;
+                 * and the d=b copy elem now reaches the end
+                 * of the block (the d=a elem didn't).
+                 */
                 if (recalc)
-                    continue Louter;
+                    break;
             }
         }
-        return;
+        if (!recalc)
+            break;
+        if (cs.newCopy)
+        {
+            if (!copyPropFlow(go, bo))
+                break;
+        }
+        else
+        {
+            copyPropUpdate(go, bo, recalc);
+            if (!cs.ins.length)
+                break;      // checking reran flowcp(), which found no copies
+        }
     }
+    foreach (v; cs.ins[])
+        vec_free(v);
+    cs.ins.setLength(0);
 }
 
 /*****************************
@@ -1332,14 +1475,45 @@ Louter:
  *      n = tree to walk & do copy propagation in
  *      IN = vector of live copy expressions, updated as progress is made
  * Returns:
- *      true if need to recalculate data flow equations and try again
+ *      the go.expnod[] index of a copy whose rvalue was changed, after which the
+ *      data flow equations need to be recalculated and the walk tried again;
+ *      0 if none
  */
 
 @trusted
-private bool copyPropWalk(ref GlobalOptimizer go, elem* n, vec_t IN, ref uint changes)
+private uint copyPropWalk(ref GlobalOptimizer go, elem* n, vec_t IN, ref uint changes)
 {
-    bool recalc = false;
+    alias cs = cpState;
+    uint recalc = 0;
     int nocp = 0;
+    elem* rvalueOf = null;      // the copy whose rvalue is being walked
+
+    /* Clear in IN the copies that definition of s kills, those with s as an operand
+     */
+    void killCopies(Symbol* s, vec_t IN)
+    {
+        void kill(uint i)
+        {
+            if (vec_testbit(i, IN))
+            {
+                elem* c = go.expnod[i];
+                if (c.E1.Vsym == s || c.E2.Vsym == s)
+                    vec_clearbit(i, IN);
+            }
+        }
+
+        const(uint)[] list;
+        if (!copiesOf(s, list))
+        {
+            for (size_t i = 0; (i = vec_index(i, IN)) < go.exptop; ++i)
+                kill(cast(uint)i);
+            return;
+        }
+        foreach (i; list)
+            kill(i);
+        for (uint k = cs.extraHead[s.Ssymnum]; k != noCopy; k = cs.extraNext[k])
+            kill(cs.extraCopy[k]);
+    }
 
     void cpwalk(elem* n, vec_t IN)
     {
@@ -1391,7 +1565,17 @@ private bool copyPropWalk(ref GlobalOptimizer go, elem* n, vec_t IN, ref uint ch
         }
         else if (OTassign(op))
         {
-            cpwalk(n.E2,IN);
+            if (n.E2.Eoper == OPvar && (op == OPeq || op == OPstreq) && n.E1.Eoper == OPvar)
+            {
+                Symbol* before = n.E2.Vsym;
+                rvalueOf = n;
+                cpwalk(n.E2,IN);
+                rvalueOf = null;
+                if (!n.Eexp && n.E2.Vsym != before && isCopy(n))
+                    cs.newCopy = true;
+            }
+            else
+                cpwalk(n.E2,IN);
             t = n.E1;
             if (t.Eoper == OPind)
                 cpwalk(t,IN);
@@ -1414,47 +1598,18 @@ private bool copyPropWalk(ref GlobalOptimizer go, elem* n, vec_t IN, ref uint ch
 
         if (OTdef(op))                  // if definition elem
         {
-            int ambig;              /* true if ambiguous def        */
-
-            ambig = !OTassign(op) || t.Eoper == OPind;
             assert(go.exptop == go.expnod.length);
-            for (size_t i = 0; (i = vec_index(i, IN)) < go.exptop; ++i) // for each active copy elem
+            if (op == OPasm)
+                vec_clear(IN);
+            else if (!OTassign(op) || t.Eoper == OPind)
             {
-                Symbol* v;
-
-                if (op == OPasm)
-                    goto clr;
-
-                /* If this elem could kill the lvalue or the rvalue, */
-                /*      Clear bit in IN.                        */
-                v = go.expnod[i].E1.Vsym;
-                if (ambig)
-                {
-                    if (Symbol_isAffected(*v))
-                        goto clr;
-                }
-                else
-                {
-                    if (v == t.Vsym)
-                        goto clr;
-                }
-
-                v = go.expnod[i].E2.Vsym;
-                if (ambig)
-                {
-                    if (Symbol_isAffected(*v))
-                        goto clr;
-                }
-                else
-                {
-                    if (v == t.Vsym)
-                        goto clr;
-                }
-                continue;
-
-            clr:                        /* this copy elem is not available */
-                vec_clearbit(i,IN);     /* so remove it from the vector */
-            } /* foreach */
+                /* An ambiguous definition kills the copies with an operand it could
+                 * change, which go.defkill holds
+                 */
+                vec_subass(IN, go.defkill);
+            }
+            else
+                killCopies(t.Vsym, IN);
 
             /* If this is a copy elem in go.expnod[]   */
             /*      Set bit in IN.                     */
@@ -1476,7 +1631,11 @@ private bool copyPropWalk(ref GlobalOptimizer go, elem* n, vec_t IN, ref uint ch
             elem* foundelem = null;
             Symbol* f;
             assert(go.exptop == go.expnod.length);
-            for (size_t i = 0; (i = vec_index(i, IN)) < go.exptop; ++i) // for all active copy elems
+
+            /* Note active copy go.expnod[i] if it copies to the part of v that n is.
+             * Returns: false if copies to it differ in where they copy from
+             */
+            bool consider(size_t i)
             {
                 elem* c = go.expnod[i];
                 assert(c);
@@ -1497,13 +1656,33 @@ private bool copyPropWalk(ref GlobalOptimizer go, elem* n, vec_t IN, ref uint ch
                     if (foundelem)
                     {
                         if (c.E2.Vsym != f)
-                            goto noprop;
+                            return false;
                     }
                     else
                     {
                         foundelem = c;
                         f = foundelem.E2.Vsym;
                     }
+                }
+                return true;
+            }
+
+            const(uint)[] list;
+            if (copiesOf(v, list))
+            {
+                // the copies to v are among those with v as an operand
+                foreach (i; list)
+                {
+                    if (vec_testbit(i, IN) && !consider(i))
+                        goto noprop;
+                }
+            }
+            else
+            {
+                for (size_t i = 0; (i = vec_index(i, IN)) < go.exptop; ++i) // for all active copy elems
+                {
+                    if (!consider(i))
+                        goto noprop;
                 }
             }
             if (foundelem)          /* if we can do the copy prop   */
@@ -1527,18 +1706,10 @@ private bool copyPropWalk(ref GlobalOptimizer go, elem* n, vec_t IN, ref uint ch
                  *  g = v   => g = f
                  *  f = x
                  *  d = g   => d = f !!error
-                 * Therefore, if n appears as an rvalue in go.expnod[], then recalc
+                 * Therefore, if n is the rvalue of a copy, then recalc
                  */
-                assert(go.exptop == go.expnod.length);
-                foreach (j; 1 .. go.exptop)
-                {
-                    //printf("go.expnod[%d]: ", j); elem_print(go.expnod[j]);
-                    if (go.expnod[j].E2 == n)
-                    {
-                        recalc = true;
-                        break;
-                    }
-                }
+                if (rvalueOf && rvalueOf.E2 is n && rvalueOf.Eexp)
+                    recalc = rvalueOf.Eexp;
 
                 ++changes;
             }
