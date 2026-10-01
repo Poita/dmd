@@ -103,6 +103,7 @@ struct Symbol
     FL Sfl;                     // flavor (FL.xxxx)
     SYMFLGS Sflags;             // flag bits (SFLxxxx)
 
+    bool SpregLost;             // fastpar, not a register variable: accessed in memory rather than its register
     vec_t       Srange;         // live range, if any
     vec_t       Slvreg;         // when symbol is in register
     targ_size_t Ssize;          // tyfunc: size of function

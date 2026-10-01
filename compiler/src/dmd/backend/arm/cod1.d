@@ -1261,6 +1261,8 @@ void getlvalue(ref CGstate cg,ref CodeBuilder cdb,ref code pcs,elem* e,regm_t ke
                     else
                         cg.regcon.params &= ~pregm;
                 }
+                // read from or written to memory, as its register no longer holds it
+                s.SpregLost = true;
             }
             if (s.Sclass == SC.shadowreg)
                 goto Lpara;

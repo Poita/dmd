@@ -358,6 +358,12 @@ private int cgreg_benefit(ref CGstate cg, Symbol* s, reg_t reg, Symbol* retsym)
         lastLvreg = w.lvreg;
         if (w.cant)
             return -1;
+        /* The register is used in all of the live range, so s would be in it
+         * nowhere, which only helps a parameter that stays in the register
+         * it came in
+         */
+        if (s.SpregLost && vec_index(0, w.lvreg) >= vec_numbits(w.lvreg))
+            return 0;
         int benefit = w.benefit + cgreg_benefit_adjustment(cg, s, reg);
         if (benefit > s.Sweight + 1)
             benefit = int.max;      // saturate instead of overflow error
