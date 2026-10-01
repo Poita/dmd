@@ -614,6 +614,109 @@ noprop:
 }
 
 /***********************************
+ * Index of go.defnod[], built by buildDefIndex() each time go.defnod[] is filled in
+ */
+struct DefIndex
+{
+    /* The go.defnod[] indices of the assignments to variables, by variable:
+     * sorted by the variable's address, then by index
+     */
+    static struct SymDef
+    {
+        const(Symbol)* s;
+        uint i;
+    }
+    Barray!SymDef symDefs;
+
+    vec_t asmDefs;      // the OPasm definitions
+    vec_t anyDefs;      // the OPasm definitions, assignments through pointers and other definitions
+    vec_t varDefs;      // the assignments to variables, which those of symDefs still are
+
+    /// Returns: the go.defnod[] indices of the assignments to `s`, in order
+    SymDef[] defsOf(const Symbol* s) nothrow
+    {
+        size_t lo = 0, hi = symDefs.length;
+        while (lo < hi)
+        {
+            const mid = (lo + hi) / 2;
+            if (symDefs[mid].s < s)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        size_t end = lo;
+        while (end < symDefs.length && symDefs[end].s is s)
+            ++end;
+        return symDefs[lo .. end];
+    }
+}
+
+public __gshared DefIndex defIndex;
+
+/***********************************
+ * Build defIndex for go.defnod[].
+ */
+@trusted
+public void buildDefIndex(ref GlobalOptimizer go)
+{
+    alias di = defIndex;
+    const n = go.defnod.length;
+    di.symDefs.setLength(0);
+    vec_free(di.asmDefs);
+    vec_free(di.anyDefs);
+    vec_free(di.varDefs);
+    di.asmDefs = vec_calloc(n);
+    di.anyDefs = vec_calloc(n);
+    di.varDefs = vec_calloc(n);
+    foreach (uint i; 0 .. cast(uint)n)
+    {
+        elem* d = go.defnod[i].DNelem;
+        const op = d.Eoper;
+        if (op == OPasm)
+        {
+            vec_setbit(i, di.asmDefs);
+            vec_setbit(i, di.anyDefs);
+        }
+        else if (OTassign(op) && d.E1.Eoper == OPvar)
+        {
+            di.symDefs.push(DefIndex.SymDef(d.E1.Vsym, i));
+            vec_setbit(i, di.varDefs);
+        }
+        else
+            vec_setbit(i, di.anyDefs);
+    }
+    extern (C) static int cmp(scope const void* a, scope const void* b) nothrow
+    {
+        auto x = cast(const DefIndex.SymDef*)a;
+        auto y = cast(const DefIndex.SymDef*)b;
+        if (x.s !is y.s)
+            return x.s < y.s ? -1 : 1;
+        return x.i < y.i ? -1 : x.i > y.i;
+    }
+    qsort(di.symDefs[].ptr, di.symDefs.length, DefIndex.SymDef.sizeof, &cmp);
+}
+
+/***********************************
+ * Update defIndex for definition elem n of go.defnod[], which has been changed
+ * from an assignment to a variable into an elem that is not a definition of it.
+ */
+@trusted
+public void defIndexChanged(ref GlobalOptimizer go, elem* n)
+{
+    foreach (uint j; 0 .. cast(uint)go.defnod.length)
+    {
+        if (go.defnod[j].DNelem == n && vec_testbit(j, defIndex.varDefs))
+        {
+            assert(!(OTassign(n.Eoper) && n.E1.Eoper == OPvar));
+            vec_clearbit(j, defIndex.varDefs);
+            vec_setbit(j, defIndex.anyDefs);
+            if (n.Eoper == OPasm)
+                vec_setbit(j, defIndex.asmDefs);
+        }
+    }
+}
+
+/***********************************
  * Find all the reaching defs of OPvar e.
  * Params:
  *      IN = vector of definition nodes
@@ -625,6 +728,109 @@ noprop:
 @trusted
 public
 void listrds(ref GlobalOptimizer go, vec_t IN, elem* e, vec_t f, Barray!(elem*)* rdlist)
+{
+    assert(IN);
+    assert(e.Eoper == OPvar);
+    Barray!(elem*) checkList;
+    vec_t checkF;
+    const check = checkDefIndex();
+    if (check)
+    {
+        if (f)
+        {
+            checkF = vec_calloc(vec_numbits(f));
+            listrdsAll(go, IN, e, checkF, null);
+        }
+        else
+            listrdsAll(go, IN, e, null, &checkList);
+    }
+    const listStart = rdlist ? rdlist.length : 0;
+
+    Symbol* s = e.Vsym;
+    const ty = e.Ety;
+    uint nsize;
+    if (tyscalar(ty))
+        nsize = cast(uint)size(ty);
+    const noff = e.Voffset;
+    const unambig = s.Sflags & SFLdistinct;
+    if (f)
+        vec_clear(f);
+
+    /* The definitions that may define e: the assignments to s, the OPasms,
+     * and unless s is distinct the others but assignments to other variables
+     */
+    auto defs = defIndex.defsOf(s);
+    const vec_t mask = unambig ? defIndex.asmDefs : defIndex.anyDefs;
+    size_t k = 0;               // next of defs[]
+    size_t i = 0;               // next of mask & IN
+    while (1)
+    {
+        i = vec_index(i, IN);
+        while (i < go.defnod.length && !vec_testbit(i, mask))
+            i = vec_index(i + 1, IN);
+        while (k < defs.length && !(vec_testbit(defs[k].i, IN) && vec_testbit(defs[k].i, defIndex.varDefs)))
+            ++k;
+        const fromMask = i < go.defnod.length;
+        const fromDefs = k < defs.length;
+        if (!fromMask && !fromDefs)
+            break;
+        size_t j;
+        if (fromDefs && (!fromMask || defs[k].i < i))
+        {
+            j = defs[k++].i;
+            elem* d = go.defnod[j].DNelem;
+            elem* t = d.E1;
+            if (d.Eoper != OPstreq && tyscalar(ty) && tyscalar(t.Ety))
+            {
+                // If t does not overlap e, then it doesn't affect things
+                if (!(noff + nsize > t.Voffset && t.Voffset + size(t.Ety) > noff))
+                    continue;
+            }
+        }
+        else
+            j = i++;
+        if (f)
+            vec_setbit(j, f);
+        else
+            (*rdlist).push(go.defnod[j].DNelem);
+    }
+
+    if (check)
+    {
+        bool same;
+        if (f)
+        {
+            same = vec_equal(f, checkF) != 0;
+            vec_free(checkF);
+        }
+        else
+            same = (*rdlist)[listStart .. $] == checkList[];
+        checkList.dtor();
+        if (!same)
+        {
+            fprintf(stderr, "def index mismatch for %s in %s\n", s.Sident.ptr, funcsym_p ? funcsym_p.Sident.ptr : "?".ptr);
+            abort();
+        }
+    }
+}
+
+/* Whether to check that listrds() finds what listrdsAll() does, set by the
+ * environment variable DMD_CHECK_DEF_INDEX
+ */
+private __gshared int checkDefIndexState = -1;
+
+@trusted
+public bool checkDefIndex()
+{
+    if (checkDefIndexState < 0)
+        checkDefIndexState = getenv("DMD_CHECK_DEF_INDEX") !is null;
+    return checkDefIndexState != 0;
+}
+
+/* listrds() by looking at every reaching definition
+ */
+@trusted
+private void listrdsAll(ref GlobalOptimizer go, vec_t IN, elem* e, vec_t f, Barray!(elem*)* rdlist)
 {
     uint unambig;
     Symbol* s;

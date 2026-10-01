@@ -24,6 +24,7 @@ import dmd.backend.global : err_nomem;
 import dmd.backend.blockopt : blockopt;
 import dmd.backend.evalu8 : iftrue;
 import dmd.backend.go;
+import dmd.backend.gother : buildDefIndex, defIndex;
 import dmd.backend.el;
 import dmd.backend.symbol;
 import dmd.backend.ty;
@@ -156,7 +157,10 @@ private void rdgenkill(ref GlobalOptimizer go, ref BlockOpt bo)
     /*      to the enclosing block.                         */
     go.defnod.setLength(deftop);
     if (deftop == 0)
+    {
+        buildDefIndex(go);
         return;
+    }
 
     /* Allocate buffer for the DNunambig vectors
      */
@@ -171,6 +175,7 @@ private void rdgenkill(ref GlobalOptimizer go, ref BlockOpt bo)
         if (b.Belem)
             asgdefelems(b, b.Belem, go.defnod[], i);    // fill in go.defnod[]
     assert(i == 0);
+    buildDefIndex(go);
 
     initDNunambigVectors(go, go.defnod[]);
 
@@ -342,21 +347,20 @@ private void fillInDNunambig(vec_t v, elem* e, size_t start, DefNode[] defnod)
     targ_size_t tsize = (e.Eoper == OPstreq) ? type_size(e.ET) : tysize(t.Ety);
     targ_size_t ttop = toff + tsize;
 
-    // for all unambig defs in defnod[]
-    foreach (const i; start + 1 .. defnod.length)
+    // for all unambig defs of d in defnod[] after start
+    foreach (const sd; defIndex.defsOf(d))
     {
-        vec_t v2 = defnod[i].DNunambig;
-        if (!v2)
+        const i = sd.i;
+        if (i <= start)
             continue;
+        vec_t v2 = defnod[i].DNunambig;
+        assert(v2);
 
         elem* tn = defnod[i].DNelem;
         elem* tn1;
         targ_size_t tn1size;
 
-        // If not same variable then no overlap
         tn1 = tn.E1;
-        if (d != tn1.Vsym)
-            continue;
 
         tn1size = (tn.Eoper == OPstreq)
             ? type_size(tn.ET) : tysize(tn1.Ety);
@@ -651,6 +655,111 @@ private void flowaecp(ref GlobalOptimizer go, ref BlockOpt bo)
  * Compute Bgen and Bkill for AEs, CPs, and VBEs.
  */
 
+/* Indexes of go.expnod[] that let accumaecpx() find the elems a definition kills
+ * without looking at every elem
+ */
+private struct KillIndex
+{
+    /* For each globsym[] index i, symList[symStart[i] .. symStart[i + 1]] are the
+     * go.expnod[] indices of the elems that a definition of globsym[i] kills directly
+     */
+    Barray!uint symStart;
+    Barray!uint symList;
+
+    /* For each go.expnod[] index c, parentList[parentStart[c] .. parentStart[c + 1]]
+     * are the go.expnod[] indices of the AEs that have expnod[c] as an operand
+     */
+    Barray!uint parentStart;
+    Barray!uint parentList;
+
+    Barray!uint mark;           // the round in which each elem was last killed
+    uint round;
+    Barray!uint work;
+}
+
+private __gshared KillIndex killIndex;
+
+/* Returns: the globsym[] index of `s`, or size_t.max if it is not in it
+ */
+@trusted
+private size_t localIndex(const Symbol* s)
+{
+    const si = s.Ssymnum;
+    return si < globsym.length && globsym[si] is s ? si : size_t.max;
+}
+
+/* Build `killIndex` for the elems in go.expnod[]
+ */
+@trusted
+private void buildKillIndex(ref GlobalOptimizer go)
+{
+    alias ki = killIndex;
+    const nsyms = globsym.length;
+    const nexp = go.exptop;
+
+    /* Fill start[] and list[] with the pairs (key, value) that each(dg) passes to dg,
+     * the values of each key being in list[start[key] .. start[key + 1]]
+     */
+    static void group(ref Barray!uint start, ref Barray!uint list, size_t nkeys,
+        scope void delegate(scope void delegate(size_t key, uint value) nothrow) nothrow each)
+    {
+        start.setLength(nkeys + 1);
+        start[][] = 0;
+        each((key, value) { ++start[key + 1]; });
+        foreach (k; 0 .. nkeys)
+            start[k + 1] += start[k];
+        list.setLength(start[nkeys]);
+        each((key, value) { list[start[key]++] = value; });
+        foreach_reverse (k; 0 .. nkeys)         // restore the starts the stores advanced
+            start[k + 1] = start[k];
+        start[0] = 0;
+    }
+
+    group(ki.symStart, ki.symList, nsyms, (scope add) {
+        foreach (uint i; 1 .. nexp)
+        {
+            elem* e = go.expnod[i];
+            if (go.flowxx == CP)
+            {
+                const s1 = localIndex(e.E1.Vsym);
+                const s2 = localIndex(e.E2.Vsym);
+                if (s1 != size_t.max)
+                    add(s1, i);
+                if (s2 != size_t.max && s2 != s1)
+                    add(s2, i);
+            }
+            else if (e.Eoper == OPvar)
+            {
+                const si = localIndex(e.Vsym);
+                if (si != size_t.max)
+                    add(si, i);
+            }
+        }
+    });
+
+    group(ki.parentStart, ki.parentList, nexp, (scope add) {
+        if (go.flowxx == CP)
+            return;
+        foreach (uint i; 1 .. nexp)
+        {
+            elem* e = go.expnod[i];
+            const op = e.Eoper;
+            if (OTunary(op))
+                add(e.E1.Eexp, i);
+            else if (OTbinary(op))
+            {
+                add(e.E1.Eexp, i);
+                if (e.E2.Eexp != e.E1.Eexp)
+                    add(e.E2.Eexp, i);
+            }
+        }
+    });
+
+    ki.mark.setLength(nexp);
+    ki.mark[][] = 0;
+    ki.round = 0;
+}
+
 @trusted
 private void aecpgenkill(ref GlobalOptimizer go, ref BlockOpt bo)
 {
@@ -759,6 +868,7 @@ private void aecpgenkill(ref GlobalOptimizer go, ref BlockOpt bo)
 
     go.expnod.setLength(0);             // dump any existing one
     go.expnod.push(null);
+    aeCandKILL = null;
 
     go.expblk.setLength(0);             // dump any existing one
     go.expblk.push(null);
@@ -781,6 +891,7 @@ private void aecpgenkill(ref GlobalOptimizer go, ref BlockOpt bo)
         return;
 
     defstarkill(go);                  /* compute go.defkill and go.starkill */
+    buildKillIndex(go);
 
     static if (0)
     {
@@ -1053,6 +1164,65 @@ private __gshared
 {
     vec_t GEN;       // use static copies to save on parameter passing
     vec_t KILL;
+
+    /* For AEs: the AEs that may be in no KILL while an operand is, which a
+     * definition kills along with the uses of the variable it defines.
+     * aeCand[aeCandBase .. $] are those of the current GEN and KILL.
+     */
+    Barray!uint aeCand;
+    size_t aeCandBase;
+    uint aeDepth;               // nesting of accumaecp() calls
+    vec_t aeCandKILL;           // the KILL aeCand[0 .. $] was last kept for
+}
+
+/* Returns: whether an operand of AE go.expnod[i] is in KILL
+ */
+@trusted
+private bool killedOperand(ref GlobalOptimizer go, uint i)
+{
+    elem* e = go.expnod[i];
+    const op = e.Eoper;
+    if (OTunary(op))
+        return vec_testbit(e.E1.Eexp, KILL) != 0;
+    if (OTbinary(op))
+        return vec_testbit(e.E1.Eexp, KILL) || vec_testbit(e.E2.Eexp, KILL);
+    return false;
+}
+
+/* Elem b has been added to GEN, so removed from KILL
+ */
+@trusted
+private void noteGen(ref GlobalOptimizer go, uint b)
+{
+    if (go.flowxx == AE && killedOperand(go, b))
+        aeCand.push(b);
+}
+
+/* KILL |= x, noting the AEs whose operands that kills
+ */
+@trusted
+private void killBits(ref GlobalOptimizer go, const vec_t x)
+{
+    if (go.flowxx != AE)
+    {
+        vec_orass(KILL, x);
+        return;
+    }
+    alias ki = killIndex;
+    foreach (w; 0 .. vec_dim(KILL))
+    {
+        auto added = x[w] & ~KILL[w];
+        KILL[w] |= x[w];
+        while (added)
+        {
+            import core.bitop : bsf;
+            const c = cast(uint)(w * VECBITS + bsf(added));
+            added &= added - 1;
+            if (c < go.exptop)
+                foreach (p; ki.parentList[ki.parentStart[c] .. ki.parentStart[c + 1]])
+                    aeCand.push(p);
+        }
+    }
 }
 
 @trusted
@@ -1064,9 +1234,86 @@ private void accumaecp(ref GlobalOptimizer go, vec_t g,vec_t k,elem* n)
     KILLsave = KILL;
     GEN = g;
     KILL = k;
+    const baseSave = aeCandBase;
+    if (go.flowxx == AE)
+    {
+        if (aeDepth == 0)
+        {
+            if (k !is aeCandKILL)
+            {
+                /* Find the AEs in no KILL with an operand that is
+                 */
+                aeCand.setLength(0);
+                if (!vec_disjoint(k, k))
+                {
+                    foreach (uint i; 1 .. go.exptop)
+                    {
+                        if (!vec_testbit(i, KILL) && killedOperand(go, i))
+                            aeCand.push(i);
+                    }
+                }
+            }
+            aeCandKILL = k;
+        }
+        aeCandBase = aeDepth ? aeCand.length : 0;
+        ++aeDepth;
+    }
     accumaecpx(go, n);
+    if (go.flowxx == AE)
+    {
+        --aeDepth;
+        if (aeDepth)
+            aeCand.setLength(aeCandBase);
+        aeCandBase = baseSave;
+    }
     GEN = GENsave;
     KILL = KILLsave;
+}
+
+/* Whether to check that the kills found through `killIndex` are those found by
+ * looking at every elem, set by the environment variable DMD_CHECK_KILL_INDEX
+ */
+private __gshared int checkKillIndexState = -1;
+
+@trusted
+private bool checkKillIndex()
+{
+    if (checkKillIndexState < 0)
+        checkKillIndexState = getenv("DMD_CHECK_KILL_INDEX") !is null;
+    return checkKillIndexState != 0;
+}
+
+/* Abort if the KILL and GEN computed through `killIndex` differ from `checkKILL`
+ * and `checkGEN`, which are freed
+ */
+@trusted
+private void checkKills(vec_t checkKILL, vec_t checkGEN)
+{
+    if (!vec_equal(checkKILL, KILL) || !vec_equal(checkGEN, GEN))
+    {
+        import dmd.backend.debugprint : oper_str;
+        fprintf(stderr, "kill index mismatch in %s flowxx=%d\n", funcsym_p ? funcsym_p.Sident.ptr : "?".ptr, go.flowxx);
+        foreach (uint i; 1 .. go.exptop)
+        {
+            const ok = vec_testbit(i, checkKILL) != 0, nk = vec_testbit(i, KILL) != 0;
+            const og = vec_testbit(i, checkGEN) != 0, ng = vec_testbit(i, GEN) != 0;
+            if (ok != nk || og != ng)
+            {
+                elem* e = go.expnod[i];
+                fprintf(stderr, " i=%u op=%s oldKILL=%d newKILL=%d oldGEN=%d newGEN=%d", i, oper_str(e.Eoper), ok, nk, og, ng);
+                if (!OTleaf(e.Eoper))
+                {
+                    const c1 = e.E1.Eexp;
+                    fprintf(stderr, " E1.Eexp=%u(K%d) ", c1, vec_testbit(c1, checkKILL) != 0);
+                    if (OTbinary(e.Eoper)) fprintf(stderr, " E2.Eexp=%u(K%d)", e.E2.Eexp, vec_testbit(e.E2.Eexp, checkKILL) != 0);
+                }
+                fprintf(stderr, "\n");
+            }
+        }
+        abort();
+    }
+    vec_free(checkKILL);
+    vec_free(checkGEN);
 }
 
 @trusted
@@ -1102,8 +1349,8 @@ private void accumaecpx(ref GlobalOptimizer go, elem* n)
             /* GEN =((GEN - Kl) | Gl) &  */
             /*     ((GEN - Kr) | Gr)     */
 
-            vec_orass(KILL,Kl);
-            vec_orass(KILL,Kr);
+            killBits(go, Kl);
+            killBits(go, Kr);
 
             vec_sub(Kl,GEN,Kl);
             vec_sub(Kr,GEN,Kr);
@@ -1130,7 +1377,7 @@ private void accumaecpx(ref GlobalOptimizer go, elem* n)
                 // KILL |= Kr
                 // GEN &= (GEN - Kr) | Gr
 
-                vec_orass(KILL,Kr);
+                killBits(go, Kr);
                 vec_sub(Kr,GEN,Kr);
                 vec_orass(Kr,Gr);
                 vec_andass(GEN,Kr);
@@ -1146,6 +1393,8 @@ private void accumaecpx(ref GlobalOptimizer go, elem* n)
             assert(!n.Eexp);                   // no ASM available expressions
             vec_set(KILL);                      // KILL everything
             vec_clear(GEN);                     // GEN nothing
+            if (go.flowxx == AE)
+                aeCand.setLength(aeCandBase);   // every AE is in KILL
             return;
 
         case OPeq:
@@ -1161,7 +1410,7 @@ private void accumaecpx(ref GlobalOptimizer go, elem* n)
         case OPvp_fp:
         case OPcvp_fp:                          // if vptr access
             if ((go.flowxx == AE) && n.Eexp)
-                vec_orass(KILL,go.vptrkill);       // kill all other vptr accesses
+                killBits(go, go.vptrkill);         // kill all other vptr accesses
             break;
 
         case OPprefetch:
@@ -1202,22 +1451,42 @@ private void accumaecpx(ref GlobalOptimizer go, elem* n)
             return;
         if (!Eunambig(n))                       /* if ambiguous def elem */
         {
-            vec_orass(KILL,go.defkill);
+            killBits(go, go.defkill);
             vec_subass(GEN,go.defkill);
         }
         else                                    /* unambiguous def elem */
         {
             assert(t.Eoper == OPvar);
             Symbol* s = t.Vsym;                  // ptr to var being def'd
-            foreach (uint i; 1 .. go.exptop)        // for each ae elem
+            void killAll(vec_t KILL, vec_t GEN)
             {
-                elem* e = go.expnod[i];
+                foreach (uint i; 1 .. go.exptop)        // for each ae elem
+                {
+                    elem* e = go.expnod[i];
 
-                /* If it could be changed by the definition,     */
-                /* set bit in KILL.                              */
+                    /* If it could be changed by the definition,     */
+                    /* set bit in KILL.                              */
 
-                if (e.E1.Vsym == s || e.E2.Vsym == s)
+                    if (e.E1.Vsym == s || e.E2.Vsym == s)
+                        vec_setclear(i,KILL,GEN);
+                }
+            }
+            const si = localIndex(s);
+            if (si == size_t.max)
+                killAll(KILL, GEN);
+            else
+            {
+                vec_t checkKILL, checkGEN;
+                if (checkKillIndex)
+                {
+                    checkKILL = vec_clone(KILL);
+                    checkGEN = vec_clone(GEN);
+                    killAll(checkKILL, checkGEN);
+                }
+                foreach (i; killIndex.symList[killIndex.symStart[si] .. killIndex.symStart[si + 1]])
                     vec_setclear(i,KILL,GEN);
+                if (checkKillIndex)
+                    checkKills(checkKILL, checkGEN);
             }
         }
 
@@ -1238,16 +1507,17 @@ private void accumaecpx(ref GlobalOptimizer go, elem* n)
         const uint b = n.Eexp;             // add elem to GEN
         assert(go.expnod[b] == n);
         vec_setclear(b,GEN,KILL);
+        noteGen(go, b);
     }
     else if (OTdef(op))                         /* else if definition elem */
     {
         if (!Eunambig(n))                       /* if ambiguous def elem */
         {
-            vec_orass(KILL,go.defkill);
+            killBits(go, go.defkill);
             vec_subass(GEN,go.defkill);
             if (OTcalldef(op))
             {
-                vec_orass(KILL,go.vptrkill);
+                killBits(go, go.vptrkill);
                 vec_subass(GEN,go.vptrkill);
             }
         }
@@ -1257,36 +1527,98 @@ private void accumaecpx(ref GlobalOptimizer go, elem* n)
             Symbol* s = t.Vsym;             // idx of var being def'd
             if (!(s.Sflags & SFLdistinct))
             {
-                vec_orass(KILL,go.starkill);       /* kill all 'starred' refs */
+                killBits(go, go.starkill);         /* kill all 'starred' refs */
                 vec_subass(GEN,go.starkill);
             }
-            foreach (uint i; 1 .. go.exptop)        // for each ae elem
+            void killAll(vec_t KILL, vec_t GEN)
             {
-                elem* e = go.expnod[i];
-                const int eop = e.Eoper;
+                foreach (uint i; 1 .. go.exptop)        // for each ae elem
+                {
+                    elem* e = go.expnod[i];
+                    const int eop = e.Eoper;
 
-                /* If it could be changed by the definition,     */
-                /* set bit in KILL.                              */
-                if (eop == OPvar)
-                {
-                    if (e.Vsym != s)
-                        continue;
-                }
-                else if (OTunary(eop))
-                {
-                    if (!vec_testbit(e.E1.Eexp,KILL))
-                        continue;
-                }
-                else if (OTbinary(eop))
-                {
-                    if (!vec_testbit(e.E1.Eexp,KILL) &&
-                        !vec_testbit(e.E2.Eexp,KILL))
-                        continue;
-                }
-                else
-                        continue;
+                    /* If it could be changed by the definition,     */
+                    /* set bit in KILL.                              */
+                    if (eop == OPvar)
+                    {
+                        if (e.Vsym != s)
+                            continue;
+                    }
+                    else if (OTunary(eop))
+                    {
+                        if (!vec_testbit(e.E1.Eexp,KILL))
+                            continue;
+                    }
+                    else if (OTbinary(eop))
+                    {
+                        if (!vec_testbit(e.E1.Eexp,KILL) &&
+                            !vec_testbit(e.E2.Eexp,KILL))
+                            continue;
+                    }
+                    else
+                            continue;
 
-                vec_setclear(i,KILL,GEN);
+                    vec_setclear(i,KILL,GEN);
+                }
+            }
+            const si = localIndex(s);
+            if (si == size_t.max)
+            {
+                killAll(KILL, GEN);
+                aeCand.setLength(aeCandBase);   // no AE outside KILL has an operand in it
+            }
+            else
+            {
+                vec_t checkKILL, checkGEN;
+                if (checkKillIndex)
+                {
+                    checkKILL = vec_clone(KILL);
+                    checkGEN = vec_clone(GEN);
+                    killAll(checkKILL, checkGEN);
+                }
+
+                /* Kill the uses of s and the AEs outside KILL with an operand
+                 * in it, then the AEs with an operand killed by that
+                 */
+                alias ki = killIndex;
+                if (++ki.round == 0)
+                {
+                    ki.mark[][] = 0;
+                    ki.round = 1;
+                }
+                ki.work.setLength(0);
+                foreach (i; ki.symList[ki.symStart[si] .. ki.symStart[si + 1]])
+                {
+                    ki.mark[i] = ki.round;
+                    vec_setclear(i,KILL,GEN);
+                    ki.work.push(i);
+                }
+                foreach (i; aeCand[aeCandBase .. aeCand.length])
+                {
+                    if (ki.mark[i] != ki.round && !vec_testbit(i, KILL) && killedOperand(go, i))
+                    {
+                        ki.mark[i] = ki.round;
+                        vec_setclear(i,KILL,GEN);
+                        ki.work.push(i);
+                    }
+                }
+                aeCand.setLength(aeCandBase);
+                while (ki.work.length)
+                {
+                    const c = ki.work[ki.work.length - 1];
+                    ki.work.setLength(ki.work.length - 1);
+                    foreach (p; ki.parentList[ki.parentStart[c] .. ki.parentStart[c + 1]])
+                    {
+                        if (ki.mark[p] != ki.round)
+                        {
+                            ki.mark[p] = ki.round;
+                            vec_setclear(p,KILL,GEN);
+                            ki.work.push(p);
+                        }
+                    }
+                }
+                if (checkKillIndex)
+                    checkKills(checkKILL, checkGEN);
             }
         }
 
@@ -1296,6 +1628,7 @@ private void accumaecpx(ref GlobalOptimizer go, elem* n)
             uint b = t.Eexp;
 
             vec_setclear(b,GEN,KILL);
+            noteGen(go, b);
         }
     }
 }

@@ -45,7 +45,7 @@ nothrow:
 char symbol_isintab(const Symbol* s) { return sytab[s.Sclass] & SCSS; }
 
 
-import dmd.backend.gother : findloopparameters;
+import dmd.backend.gother : defIndexChanged, findloopparameters;
 
 alias Loops = Rarray!Loop;
 
@@ -1649,6 +1649,7 @@ Lnextlis:
                 l.Llis.push(ne);
 
                 el_copy(n,ne.E1);      // replace n with just a reference to v
+                defIndexChanged(go, n);
                 goto Lret;
             } // if
             break;
