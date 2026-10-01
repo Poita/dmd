@@ -63,11 +63,6 @@ struct CgElem
 {
     Symbol* hdiff;
     tym_t global_tyf;
-
-    /* The chain of logical operators that swaplog() moved, optimized already
-     * for Goal.flags
-     */
-    elem* optimizedChain;
     bool again;
     bool topair;
 }
@@ -2796,16 +2791,7 @@ private elem* swaplog(elem* e, Goal goal)
     elem* e1 = e.E1;
     e.E1 = e1.E2;
     e1.E2 = e;
-
-    /* b was optimized as the right operand of e1, for Goal.flags. It is not
-     * optimized again as the left operand of e, which for a long chain of
-     * logical operators would optimize the rest of the chain once for each one.
-     */
-    elem* saved = cgel.optimizedChain;
-    cgel.optimizedChain = e.E1;
-    e1 = optelem(e1,goal);
-    cgel.optimizedChain = saved;
-    return e1;
+    return optelem(e1,goal);
 }
 
 @trusted
@@ -5870,9 +5856,6 @@ beg:
         else
             e.Nflags |= NFLnogoal;
     }
-
-    if (e is cgel.optimizedChain && goal == Goal.flags)
-        return e;
 
     auto op = e.Eoper;
     if (OTleaf(op))                     // if not an operator node
