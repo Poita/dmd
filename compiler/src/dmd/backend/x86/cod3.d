@@ -1328,8 +1328,9 @@ static if (NTEXCEPTIONS)
             if (AArch64 && tyaggregate(e.Ety) && retregs)
             {
                 // AAPCS64 aggregate returned in several registers
-                import dmd.backend.arm.cod1 : aarch64Aggregate, aggregateAddress, loadAggregateRegs, AggregateABI;
+                import dmd.backend.arm.cod1 : aarch64Aggregate, aggregateAddress, evalToAggregate, loadAggregateRegs, AggregateABI;
                 const a = aarch64Aggregate(e.ET);
+                e = evalToAggregate(cg, cdb, e, 0);
                 if (OTcall(e.Eoper))
                     gencodelem(cdb,e,retregs,true);     // already in the return registers
                 else
