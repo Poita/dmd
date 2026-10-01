@@ -2136,6 +2136,45 @@ void cdstreq(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         }
     }
 
+    /* Copy a small aggregate between operands in memory through their
+     * addressing modes, without computing their addresses
+     */
+    bool inMemory(elem* x)
+    {
+        return !x.Ecount && (x.Eoper == OPvar && x.Vsym.Sfl != FL.reg || x.Eoper == OPind);
+    }
+    if (!pretregs && numbytes && numbytes <= 32 && inMemory(e1) && inMemory(e2))
+    {
+        // an indexed addressing mode takes no offset, so is only good for one access
+        const bool oneAccess = numbytes == 1 || numbytes == 2 || numbytes == 4 || numbytes == 8;
+        code csrc;
+        getlvalue(cg,cdb,csrc,e2,0,RM.load);
+        const regm_t srcregs = idxregm(csrc);
+        code cdst;
+        getlvalue(cg,cdb,cdst,e1,srcregs,RM.store);
+        assert(csrc.reg == NOREG && cdst.reg == NOREG);
+        assert(oneAccess || (csrc.index == NOREG && cdst.index == NOREG));
+        regm_t regm = cg.allregs & ~(cg.regcon.mvar | srcregs | idxregm(cdst));
+        const reg_t Rv = allocreg(cdb, regm, TYllong);
+        for (uint off = 0; off < numbytes; )
+        {
+            const uint left = numbytes - off;
+            const uint n = left >= 8 ? 8 : left >= 4 ? 4 : left >= 2 ? 2 : 1;
+            code cs = csrc;
+            cs.IEV1.Voffset += off;
+            loadFromEA(cs, Rv, n == 8 ? 8 : 4, n);
+            cdb.gen(&cs);
+            cs = cdst;
+            cs.IEV1.Voffset += off;
+            storeToEA(cs, Rv, n);
+            cdb.gen(&cs);
+            off += n;
+        }
+        freenode(e1);
+        freenode(e2);
+        return;
+    }
+
     /* The address registers and the copy register are scratch,
      * so they must not be register variables
      */

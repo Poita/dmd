@@ -89,6 +89,33 @@ void cdeq(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
     uint sz = _tysize[tyml];           // # of bytes to transfer
     assert(cast(int)sz > 0);
 
+    /* Store an HFA returned by a call from its V registers, without moving
+     * it into the X registers that hold its value as an integer
+     */
+    import dmd.backend.arm.cod1 : aarch64Aggregate, aggregateRetRegs, holdsAggregate, AggregateABI;
+    if (retregs == 0 && OTcall(e2oper) && !e2.Ecount && !e1.Ecount &&
+        holdsAggregate(e2.Ety, e2.ET) && !tyaggregate(e2.Ety) &&
+        (e1.Eoper == OPvar && e1.Vsym.Sfl != FL.reg || e1.Eoper == OPind))
+    {
+        const a = aarch64Aggregate(e2.ET);
+        if (a.kind == AggregateABI.Kind.hfa && a.size <= 16)
+        {
+            regm_t vregs = aggregateRetRegs(a);
+            codelem(cg,cdb,e2,vregs,false);
+            getlvalue(cg,cdb,cs,e1,vregs,RM.store);
+            assert(cs.reg == NOREG && cs.index == NOREG);
+            foreach (k; 0 .. a.nregs)
+            {
+                code csk = cs;
+                csk.IEV1.Voffset += k * a.esz;
+                storeToEA(csk, cast(reg_t)(32 + k), a.esz);
+                cdb.gen(&csk);
+            }
+            freenode(e1);
+            return;
+        }
+    }
+
     if (retregs == 0)                     // if no return value
     {
         /* If registers are tight, and we might need them for the lvalue,

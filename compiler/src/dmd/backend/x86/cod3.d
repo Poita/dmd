@@ -1359,6 +1359,38 @@ static if (NTEXCEPTIONS)
                     mreg = mask(reg2) & INSTR.MSW ? reg2 : 1;
                 }
 
+                {
+                    /* Load a small HFA in memory directly into the V registers
+                     * it is returned in
+                     */
+                    import dmd.backend.arm.cod1 : aarch64Aggregate, holdsAggregate, AggregateABI, getlvalue, loadFromEA;
+                    if (holdsAggregate(e.Ety, e.ET) && !tyaggregate(e.Ety))
+                    {
+                        const a = aarch64Aggregate(e.ET);
+                        elem* ev = e;
+                        while (ev.Eoper == OPcomma && !ev.Ecount)
+                            ev = ev.E2;
+                        if (a.kind == AggregateABI.Kind.hfa && a.size <= 16 && !ev.Ecount &&
+                            (ev.Eoper == OPvar && ev.Vsym.Sfl != FL.reg || ev.Eoper == OPind))
+                        {
+                            docommas(cdb,e);
+                            code cs;
+                            getlvalue(cg,cdb,cs,e,0,RM.load);
+                            assert(cs.reg == NOREG && cs.index == NOREG);
+                            retregs = 0;
+                            foreach (k; 0 .. a.nregs)
+                            {
+                                code csk = cs;
+                                csk.IEV1.Voffset += k * a.esz;
+                                loadFromEA(csk, cast(reg_t)(32 + k), a.esz, a.esz);
+                                cdb.gen(&csk);
+                                retregs |= mask(cast(reg_t)(32 + k));
+                            }
+                            freenode(e);
+                            goto L4;
+                        }
+                    }
+                }
                 if (reg1 != NOREG)
                     retregs = (mask(lreg) | mask(mreg)) & ~mask(NOREG);
                 if (config.flags4 & CFG4optimized)

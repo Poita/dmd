@@ -1346,7 +1346,7 @@ void getlvalue(ref CGstate cg,ref CodeBuilder cdb,ref code pcs,elem* e,regm_t ke
                     off = tysize(ty) / 2;
                 if (e.Voffset == off && sz == off)
                     pcs.reg = s.Sregmsw;
-                if (!tyfloating(ty))
+                if (!tyfloating(ty) && !tyaggregate(ty))
                     pcs.Sextend = cast(ubyte)tyToExtend(ty);  // sign or zero extension
 
                 break;
@@ -1358,7 +1358,7 @@ void getlvalue(ref CGstate cg,ref CodeBuilder cdb,ref code pcs,elem* e,regm_t ke
             }
             pcs.IEV1.Vsym = s;
             pcs.IEV1.Voffset = e.Voffset;
-            if (!tyfloating(ty))
+            if (!tyfloating(ty) && !tyaggregate(ty))
                 pcs.Sextend = cast(ubyte)tyToExtend(ty);  // sign or zero extension
             if (sz == 1)
             {
@@ -2583,7 +2583,35 @@ void cdfunc(ref CGstate cg, ref CodeBuilder cdb, elem* e, ref regm_t pretregs)
                 gensaverestore(cg,tosave,cdbsave,cdbrestore);
             }
             cdb.append(cdbsave);
-            if (!tyaggregate(ep.Ety) && agg.size <= 16)
+            elem* ev = ep;              // the value after any commas
+            while (ev.Eoper == OPcomma && !ev.Ecount)
+                ev = ev.E2;
+            if (agg.kind == AggregateABI.Kind.hfa && !tyaggregate(ep.Ety) && agg.size <= 16 && !ev.Ecount &&
+                (ev.Eoper == OPvar && ev.Vsym.Sfl != FL.reg || ev.Eoper == OPind))
+            {
+                // load the elements of an HFA in memory directly into the V registers
+                while (ep.Eoper == OPcomma)
+                {
+                    regm_t none = 0;
+                    scodelem(cg, cdb, ep.E1, none, keepmsk, true);
+                    elem* eold = ep;
+                    ep = ep.E2;
+                    freenode(eold);
+                }
+                code cs;
+                getlvalue(cg, cdb, cs, ep, keepmsk, RM.load);
+                assert(cs.reg == NOREG && cs.index == NOREG);
+                getregs(cdb, regs);
+                foreach (k; 0 .. agg.nregs)
+                {
+                    code csk = cs;
+                    csk.IEV1.Voffset += k * agg.esz;
+                    loadFromEA(csk, cast(reg_t)(preg + k), agg.esz, agg.esz);
+                    cdb.gen(&csk);
+                }
+                freenode(ep);
+            }
+            else if (!tyaggregate(ep.Ety) && agg.size <= 16)
             {
                 // the value is in X registers like an integer
                 regm_t xregs;
@@ -3102,6 +3130,13 @@ static if (0)
         const a = aarch64Aggregate(e.ET);
         if (a.kind == AggregateABI.Kind.hfa && a.size <= 16)
         {
+            // leave the value in the V registers when the caller asks for them
+            const regm_t vregs = aggregateRetRegs(a);
+            if ((pretregs & ~mPSW) == vregs)
+            {
+                fixresult(cg, cdb, e, vregs, pretregs);
+                return;
+            }
             getregs(cdb, retregs);
             hfaToGpr(cdb, a, 32, 0);
         }
