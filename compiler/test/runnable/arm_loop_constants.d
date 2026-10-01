@@ -64,8 +64,26 @@ pragma(inline, false) int inTry(int[] a)
     return r;
 }
 
+pragma(inline, false) int cheap(int[] a, float[] f)
+{
+    int r;
+    foreach (i, ref x; a)
+    {
+        r += x * 3 + x * 20 + x * 31 + x * 7;
+        x = 7;
+        f[i] = f[i] * 2.5f + 0.0f;
+        if (f[i] < 1.0f)
+            r -= 1;
+    }
+    return r;
+}
+
 void main()
 {
+    int[2] ci = [1, 2];
+    float[2] cf = [0.25f, 4];
+    assert(cheap(ci, cf) == 61 * 3 - 1 && ci[1] == 7 && cf[0] == 0.625f && cf[1] == 10);
+
     ulong h = 7 ^ 0x9E3779B97F4A7C15UL;
     foreach (x; [1u, 2, 3])
     {

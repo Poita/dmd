@@ -3933,10 +3933,10 @@ private int el_length(elem* e)
 }
 
 /*************************************
- * AArch64: a constant that takes more than one instruction to load, used in
- * a loop, is loaded once into a variable assigned in the loop's preheader,
- * which the loop then uses. Done after the other optimizations, which would
- * propagate the constant back into the loop.
+ * AArch64: a constant used in a loop by an operation that needs it in a
+ * register is loaded once into a variable assigned before the loop, which the
+ * loop then uses. Done after the other optimizations, which would propagate
+ * the constant back into the loop.
  */
 @trusted
 void loopConstants(ref BlockOpt bo)
@@ -4076,14 +4076,11 @@ private ulong constBits(const(elem)* c)
 }
 
 /* Whether constant c, an operand of e, is worth loading into a variable
- * before a loop: it takes more than one instruction to load, and e has no
- * form taking it as an immediate
+ * before a loop: e has no form taking it as an immediate
  */
 @trusted
 private bool loadedConstant(const(elem)* e, const(elem)* c, bool isE2)
 {
-    import dmd.backend.arm.disasmarm : encodeHFD;
-
     const ty = tybasic(c.Ety);
     const op = e.Eoper;
     switch (op)
@@ -4108,11 +4105,9 @@ private bool loadedConstant(const(elem)* e, const(elem)* c, bool isE2)
     if (ty == TYfloat || ty == TYdouble || ty == TYdouble_alias)
     {
         const double d = ty == TYfloat ? c.Vfloat : c.Vdouble;
-        ubyte imm8;
-        if (encodeHFD(d, imm8))
-            return false;               // FMOV Vd,#imm
         if (d == 0 && OTrel(op))
             return false;               // FCMP Vn,#0.0
+        // even FMOV Vd,#imm is an instruction each time round the loop
         return true;
     }
 
@@ -4123,32 +4118,30 @@ private bool loadedConstant(const(elem)* e, const(elem)* c, bool isE2)
         return false;
     const sz = tysize(ty);
     const ulong v = constBits(c);
-    // instructions MOVZ or MOVN take, with a MOVK for each other 16 bits
-    uint nonzero, nonones;
-    foreach (k; 0 .. sz / 2)
-    {
-        const chunk = (v >> (k * 16)) & 0xFFFF;
-        nonzero += chunk != 0;
-        nonones += chunk != 0xFFFF;
-    }
-    const cost = nonzero < nonones ? nonzero : nonones;
-    if (cost < 2)
-        return false;
-    // ADD/SUB/CMP/CMN (immediate) take 12 bits, shifted by 12 or not
+    // whether the operation needs the constant in a register, rather than as an immediate
     if (op == OPadd || op == OPmin || op == OPaddass || op == OPminass || OTrel(op))
     {
+        // ADD/SUB/CMP/CMN (immediate) take 12 bits, shifted by 12 or not
         const ulong n = sz == 8 ? -v : (-v) & 0xFFFF_FFFF;
         foreach (x; [v, n])
             if ((x & ~0xFFFUL) == 0 || (x & ~0xFFF000UL) == 0)
                 return false;
     }
-    // AND/ORR/EOR (immediate) take bit masks
-    if (op == OPand || op == OPor || op == OPxor || op == OPandass || op == OPorass || op == OPxorass)
+    else if (op == OPand || op == OPor || op == OPxor || op == OPandass || op == OPorass || op == OPxorass)
     {
+        // AND/ORR/EOR (immediate) take bit masks
         import dmd.backend.arm.instr : encodeNImmrImms;
         uint N, immr, imms;
-        if (encodeNImmrImms(sz == 8 ? v : v | (v << 32), N, immr, imms))
+        if (v == 0 || encodeNImmrImms(sz == 8 ? v : v | (v << 32), N, immr, imms))
             return false;
     }
+    else if (op == OPmul || op == OPmulass)
+    {
+        // a shift, or an ADD or SUB of a shifted operand
+        if ((v & (v - 1)) == 0 || ((v - 1) & (v - 2)) == 0 || ((v + 1) & v) == 0)
+            return false;
+    }
+    else if (v == 0)
+        return false;                   // the zero register
     return true;
 }
