@@ -702,7 +702,7 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
                                           : tysize(e.Ety) == size;
     }
 
-    enum Form { none, copy, constant, load, store, pair, partial }
+    enum Form { none, copy, constant, load, store, pair, partial, result }
 
     /* Whether x refers to symbol s */
     static bool refersTo(const(elem)* x, const(Symbol)* s)
@@ -727,7 +727,19 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
     /* How an assignment e of a whole, whose value is not used, splits into
      * element assignments, given the Info of e.E1 and e.E2 if they are vars
      */
-    static Form assignForm(const(elem)* e, Info* inf1, Info* inf2)
+    /* The temporary of (tmp = value, tmp), or null
+     */
+    static Symbol* resultTemp(const(elem)* e2)
+    {
+        if (e2.Eoper == OPcomma && !e2.Ecount &&
+            e2.E1.Eoper == OPeq && !e2.E1.Ecount && e2.E1.E1.Eoper == OPvar && !e2.E1.E1.Voffset &&
+            e2.E2.Eoper == OPvar && !e2.E2.Ecount && e2.E2.Vsym is e2.E1.E1.Vsym && !e2.E2.Voffset &&
+            !(e2.E2.Ety & mTYvolatile))
+            return cast(Symbol*) e2.E2.Vsym;
+        return null;
+    }
+
+    static Form assignForm(const(elem)* e, Info* inf1, Info* inf2, bool tmpUnsplit)
     {
         const(elem)* e1 = e.E1;
         const(elem)* e2 = e.E2;
@@ -755,6 +767,10 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
             return Form.partial;
         if (whole1 && e2.Eoper == OPind && !e2.Ecount && !(e2.Ety & mTYvolatile) && !el_sideeffect(e2.E1))
             return Form.load;
+        // (tmp = value, tmp), as for a value a call returns, with tmp not split
+        if (whole1 && !inf1.isInt && resultTemp(e2) && resultTemp(e2) !is e1.Vsym && tmpUnsplit &&
+            type_size(resultTemp(e2).Stype) >= inf1.n * inf1.esz)
+            return Form.result;
         if (whole2 && e1.Eoper == OPind && !e1.Ecount && !(e1.Ety & mTYvolatile) && !el_sideeffect(e1.E1))
             return Form.store;
         return Form.none;
@@ -768,8 +784,20 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
         return si != SYMIDX.max && si < len && info[si].can ? &info[si] : null;
     }
 
-    void gather(const(elem)* e, bool valueUsed)
+    void gather(const(elem)* e, bool valueUsed) nothrow
     {
+        void argument(const(elem)* x) nothrow
+        {
+            if (x.Eoper == OPvar)
+                if (auto inf = candidate(x))
+                    if (!inf.isInt && isWhole(x, *inf))
+                    {
+                        inf.elems += inf.n;
+                        return;
+                    }
+            gather(x, true);
+        }
+
         while (1)
         {
             switch (e.Eoper)
@@ -817,6 +845,22 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
                     e = e.E2;
                     continue;
 
+                case OPparam:
+                case OPcall:
+                case OPucall:
+                    /* A floating point struct passed as a whole is passed in
+                     * registers loaded from its elements
+                     */
+                    if (e.Eoper == OPparam)
+                        argument(e.E1);
+                    if (e.Eoper != OPucall)
+                        argument(e.E2);
+                    if (e.Eoper == OPparam)
+                        return;
+                    e = e.E1;
+                    valueUsed = true;
+                    continue;
+
                 case OPeq:
                 case OPstreq:
                 {
@@ -824,7 +868,12 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
                     auto inf2 = candidate(e.E2);
                     if (!valueUsed)
                     {
-                        const form = assignForm(e, inf1, inf2);
+                        // the temporary of a value assigned to a split struct is not split itself
+                        if (inf1 && !inf1.isInt && isWhole(e.E1, *inf1))
+                            if (Symbol* tmp = resultTemp(e.E2))
+                                if (tmp.Ssymnum != SYMIDX.max && tmp.Ssymnum < len)
+                                    info[tmp.Ssymnum].can = false;
+                        const form = assignForm(e, inf1, inf2, true);
                         if (inf1 && form != Form.constant && form != Form.none)
                             inf1.assigned = true;
                         final switch (form)
@@ -835,6 +884,7 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
                             case Form.load:     inf1.elems += inf1.n; gather(e.E2.E1, true); return;
                             case Form.store:    inf2.elems += inf2.n; gather(e.E1.E1, true); return;
                             case Form.pair:     inf1.elems += inf1.n; gather(e.E2.E1, true); gather(e.E2.E2, true); return;
+                            case Form.result:   inf1.elems += inf1.n; gather(e.E2.E1, false); return;
                             case Form.none:     break;
                         }
                         if (inf1 && isWhole(e.E1, *inf1))
@@ -1072,7 +1122,9 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
                     if (!valueUsed)
                     {
                         elem*[5] a;
-                        const form = assignForm(e, inf1, inf2);
+                        Symbol* rtmp = resultTemp(e.E2);
+                        const form = assignForm(e, inf1, inf2,
+                            rtmp && !(rtmp.Ssymnum != SYMIDX.max && rtmp.Ssymnum < nsyms && byNum[rtmp.Ssymnum]));
                         if (form == Form.none)
                         {
                             if (inf1 && isWhole(e.E1, *inf1))
@@ -1179,6 +1231,25 @@ void sliceFloatStructs(ref symtab_t symtab, block* startblock)
                                     e.E2.E1 = null;
                                 else
                                     e.E1.E1 = null;
+                                break;
+                            }
+
+                            case Form.result:
+                            {
+                                // (tmp = value, e.0 = tmp.0, ...)
+                                elem* ea = e.E2.E1;
+                                replace(ea, false);
+                                Symbol* tmp = e.E2.E2.Vsym;
+                                a[0] = ea;
+                                e.E2.E1 = null;
+                                foreach (k; 0 .. inf1.n)
+                                {
+                                    elem* t = el_var(tmp);
+                                    t.Ety = elemTy(*inf1, k);
+                                    t.Voffset = k * inf1.esz;
+                                    a[k + 1] = el_bin(OPeq, elemTy(*inf1, k), elemVar(*inf1, k), t);
+                                }
+                                nchain = inf1.n + 1;
                                 break;
                             }
 

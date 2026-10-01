@@ -2296,17 +2296,22 @@ void gprToHfa(ref CodeBuilder cdb, const ref AggregateABI a, reg_t rx, reg_t rv)
 @trusted
 bool hfaElementValues(elem* e, const ref AggregateABI a, ref elem*[4] vals)
 {
-    if (a.kind != AggregateABI.Kind.hfa || a.nregs > 4 || e.Eoper != OPcomma || e.Ecount ||
-        e.E2.Eoper != OPvar || e.E2.Ecount || e.E2.Voffset)
+    if (a.kind != AggregateABI.Kind.hfa || a.nregs > 4 || e.Eoper != OPcomma || e.Ecount)
         return false;
-    const Symbol* t = e.E2.Vsym;
+    // the variable at the end of the commas
+    const(elem)* last = e;
+    while (last.Eoper == OPcomma)
+        last = last.E2;
+    if (last.Eoper != OPvar || last.Ecount || last.Voffset)
+        return false;
+    const Symbol* t = last.Vsym;
     vals[] = null;
     bool collect(elem* x)
     {
         if (x.Ecount)
             return false;
         if (x.Eoper == OPcomma)
-            return collect(x.E1) && collect(x.E2);
+            return collect(x.E1) && (x.E2 is last || collect(x.E2));
         if (x.Eoper != OPeq || x.E1.Eoper != OPvar || x.E1.Vsym !is t || !tyfloating(x.E1.Ety) ||
             tysize(x.E1.Ety) != a.esz || x.E1.Voffset % a.esz || el_sideeffect(x.E2))
             return false;
@@ -2316,7 +2321,7 @@ bool hfaElementValues(elem* e, const ref AggregateABI a, ref elem*[4] vals)
         vals[k] = x.E2;
         return true;
     }
-    if (!collect(e.E1))
+    if (!collect(e))
         return false;
     foreach (k; 0 .. a.nregs)
         if (!vals[k])
