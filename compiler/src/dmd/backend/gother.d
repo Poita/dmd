@@ -1370,7 +1370,7 @@ private bool checkCopyProp()
 /* Whether assignment n is one that flowcp() treats as a copy
  */
 @trusted
-private bool isCopy(const elem* n)
+package bool isCopy(const elem* n)
 {
     if (n.Eoper != OPeq && n.Eoper != OPstreq)
         return false;
@@ -1381,7 +1381,12 @@ private bool isCopy(const elem* n)
            !((e1.Ety | e2.Ety) & (mTYvolatile | mTYshared)) &&
            (!config.fpxmmregs ||
             (!tyfloating(e1.Vsym.Stype.Tty) == !tyfloating(e2.Vsym.Stype.Tty))) &&
-           e1.Vsym != e2.Vsym;
+           e1.Vsym != e2.Vsym &&
+           /* AArch64: a part of a larger variable is read from memory, so the
+            * copy, which can be in a register, is not replaced by it
+            */
+           !(config.target_cpu == TARGET_AArch64 && n.Eoper == OPeq &&
+             (e2.Voffset || tysize(e2.Ety) != type_size(e2.Vsym.Stype)));
 }
 
 /* Compute the copies reaching each block with flowcp() and start the walks over

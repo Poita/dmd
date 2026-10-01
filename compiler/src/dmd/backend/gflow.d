@@ -24,7 +24,7 @@ import dmd.backend.global : err_nomem;
 import dmd.backend.blockopt : blockopt;
 import dmd.backend.evalu8 : iftrue;
 import dmd.backend.go;
-import dmd.backend.gother : buildDefIndex, defIndex;
+import dmd.backend.gother : buildDefIndex, defIndex, isCopy;
 import dmd.backend.el;
 import dmd.backend.symbol;
 import dmd.backend.ty;
@@ -1230,15 +1230,7 @@ private void aecpgenkill(ref GlobalOptimizer go, ref BlockOpt bo, bool genkill =
                  * same variable.
                  * Don't mix XMM and integer registers.
                  */
-                elem* e1;
-                elem* e2;
-                if ((op == OPeq || op == OPstreq) &&
-                    (e1 = n.E1).Eoper == OPvar &&
-                    (e2 = n.E2).Eoper == OPvar &&
-                    !((e1.Ety | e2.Ety) & (mTYvolatile | mTYshared)) &&
-                    (!config.fpxmmregs ||
-                     (!tyfloating(e1.Vsym.Stype.Tty) == !tyfloating(e2.Vsym.Stype.Tty))) &&
-                    e1.Vsym != e2.Vsym)
+                if (isCopy(n))
                 {
                     n.Eexp = cast(uint)go.expnod.length;
                     go.expnod.push(n);
