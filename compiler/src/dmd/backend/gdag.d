@@ -151,12 +151,16 @@ void builddags(ref GlobalOptimizer go, ref BlockOpt bo)
 
 
 /* The go.expnod[] AEs by a hash that is equal for elems el_match() matches,
- * built at the start of the CSE walks
+ * built at the start of the CSE walks, as chains of the AEs with the same hash
+ * bucket in increasing order
  */
 private struct AeIndex
 {
     Barray!uint hashes;         // for each go.expnod[] index, the hash of the elem
-    Barray!ulong sorted;        // (hash << 32) | index, in increasing order
+    Barray!uint head;           // for each bucket, its first AE, or 0
+    Barray!uint tail;           // for each bucket, its last AE
+    Barray!uint next;           // for each go.expnod[] index, the next AE in its bucket, or 0
+    uint mask;                  // bucket of hash h is h & mask
 
     /* Returns: the go.expnod[] indices of the elems with hash h, in increasing order
      */
@@ -165,24 +169,23 @@ private struct AeIndex
     {
         static struct Range
         {
-            const(ulong)[] a;
-            nothrow:
-            bool empty() const { return a.length == 0 || cast(uint)(a[0] >> 32) != h; }
-            uint front() const { return cast(uint)a[0]; }
-            void popFront() { a = a[1 .. $]; }
+            AeIndex* ai;
+            uint i;
             uint h;
+            nothrow:
+            bool empty() const { return i == 0; }
+            uint front() const { return i; }
+            void popFront()
+            {
+                do
+                    i = ai.next[i];
+                while (i && ai.hashes[i] != h);
+            }
         }
-        const key = cast(ulong)h << 32;
-        size_t lo = 0, hi = sorted.length;
-        while (lo < hi)
-        {
-            const mid = (lo + hi) / 2;
-            if (sorted[mid] < key)
-                lo = mid + 1;
-            else
-                hi = mid;
-        }
-        return Range(sorted[][lo .. $], h);
+        auto r = Range(&this, head[h & mask], h);
+        if (r.i && hashes[r.i] != h)
+            r.popFront();
+        return r;
     }
 }
 
@@ -214,25 +217,30 @@ private uint aeHash(ref GlobalOptimizer go, const(elem)* n, uint limit)
 private void buildAeIndex(ref GlobalOptimizer go)
 {
     alias ai = aeIndex;
+    uint nbuckets = 16;
+    while (nbuckets < 2 * go.exptop)
+        nbuckets *= 2;
+    ai.mask = nbuckets - 1;
+    ai.head.setLength(nbuckets);
+    ai.head[][] = 0;
+    ai.tail.setLength(nbuckets);
     ai.hashes.setLength(go.exptop);
-    ai.sorted.setLength(0);
+    ai.next.setLength(go.exptop);
     foreach (uint i; 1 .. go.exptop)
     {
+        ai.next[i] = 0;
         if (const e = go.expnod[i])
         {
             const h = aeHash(go, e, i);
             ai.hashes[i] = h;
-            ai.sorted.push((cast(ulong)h << 32) | i);
+            const b = h & ai.mask;
+            if (ai.head[b])
+                ai.next[ai.tail[b]] = i;
+            else
+                ai.head[b] = i;
+            ai.tail[b] = i;
         }
     }
-    import core.stdc.stdlib : qsort;
-    static extern (C) int cmp(scope const void* a, scope const void* b)
-    {
-        const x = *cast(const ulong*)a, y = *cast(const ulong*)b;
-        return x < y ? -1 : x > y;
-    }
-    if (ai.sorted.length > 1)
-        qsort(ai.sorted[].ptr, ai.sorted.length, ulong.sizeof, &cmp);
 }
 
 /****************************
