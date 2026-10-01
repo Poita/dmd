@@ -543,8 +543,14 @@ void cdaddass(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
             reg1 = allocreg(cdb,posregs,tyml);
         }
         getregs(cdb,mask(reg1));
-        loadFromEA(cs,reg1,sz == 8 ? 8 : 4, sz);
-        cdb.gen(&cs);
+        /* A register variable narrower than 32 bits needs no widening first,
+         * as only its bits are stored back
+         */
+        if (!(cs.reg != NOREG && reg1 == cs.reg && sz < 4 && !forccs))
+        {
+            loadFromEA(cs,reg1,sz == 8 ? 8 : 4, sz);
+            cdb.gen(&cs);
+        }
 
         reg_t reg2 = findreg(retregs);
 

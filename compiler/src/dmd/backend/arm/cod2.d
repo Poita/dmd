@@ -160,17 +160,29 @@ void cdorth(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
      *  AND/ANDS/ORR/EOR Rd,Rn,#bitmask
      */
     if ((e.Eoper == OPand || e.Eoper == OPor || e.Eoper == OPxor) && e2.Eoper == OPconst &&
-        (tyintegral(ty) || typtr(ty)) && (sz == 4 || sz == 8) && _tysize[ty1] == sz &&
-        !isRegisterPair(true, ty, 0))
+        (tyintegral(ty) || typtr(ty)) && sz <= 8 && _tysize[ty1] == sz &&
+        !(sz < 4 && pretregs & mPSW) && !isRegisterPair(true, ty, 0))
     {
-        ulong c = el_tolong(e2);
-        if (sz == 4)
+        /* A value narrower than 32 bits is in a 32 bit register whose other
+         * bits do not matter, so the constant's can be either 0 or 1
+         */
+        static bool encode32(ulong c, uint sz, out uint N, out uint immr, out uint imms)
         {
-            c &= 0xFFFF_FFFF;
-            c |= c << 32;               // the pattern repeats in 64 bits
+            const ulong m = sz < 4 ? (1UL << (sz * 8)) - 1 : 0xFFFF_FFFF;
+            foreach (x; [c & m, (c & m) | ~m])
+            {
+                ulong v = x & 0xFFFF_FFFF;
+                v |= v << 32;           // the pattern repeats in 64 bits
+                if (encodeNImmrImms(v, N, immr, imms) && N == 0)
+                    return true;
+                if (sz == 4)
+                    break;
+            }
+            return false;
         }
+        const ulong c = el_tolong(e2);
         uint N, immr, imms;
-        if (encodeNImmrImms(c, N, immr, imms) && (sz == 8 || N == 0))
+        if (sz == 8 ? encodeNImmrImms(c, N, immr, imms) : encode32(c, sz, N, immr, imms))
         {
             const PSW = pretregs & mPSW;
             const uint opc = e.Eoper == OPand ? (PSW ? 3 : 0) : e.Eoper == OPor ? 1 : 2;
