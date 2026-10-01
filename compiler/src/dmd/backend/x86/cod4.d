@@ -102,6 +102,14 @@ int doinreg(Symbol* s, elem* e)
                     e = e.E1;
                     goto L1;
                 }
+                /* AArch64 evaluates both operands into other registers before
+                 * the instruction writes the result
+                 */
+                if (cgstate.AArch64 && !intree(*s,e.E1))
+                {
+                    e = e.E2;
+                    goto L1;
+                }
                 break;
 
             default:
