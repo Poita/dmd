@@ -1208,11 +1208,23 @@ private void killBits(ref GlobalOptimizer go, const vec_t x)
         vec_orass(KILL, x);
         return;
     }
+    /* Only the AEs that end up outside KILL with an operand in it are noted
+     */
     alias ki = killIndex;
+    killAdded.setLength(0);
     foreach (w; 0 .. vec_dim(KILL))
     {
-        auto added = x[w] & ~KILL[w];
-        KILL[w] |= x[w];
+        if (auto added = x[w] & ~KILL[w])
+        {
+            killAdded.push(w);
+            killAdded.push(added);
+            KILL[w] |= added;
+        }
+    }
+    for (size_t j = 0; j < killAdded.length; j += 2)
+    {
+        const w = killAdded[j];
+        auto added = killAdded[j + 1];
         while (added)
         {
             import core.bitop : bsf;
@@ -1220,10 +1232,15 @@ private void killBits(ref GlobalOptimizer go, const vec_t x)
             added &= added - 1;
             if (c < go.exptop)
                 foreach (p; ki.parentList[ki.parentStart[c] .. ki.parentStart[c + 1]])
-                    aeCand.push(p);
+                {
+                    if (!vec_testbit(p, KILL))
+                        aeCand.push(p);
+                }
         }
     }
 }
+
+private __gshared Barray!vec_base_t killAdded;  // for killBits(): word index, then the bits it added
 
 @trusted
 private void accumaecp(ref GlobalOptimizer go, vec_t g,vec_t k,elem* n)
