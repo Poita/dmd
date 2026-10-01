@@ -613,13 +613,19 @@ private void flowaecp(ref GlobalOptimizer go, ref BlockOpt bo)
 
     vec_t tmp = vec_calloc(go.exptop);
     bool anychng;
+    Dirty dirty;                // only a change to the Bout of a predecessor changes Bin
+    dirty.init(bo.dfo.length);
     do
     {
         anychng = false;
 
         // For all blocks except startblock
-        foreach (b; bo.dfo[1 .. $])
+        foreach (i, b; bo.dfo[1 .. $])
         {
+            if (!dirty.p[i + 1])
+                continue;
+            dirty.p[i + 1] = false;
+
             // Bin = & of Bout of all predecessors
             // Bout = (Bin - Bkill) | Bgen
 
@@ -658,48 +664,39 @@ private void flowaecp(ref GlobalOptimizer go, ref BlockOpt bo)
                 vec_clear(b.Bin);
             }
 
-            if (anychng)
-            {
-                vec_sub(b.Bout,b.Bin,b.Bkill);
-                vec_orass(b.Bout,b.Bgen);
-            }
-            else
-            {
-                vec_sub(tmp,b.Bin,b.Bkill);
-                vec_orass(tmp,b.Bgen);
-                if (!vec_equal(tmp,b.Bout))
-                {   // Swap Bout and tmp instead of
-                    // copying tmp over Bout
-                    vec_t v = tmp;
-                    tmp = b.Bout;
-                    b.Bout = v;
-                    anychng = true;
-                }
+            bool changed;
+            vec_sub(tmp,b.Bin,b.Bkill);
+            vec_orass(tmp,b.Bgen);
+            if (!vec_equal(tmp,b.Bout))
+            {   // Swap Bout and tmp instead of
+                // copying tmp over Bout
+                vec_t v = tmp;
+                tmp = b.Bout;
+                b.Bout = v;
+                changed = true;
             }
 
             if (b.bc == BC.iftrue)
             {   // Bout2 = (Bin - Bkill2) | Bgen2
-                if (anychng)
-                {
-                    vec_sub(b.Bout2,b.Bin,b.Bkill2);
-                    vec_orass(b.Bout2,b.Bgen2);
+                vec_sub(tmp,b.Bin,b.Bkill2);
+                vec_orass(tmp,b.Bgen2);
+                if (!vec_equal(tmp,b.Bout2))
+                {   // Swap Bout2 and tmp instead of
+                    // copying tmp over Bout2
+                    vec_t v = tmp;
+                    tmp = b.Bout2;
+                    b.Bout2 = v;
+                    changed = true;
                 }
-                else
-                {
-                    vec_sub(tmp,b.Bin,b.Bkill2);
-                    vec_orass(tmp,b.Bgen2);
-                    if (!vec_equal(tmp,b.Bout2))
-                    {   // Swap Bout and tmp instead of
-                        // copying tmp over Bout2
-                        vec_t v = tmp;
-                        tmp = b.Bout2;
-                        b.Bout2 = v;
-                        anychng = true;
-                    }
-                }
+            }
+            if (changed)
+            {
+                anychng = true;
+                dirty.mark(bo, b.Bsucc[]);
             }
         }
     } while (anychng);
+    dirty.free();
     vec_free(tmp);
 }
 
