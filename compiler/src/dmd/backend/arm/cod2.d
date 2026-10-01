@@ -286,6 +286,63 @@ void cdorth(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         }
     }
 
+    /* Combine with an operand shifted by a constant:
+     *  ADD/SUB/AND/ORR/EOR Rd,Rn,Rm,LSL/LSR/ASR #shift
+     */
+    if ((e.Eoper == OPadd || e.Eoper == OPmin || e.Eoper == OPand || e.Eoper == OPor || e.Eoper == OPxor) &&
+        (tyintegral(ty) || typtr(ty)) && (sz == 4 || sz == 8) && _tysize[ty1] == sz && _tysize[ty2] == sz &&
+        !isRegisterPair(true, ty, 0) &&
+        !(pretregs & mPSW && (e.Eoper == OPor || e.Eoper == OPxor)))
+    {
+        static bool isShift(elem* x, uint sz)
+        {
+            return (x.Eoper == OPshl || x.Eoper == OPshr || x.Eoper == OPashr) && !x.Ecount &&
+                   x.E2.Eoper == OPconst && el_tolong(x.E2) >= 1 && el_tolong(x.E2) < sz * 8 &&
+                   _tysize[tybasic(x.Ety)] == sz && tyintegral(x.E1.Ety) && _tysize[tybasic(x.E1.Ety)] == sz;
+        }
+        elem* eother = e1;
+        elem* esh = e2;
+        if (!isShift(esh, sz) && e.Eoper != OPmin && isShift(e1, sz))
+        {
+            eother = e2;
+            esh = e1;
+        }
+        if (isShift(esh, sz))
+        {
+            const uint imm6 = cast(uint)el_tolong(esh.E2);
+            const uint shiftType = esh.Eoper == OPshl ? 0 : esh.Eoper == OPshr ? 1 : 2;   // LSL, LSR, ASR
+            elem* x = esh.E1;
+            const PSW = pretregs & mPSW;
+            regm_t retregs1 = cg.allregs;
+            codelem(cg, cdb, eother, retregs1, !el_sideeffect(x));
+            const reg_t Rn = findreg(retregs1);
+            regm_t retregs2 = readOnlyRegs2(eother, x, cg.allregs, retregs1);
+            scodelem(cg, cdb, x, retregs2, retregs1, true);
+            const reg_t Rm = findreg(retregs2);
+            regm_t retregs = pretregs & cg.allregs;
+            if (retregs == 0)
+                retregs = cg.allregs;
+            const reg_t Rd = allocreg(cdb, retregs, ty);
+            const uint sf = sz == 8;
+            uint ins;
+            switch (e.Eoper)
+            {
+                case OPadd: ins = INSTR.addsub_shift(sf, 0, PSW != 0, shiftType, Rm, imm6, Rn, Rd); break;
+                case OPmin: ins = INSTR.addsub_shift(sf, 1, PSW != 0, shiftType, Rm, imm6, Rn, Rd); break;
+                case OPand: ins = INSTR.log_shift(sf, PSW ? 3 : 0, shiftType, 0, Rm, imm6, Rn, Rd); break;
+                case OPor:  ins = INSTR.log_shift(sf, 1, shiftType, 0, Rm, imm6, Rn, Rd); break;
+                case OPxor: ins = INSTR.log_shift(sf, 2, shiftType, 0, Rm, imm6, Rn, Rd); break;
+                default: assert(0);
+            }
+            cdb.gen1(ins);
+            freenode(esh.E2);
+            freenode(esh);
+            pretregs = retregs | PSW;
+            fixresult(cg,cdb,e,mask(Rd),pretregs);
+            return;
+        }
+    }
+
     regm_t posregs = tyfloating(ty1) ? INSTR.FLOATREGS : cg.allregs;
 
     /* The operands are only read, as the result goes to Rd, except that a

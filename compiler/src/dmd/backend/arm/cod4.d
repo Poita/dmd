@@ -514,8 +514,24 @@ void cdaddass(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
     }
     else // evaluate e2 into register
     {
+        /* An operand shifted by a constant is shifted by the instruction:
+         *  ADD/SUB/AND/ORR/EOR reg1,reg1,reg2,LSL/LSR/ASR #shift
+         */
+        const bool shifted = (sz == 4 || sz == 8) &&
+            (e2.Eoper == OPshl || e2.Eoper == OPshr || e2.Eoper == OPashr) && !e2.Ecount &&
+            e2.E2.Eoper == OPconst && el_tolong(e2.E2) >= 1 && el_tolong(e2.E2) < sz * 8 &&
+            _tysize[tybasic(e2.Ety)] == sz && tyintegral(e2.E1.Ety) && _tysize[tybasic(e2.E1.Ety)] == sz;
+        const uint shiftType = !shifted ? 0 : e2.Eoper == OPshl ? 0 : e2.Eoper == OPshr ? 1 : 2;   // LSL, LSR, ASR
+        const uint imm6 = shifted ? cast(uint)el_tolong(e2.E2) : 0;
         retregs = cg.allregs;                        // pick working reg
-        scodelem(cg,cdb,e.E2,retregs,0,true);   // get rvalue
+        if (shifted)
+        {
+            scodelem(cg,cdb,e2.E1,retregs,0,true);   // get the operand of the shift
+            freenode(e2.E2);
+            freenode(e2);
+        }
+        else
+            scodelem(cg,cdb,e.E2,retregs,0,true);   // get rvalue
         getlvalue(cg,cdb,cs,e1,retregs);                // get lvalue
         reg_t reg1;
         //printf("cs.reg: %s cs.base: %s cs.index: %s\n", regm_str(mask(cs.reg)), regm_str(mask(cs.base)), regm_str(mask(cs.index)));
@@ -545,22 +561,24 @@ void cdaddass(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         switch (op)                   // select instruction opcodes
         {
             case OPaddass:
-                ins = INSTR.addsub_ext(sf,0,S,opt,Rm,option,imm3,Rn,Rd); // ADD/ADDS
+                ins = shifted ? INSTR.addsub_shift(sf,0,S,shiftType,Rm,imm6,Rn,Rd)
+                              : INSTR.addsub_ext(sf,0,S,opt,Rm,option,imm3,Rn,Rd); // ADD/ADDS
                 pretregs &= ~mPSW;                                       // flags are already set
                 break;
             case OPminass:
-                ins = INSTR.addsub_ext(sf,1,S,opt,Rm,option,imm3,Rn,Rd); // SUB/SUBS
+                ins = shifted ? INSTR.addsub_shift(sf,1,S,shiftType,Rm,imm6,Rn,Rd)
+                              : INSTR.addsub_ext(sf,1,S,opt,Rm,option,imm3,Rn,Rd); // SUB/SUBS
                 pretregs &= ~mPSW;                                       // flags are already set
                 break;
             case OPandass:
-                ins = INSTR.log_shift(sf,S?3:0,0,0,Rm,0,Rn,Rd);  // AND/ANDS
+                ins = INSTR.log_shift(sf,S?3:0,shiftType,0,Rm,imm6,Rn,Rd);  // AND/ANDS
                 pretregs &= ~mPSW;                               // flags are already set
                 break;
             case OPorass:
-                ins = INSTR.log_shift(sf,1,0,0,Rm,0,Rn,Rd);      // ORR
+                ins = INSTR.log_shift(sf,1,shiftType,0,Rm,imm6,Rn,Rd);      // ORR
                 break;
             case OPxorass:
-                ins = INSTR.log_shift(sf,2,0,0,Rm,0,Rn,Rd);      // EOR
+                ins = INSTR.log_shift(sf,2,shiftType,0,Rm,imm6,Rn,Rd);      // EOR
                 break;
             default:
                 assert(0);
