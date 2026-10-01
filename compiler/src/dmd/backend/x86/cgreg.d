@@ -1042,6 +1042,28 @@ int cgreg_assign(ref CGstate cg, Symbol* retsym)
             : 0;
     }
 
+    /* The registers of a return value that takes two or more registers, which
+     * are not given to register variables, as the return value is computed
+     * into all of them at once
+     */
+    regm_t retMultiRegs = 0;
+    if (AArch64 && funcsym_p.Stype.Tnext)
+    {
+        import dmd.backend.arm.cod1 : aarch64Aggregate, aggregateRetRegs;
+        type* tret = funcsym_p.Stype.Tnext;
+        const tyr = tybasic(tret.Tty);
+        if (tycomplex(tyr))
+            retMultiRegs = mask(32) | mask(33);
+        else if (tyaggregate(tyr))
+        {
+            const a = aarch64Aggregate(tret);
+            if (a.nregs > 1)
+                retMultiRegs = aggregateRetRegs(a);
+        }
+        else if (_tysize[tyr] == 2 * REGSIZE)
+            retMultiRegs = mask(0) | mask(1);
+    }
+
     /* Assign registers to the most 'deserving' symbol t, then to the next most
      * deserving one with a live range apart from those of the symbols assigned
      * so far, and so on. Assigning a register changes the code generated for the
@@ -1109,6 +1131,10 @@ int cgreg_assign(ref CGstate cg, Symbol* retsym)
                 // Symbols used as return values should only be mapped into return value registers
                 if (s == retsym && !(reg == dst_integer_reg || reg == dst_float_reg))
                     continue;
+
+                // The registers a value is returned in as a pair or more are needed for it
+                if (retMultiRegs & mask(reg))
+                    continue;
     
                 // If BP isn't available, can't assign to it
                 if (!AArch64 && reg == BP && !(cg.allregs & mBP))
@@ -1157,7 +1183,8 @@ int cgreg_assign(ref CGstate cg, Symbol* retsym)
                     // Now assign MSW
                     foreach (r2; pseqmsw[])
                     {
-                        if (r2 == reg)              // can't assign msw and lsw to same reg
+                        if (r2 == reg ||            // can't assign msw and lsw to same reg
+                            retMultiRegs & mask(r2))
                             continue;
                         if ((s.Sclass == SC.fastpar || s.Sclass == SC.shadowreg) &&
                             (1UL << r2) & regparams &&
