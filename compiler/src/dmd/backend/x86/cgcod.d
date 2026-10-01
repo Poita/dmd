@@ -2039,8 +2039,14 @@ L3:
             regm_t PAIR = AArch64 ? 1|2 : mAX | mDX;
             if (!(pair && outretregs == PAIR))
             {
-                retregs = (outretregs &= ~(retregs & cg.regcon.mvar));
-                goto L1;                // try other registers
+                /* Try other registers. On AArch64 leave out all the register
+                 * variables at once, as there can be more of them than tries
+                 */
+                regm_t conflict = retregs & cg.regcon.mvar;
+                if (AArch64 && outretregs & ~cg.regcon.mvar)
+                    conflict = cg.regcon.mvar;
+                retregs = (outretregs &= ~conflict);
+                goto L1;
             }
         }
         outretregs = retregs;
