@@ -1302,6 +1302,39 @@ void cdcmp(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
 
     switch (e2.Eoper)
     {
+        case OPconst:
+            /* Compare with a constant that fits an immediate field:
+             *  CMP Rn,#imm12{, LSL #12}
+             *  CMN Rn,#imm12{, LSL #12}       for a negative constant
+             */
+            if (!isPair && (sz == 4 || sz == 8) && (tyintegral(tym) || typtr(tym)))
+            {
+                long c = el_tolong(e2);
+                if (sz == 4)
+                    c = cast(int)c;
+                uint subs = 1;                          // SUBS
+                if (c < 0 && c != long.min && !(sz == 4 && c == int.min))
+                {
+                    c = -c;
+                    subs = 0;                           // ADDS, which sets the same flags
+                }
+                uint sh = 0;
+                if (c >= 0x1000 && (c & 0xFFF) == 0)
+                {
+                    c >>= 12;
+                    sh = 1;
+                }
+                if (c >= 0 && c < 0x1000)
+                {
+                    scodelem(cg,cdb,e1,retregs,0,true);    // compute left leaf
+                    reg = findreg(retregs);
+                    cdb.gen1(INSTR.addsub_imm(sz == 8, subs, 1, sh, cast(uint)c, reg, 31));   // CMP/CMN reg,#c
+                    freenode(e2);
+                    break;
+                }
+            }
+            goto default;
+
         default:
             scodelem(cg,cdb,e1,retregs,0,true);        // compute left leaf
             rretregs = cg.allregs & ~retregs;
