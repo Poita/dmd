@@ -1236,6 +1236,17 @@ void cdcmp(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
 
     bool isPair = isRegisterPair(true, tym, 0);
 
+    if (tyfloating(tym) && !tycomplex(tym) && (sz == 4 || sz == 8) && e2.Eoper == OPconst &&
+        (sz == 4 ? e2.Vfloat == 0 : e2.Vdouble == 0))
+    {
+        // compare with zero, which needs no register (and -0.0 compares the same)
+        regm_t retregs1 = INSTR.FLOATREGS;
+        codelem(cg,cdb,e1,retregs1,1);
+        freenode(e2);
+        cdb.gen1(INSTR.fcmpe_float(INSTR.szToFtype(sz),0,findreg(retregs1)));    // FCMPE reg1,#0.0
+        goto L3;
+    }
+
     if (tyfloating(tym))
     {
         regm_t retregs1 = INSTR.FLOATREGS;

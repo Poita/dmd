@@ -156,6 +156,58 @@ void cdorth(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         }
     }
 
+    /* Add or subtract an operand shifted left by up to 4, extending it first
+     * if it is converted from 32 bits:
+     *  ADD/SUB Rd,Rn,Rm{, extend} {#shift}
+     */
+    if ((e.Eoper == OPadd || e.Eoper == OPmin) && (tyintegral(ty) || typtr(ty)) && (sz == 4 || sz == 8) &&
+        _tysize[ty1] == sz && !isRegisterPair(true, ty, 0))
+    {
+        static bool isSmallShift(elem* x, uint sz)
+        {
+            return x.Eoper == OPshl && !x.Ecount && x.E2.Eoper == OPconst &&
+                   el_tolong(x.E2) >= 1 && el_tolong(x.E2) <= 4 &&
+                   _tysize[tybasic(x.Ety)] == sz && tyintegral(x.E1.Ety) && _tysize[tybasic(x.E1.Ety)] == sz;
+        }
+        elem* eadd = e1;
+        elem* esh = e2;
+        if (!isSmallShift(esh, sz) && e.Eoper == OPadd && isSmallShift(e1, sz) && _tysize[ty2] == sz)
+        {
+            eadd = e2;
+            esh = e1;
+        }
+        if (isSmallShift(esh, sz) && _tysize[tybasic(eadd.Ety)] == sz)
+        {
+            const uint shift = cast(uint)el_tolong(esh.E2);
+            elem* x = esh.E1;
+            Extend option = sz == 8 ? Extend.LSL : Extend.UXTW;
+            if (sz == 8 && (x.Eoper == OPu32_64 || x.Eoper == OPs32_64) && !x.Ecount)
+            {
+                option = x.Eoper == OPu32_64 ? Extend.UXTW : Extend.SXTW;
+                elem* xx = x.E1;
+                freenode(x);
+                x = xx;
+            }
+            const PSW = pretregs & mPSW;
+            regm_t retregs1 = cg.allregs;
+            codelem(cg, cdb, eadd, retregs1, !el_sideeffect(x));
+            const reg_t Rn = findreg(retregs1);
+            regm_t retregs2 = readOnlyRegs2(eadd, x, cg.allregs, retregs1);
+            scodelem(cg, cdb, x, retregs2, retregs1, true);
+            const reg_t Rm = findreg(retregs2);
+            regm_t retregs = pretregs & cg.allregs;
+            if (retregs == 0)
+                retregs = cg.allregs;
+            const reg_t Rd = allocreg(cdb, retregs, ty);
+            cdb.gen1(INSTR.addsub_ext(sz == 8, e.Eoper == OPmin, PSW != 0, 0, Rm, option, shift, Rn, Rd));
+            freenode(esh.E2);
+            freenode(esh);
+            pretregs = retregs | PSW;
+            fixresult(cg,cdb,e,mask(Rd),pretregs);
+            return;
+        }
+    }
+
     regm_t posregs = tyfloating(ty1) ? INSTR.FLOATREGS : cg.allregs;
 
     /* The operands are only read, as the result goes to Rd, except that a
@@ -514,6 +566,52 @@ void cdmul(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         }
         cdorth(cg, cdb, e, pretregs);
         return;
+    }
+
+    /* Multiply two 32 bit values extended to 64 bits with
+     *  UMULL/SMULL Xd,Wn,Wm
+     */
+    if (sz == 8 && tyintegral(ty) && (e1.Eoper == OPu32_64 || e1.Eoper == OPs32_64) && !e1.Ecount)
+    {
+        const conv = e1.Eoper;
+        bool fits(elem* x)
+        {
+            if (x.Eoper == conv && !x.Ecount)
+                return true;
+            if (x.Eoper != OPconst)
+                return false;
+            const c = el_tolong(x);
+            return conv == OPu32_64 ? c >= 0 && c <= uint.max : c >= int.min && c <= int.max;
+        }
+        if (fits(e2))
+        {
+            elem* x1 = e1.E1;
+            freenode(e1);
+            elem* x2;
+            if (e2.Eoper == OPconst)
+            {
+                x2 = e2;
+                x2.Ety = conv == OPu32_64 ? TYuint : TYint;
+            }
+            else
+            {
+                x2 = e2.E1;
+                freenode(e2);
+            }
+            regm_t retregs1 = cg.allregs;
+            codelem(cg, cdb, x1, retregs1, !el_sideeffect(x2));
+            regm_t retregs2 = readOnlyRegs2(x1, x2, cg.allregs, retregs1);
+            scodelem(cg, cdb, x2, retregs2, retregs1, true);
+            regm_t retregs = pretregs & cg.allregs;
+            if (retregs == 0)
+                retregs = INSTR.ALLREGS & cg.allregs;
+            const reg_t Rd = allocreg(cdb, retregs, ty);
+            // https://www.scs.stanford.edu/~zyedidia/arm64/umaddl.html
+            cdb.gen1(INSTR.dp_3src(1, 0, conv == OPu32_64 ? 5 : 1, findreg(retregs2), 0, 31,
+                                   findreg(retregs1), Rd));    // UMULL/SMULL Rd,Rn,Rm
+            fixresult(cg,cdb,e,retregs,pretregs);
+            return;
+        }
     }
 
     regm_t posregs = cg.allregs;
