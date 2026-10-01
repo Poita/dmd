@@ -86,6 +86,20 @@ int doinreg(Symbol* s, elem* e)
         (OTunary(op) && OTleaf(e.E1.Eoper))
        )
         return 1;
+    /* AArch64 evaluates the condition of a selection first, and each value
+     * into its register before the selection: fine if each value is either
+     * the variable or does not refer to it
+     */
+    if (cgstate.AArch64 && op == OPcond)
+    {
+        static bool isVar(const(elem)* x, const ref Symbol s)
+        {
+            return x.Eoper == OPvar && x.Vsym is &s && x.Voffset == 0;
+        }
+        elem* ec = e.E2;
+        if ((isVar(ec.E1, *s) || !intree(*s, ec.E1)) && (isVar(ec.E2, *s) || !intree(*s, ec.E2)))
+            return 1;
+    }
     if (in_ == 1)
     {
         switch (op)

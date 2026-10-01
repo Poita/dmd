@@ -547,6 +547,11 @@ void brcombine(ref BlockOpt bo, ref uint changes)
             /* Look for [e1 IFFALSE L3,L2] L2: [e2 GOTO L3] L3: [e3]    */
             /* Replace with [(e1 && e2),e3]                             */
             const bc = b.bc;
+            if (bc == BC.iftrue && config.target_cpu == TARGET_AArch64 && selectAssign(bo, b))
+            {
+                anychanges++;
+                continue;
+            }
             if (bc == BC.iftrue)
             {
                 block* b2 = b.Bsucc[0];
@@ -653,6 +658,60 @@ void brcombine(ref BlockOpt bo, ref uint changes)
             continue;
         }
     } while (0);
+}
+
+/***********************
+ * AArch64: a block assigning a variable a value that is cheap to compute and
+ * can not fault, run only when a condition holds, becomes an assignment of a
+ * selection, which CSEL does without a branch:
+ *      [e IFTRUE L2,L3] L2: [x = y; GOTO L3]  =>  [x = e ? y : x; GOTO L3]
+ *      [e IFTRUE L3,L2] L2: [x = y; GOTO L3]  =>  [x = e ? x : y; GOTO L3]
+ * Params:
+ *      bo = block optimizer
+ *      b = the block ending in the condition
+ * Returns:
+ *      true if b was changed
+ */
+@trusted
+private bool selectAssign(ref BlockOpt bo, block* b)
+{
+    import dmd.backend.cgelem : cheapValue;
+    foreach (k; 0 .. 2)
+    {
+        block* b2 = b.Bsucc[k];         // the block assigning
+        block* b3 = b.Bsucc[1 - k];     // where both go
+        if (b2 == b3 || b2 == bo.startblock || b2.Bpred.length != 1 || b2.bc != BC.goto_ ||
+            b2.Bsucc[0] != b3 || b2.Btry != b.Btry)
+            continue;
+        elem* ea = b2.Belem;
+        if (!ea || ea.Eoper != OPeq || ea.E1.Eoper != OPvar || ea.E1.Ety & (mTYvolatile | mTYshared) ||
+            ea.E1.Vsym.ty() & (mTYvolatile | mTYshared))
+            continue;
+        const tym_t ty = tybasic(ea.Ety);
+        if (!(tyintegral(ty) && (tysize(ty) == 4 || tysize(ty) == 8) || typtr(ty) && tysize(ty) == 8 ||
+              ty == TYfloat || ty == TYdouble))
+            continue;
+        elem* y = ea.E2;
+        int budget = 8;
+        if (tybasic(y.Ety) != ty || !cheapValue(y, budget))
+            continue;
+
+        elem* x = el_copytree(ea.E1);
+        elem* colon = k == 0 ? el_bin(OPcolon, ty, y, x) : el_bin(OPcolon, ty, x, y);
+        ea.E2 = el_bin(OPcond, ty, b.Belem, colon);
+        b.Belem = ea;
+        b2.Belem = null;
+        b.bc = BC.goto_;
+        b.Bsucc.reset();
+        b.Bsucc.push(b3);
+        b3.Bpred.subtract(b2);
+        b2.Bpred.reset();
+        b2.Bsucc.reset();
+        b2.bc = BC.ret;
+        debug if (debugc) printf("selectAssign(): if e x = y => x = e ? y : x\n");
+        return true;
+    }
+    return false;
 }
 
 /***********************

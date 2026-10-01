@@ -3992,8 +3992,17 @@ static if (0)  // Doesn't work too well, removed
             return optelem(e, Goal.value);
         }
 
+        /* AArch64 selects a value that is cheap to compute without a branch,
+         * so keep x = (y ? z : x) and x = (y ? x : z) for CSEL
+         */
+        int budget = 8;
+        if (op2 == OPcond && config.target_cpu == TARGET_AArch64 &&
+            (el_match(e1,e2.E2.E2) && cheapValue(e2.E2.E1, budget) ||
+             el_match(e1,e2.E2.E1) && cheapValue(e2.E2.E2, budget)))
+        {
+        }
         // Replace (x = (y ? z : x)) with ((y && (x = z)),x)
-        if (op2 == OPcond && el_match(e1,e2.E2.E2))
+        else if (op2 == OPcond && el_match(e1,e2.E2.E2))
         {
             elem* e22 = e2.E2;         // e22 is the OPcond
             e.Eoper = OPcomma;
@@ -4010,7 +4019,7 @@ static if (0)  // Doesn't work too well, removed
         }
 
         // Replace (x = (y ? x : z)) with ((y || (x = z)),x)
-        if (op2 == OPcond && el_match(e1,e2.E2.E1))
+        else if (op2 == OPcond && el_match(e1,e2.E2.E1))
         {
             elem* e22 = e2.E2;         // e22 is the OPcond
             e.Eoper = OPcomma;
@@ -6763,3 +6772,32 @@ private immutable elfp_t[OPMAX] elxxx =
     OPva_start: &elva_start,
     OPprefetch: &elzot,
 ];
+
+/*****************************
+ * Whether x is cheap to compute, within budget operations, and can not
+ * fault or have side effects, so that it can be computed whether or not
+ * it is needed.
+ */
+@trusted
+package bool cheapValue(const(elem)* x, ref int budget)
+{
+    if (--budget < 0 || x.Ety & (mTYvolatile | mTYshared))
+        return false;
+    switch (x.Eoper)
+    {
+        case OPconst:
+            return true;
+        case OPvar:
+            return !(x.Vsym.ty() & (mTYvolatile | mTYshared));
+        case OPadd: case OPmin: case OPmul:
+        case OPand: case OPor: case OPxor:
+        case OPshl: case OPshr: case OPashr:
+            return !tycomplex(x.Ety) && cheapValue(x.E1, budget) && cheapValue(x.E2, budget);
+        case OPneg: case OPcom:
+        case OPu8_16: case OPs8_16: case OPu16_32: case OPs16_32:
+        case OPu32_64: case OPs32_64: case OP64_32: case OP32_16: case OP16_8:
+            return cheapValue(x.E1, budget);
+        default:
+            return false;
+    }
+}
