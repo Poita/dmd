@@ -101,7 +101,7 @@ void cdorth(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
      *  ADD/SUB Rd,Rn,#imm12{, LSL #12}
      */
     if ((e.Eoper == OPadd || e.Eoper == OPmin) &&
-        e2.Eoper == OPconst && tyintegral(ty) && (sz == 4 || sz == 8) &&
+        e2.Eoper == OPconst && (tyintegral(ty) || typtr(ty)) && (sz == 4 || sz == 8) &&
         _tysize[ty1] == sz && !isRegisterPair(true, ty, 0))
     {
         long c = el_tolong(e2);
@@ -1413,10 +1413,52 @@ void cdind(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         }
     }
 
+    /* Load *(p + (i << log2(sz))) or *(p + i) with LDR Rt,[Rp,Ri{, LSL #log2(sz)}]
+     */
+    elem* eindex = null;
+    uint scaled = 0;            // S field: shift the index by the size
+    if (!offset && eaddr.Eoper == OPadd && !eaddr.Ecount && !isPair && sz && sz <= 8 &&
+        tysize(eaddr.Ety) == REGSIZE && eaddr.E2.Eoper != OPconst)
+    {
+        const uint log2sz = sz == 1 ? 0 : sz == 2 ? 1 : sz == 4 ? 2 : 3;
+        bool isScaledIndex(elem* x)
+        {
+            return x.Eoper == OPshl && !x.Ecount && x.E2.Eoper == OPconst &&
+                   el_tolong(x.E2) == log2sz && tysize(x.E1.Ety) == 8;
+        }
+        elem* a = eaddr.E1;
+        elem* b = eaddr.E2;
+        if (isScaledIndex(a) && !isScaledIndex(b))
+        {
+            elem* t = a; a = b; b = t;
+        }
+        if (isScaledIndex(b) && tysize(a.Ety) == 8)
+        {
+            eindex = b.E1;
+            scaled = 1;
+            freenode(b.E2);
+            freenode(b);
+        }
+        else if (tysize(a.Ety) == 8 && tysize(b.Ety) == 8 && !tyfloating(b.Ety))
+            eindex = b;
+        if (eindex)
+        {
+            freenode(eaddr);
+            eaddr = a;
+        }
+    }
+
     const posregs = cg.allregs;
     regm_t retregs1 = posregs;
     codelem(cg,cdb,eaddr,retregs1,false);
     const Rn = findreg(retregs1);           // Rn is the pointer
+    reg_t Ri = NOREG;                       // the index register
+    if (eindex)
+    {
+        regm_t retregsi = posregs & ~retregs1;
+        scodelem(cg,cdb,eindex,retregsi,retregs1,false);
+        Ri = findreg(retregsi);
+    }
 
     if (tyfloating(tym))
     {
@@ -1445,12 +1487,15 @@ void cdind(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
                 cdb.gen1(INSTR.ldst_pos(size,1,opc,imm12+1,Rn,Rmsw));
             }
         }
-        else if (offset)
+        else if (offset || Ri != NOREG)
         {
             reg_t Rt = allocreg(cdb, retregs, tym);
             uint size, opc;
             INSTR.szToSizeOpcLdr(sz, size, opc);
-            cdb.gen1(INSTR.ldst_pos(size,1,opc,offset / sz,Rn,Rt)); // LDR Rt,[Rn,#offset]
+            if (Ri != NOREG)
+                cdb.gen1(INSTR.ldst_regoff(size,1,opc,Ri,3,scaled,Rn,Rt & 31)); // LDR Rt,[Rn,Ri{, LSL #size}]
+            else
+                cdb.gen1(INSTR.ldst_pos(size,1,opc,offset / sz,Rn,Rt)); // LDR Rt,[Rn,#offset]
         }
         else
         {
@@ -1538,8 +1583,13 @@ void cdind(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
     }
 
     uint VR = 0;
-    uint imm12 = offset >> size;
-    cdb.gen1(INSTR.ldst_pos(size,VR,opc,imm12,Rn,Rt));
+    if (Ri != NOREG)
+        cdb.gen1(INSTR.ldst_regoff(size,VR,opc,Ri,3,scaled,Rn,Rt)); // LDR Rt,[Rn,Ri{, LSL #size}]
+    else
+    {
+        uint imm12 = offset >> size;
+        cdb.gen1(INSTR.ldst_pos(size,VR,opc,imm12,Rn,Rt));
+    }
 
     fixresult(cg,cdb,e,retregs,pretregs);
 }
