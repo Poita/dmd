@@ -339,16 +339,6 @@ void optfunc(ref GlobalOptimizer go, ref BlockOpt bo)
     // We try to put a lid on it.
     clock_t starttime = clock();
     int iter = 0;           // iteration count
-
-    /* Further rounds rarely improve the code enough to pay for re-running
-     * every data flow analysis, so the optimizer stops after maxRounds.
-     */
-    enum maxRounds = 1;
-    bool anotherRound()
-    {
-        return go.changes && go.mfoptim & MFloop && iter < maxRounds &&
-            (clock() - starttime) < 30 * CLOCKS_PER_SEC;
-    }
     do
     {
         //printf("iter = %d\n", iter);
@@ -403,7 +393,7 @@ void optfunc(ref GlobalOptimizer go, ref BlockOpt bo)
 
         if (go.mfoptim & MFcnp)
             boolopt(go, bo);              // optimize boolean values
-        if (anotherRound())
+        if (go.changes && go.mfoptim & MFloop && (clock() - starttime) < 30 * CLOCKS_PER_SEC)
             continue;
 
         if (go.mfoptim & MFcnp)
@@ -445,7 +435,7 @@ void optfunc(ref GlobalOptimizer go, ref BlockOpt bo)
             rmdeadass(go, bo, go.changes); /* remove dead assignments       */
 
         if (debugc) printf("changes = %d\n", go.changes);
-        if (!anotherRound())
+        if (!(go.changes && go.mfoptim & MFloop && (clock() - starttime) < 30 * CLOCKS_PER_SEC))
             break;
     } while (1);
     if (debugc) printf("%d iterations\n",iter);

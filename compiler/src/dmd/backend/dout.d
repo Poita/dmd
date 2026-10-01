@@ -820,7 +820,7 @@ void writefunc(Symbol* sfunc)
 }
 
 /// Functions with more elem nodes than this are not globally optimized.
-enum maxOptimizedElems = 2000;
+enum maxOptimizedElems = 1500;
 
 /// Returns: whether the block list holds more than `limit` elem nodes.
 @trusted
