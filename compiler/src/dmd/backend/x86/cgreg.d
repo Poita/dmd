@@ -54,9 +54,12 @@ ref int WEIGHTS(int bi, int si) { return weights[bi * globsym.length + si]; }
 /******************************************
  */
 
+private __gshared int assignPasses;     // calls to cgreg_assign() for the function
+
 @trusted
 void cgreg_init()
 {
+    assignPasses = 0;
     if (!(config.flags4 & CFG4optimized))
         return;
 
@@ -900,6 +903,7 @@ struct Reg              // data for trial register assignment
 int cgreg_assign(ref CGstate cg, Symbol* retsym)
 {
     int flag = false;                   // assume no changes
+    ++assignPasses;
     rangeWalksUsed = 0;
     if (++rangeWalkStamp == 0)          // invalidate the walks of the last call
     {
@@ -1180,6 +1184,12 @@ int cgreg_assign(ref CGstate cg, Symbol* retsym)
                 best = i;
         }
         if (best == size_t.max)
+            break;
+        /* Each assignment after the first pass costs generating the code of the
+         * function again, so it is made only for a symbol that pays for that
+         */
+        enum minLaterBenefit = 20;
+        if (assignPasses > 1 && candidates[best].u.benefit < minLaterBenefit)
             break;
         Reg t = candidates[best].u;
         vec_copy(t.sym.Slvreg, candidates[best].lvreg);
