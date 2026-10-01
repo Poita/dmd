@@ -100,10 +100,16 @@ void loadFromEA(ref code cs, reg_t reg, uint szw, uint szr)
             }
             cs.IFL1 = FL.unde;      // no memory operand
         }
+        else if (cs.base != NOREG && cs.index != NOREG)
+        {
+            // LDR reg,[cs.base,cs.index{, extend S}]
+            uint size, opc;
+            INSTR.szToSizeOpcLdr(szw, size, opc);
+            cs.Iop = INSTR.ldst_regoff(size,1,opc,cs.index,cs.Sextend & 7,cs.Sextend >> 3,cs.base,reg & 31);
+        }
         else if (cs.base != NOREG)
         {
             // LDR reg,[cs.base, #offset]
-            assert(cs.index == NOREG);
             uint imm12 = 0; // cast(uint)cs.IEV1.Voffset added in by assignaddrc()
             uint size, opc;
             INSTR.szToSizeOpcLdr(szw, size, opc);
@@ -252,10 +258,16 @@ void storeToEA(ref code cs, reg_t reg, uint sz)
             }
             cs.IFL1 = FL.unde;
         }
+        else if (cs.base != NOREG && cs.index != NOREG)
+        {
+            // STR reg,[cs.base,cs.index{, extend S}]
+            uint size, opc;
+            INSTR.szToSizeOpcStr(sz, size, opc);
+            cs.Iop = INSTR.ldst_regoff(size,1,opc,cs.index,cs.Sextend & 7,cs.Sextend >> 3,cs.base,reg & 31);
+        }
         else if (cs.base != NOREG)
         {
             // STR reg,[cs.base, #offset]
-            assert(cs.index == NOREG);
             uint imm12 = 0; // addaddrc() will add in cast(uint)cs.IEV1.Voffset;
             uint size, opc;
             INSTR.szToSizeOpcStr(sz, size, opc);
@@ -1077,6 +1089,49 @@ void getlvalue(ref CGstate cg,ref CodeBuilder cdb,ref code pcs,elem* e,regm_t ke
              * word.
              */
             assert(e1free);
+
+            /* Store to *(p + (i << log2(sz))) or *(p + i) with
+             *      EA =    [Rp,Ri{, LSL #log2(sz)}]
+             */
+            if (rm == RM.store && e1isadd && !e1.Ecount && sz && sz <= 8 &&
+                tysize(e1ty) == REGSIZE && e12.Eoper != OPconst)
+            {
+                const uint log2sz = sz == 1 ? 0 : sz == 2 ? 1 : sz == 4 ? 2 : 3;
+                bool isScaledIndex(elem* x)
+                {
+                    return x.Eoper == OPshl && !x.Ecount && x.E2.Eoper == OPconst &&
+                           el_tolong(x.E2) == log2sz && tysize(x.E1.Ety) == 8;
+                }
+                elem* a = e11;
+                elem* b = e12;
+                if (isScaledIndex(a) && !isScaledIndex(b))
+                {
+                    elem* t = a; a = b; b = t;
+                }
+                elem* eindex = null;
+                uint scaled = 0;
+                if (isScaledIndex(b) && tysize(a.Ety) == 8)
+                {
+                    eindex = b.E1;
+                    scaled = 1;
+                    freenode(b.E2);
+                    freenode(b);
+                }
+                else if (tysize(a.Ety) == 8 && tysize(b.Ety) == 8 && !tyfloating(b.Ety))
+                    eindex = b;
+                if (eindex)
+                {
+                    scodelem(cg,cdb, a, idxregs, keepmsk, true);
+                    regm_t idxregs2 = cg.allregs & ~(idxregs | keepmsk);
+                    scodelem(cg,cdb, eindex, idxregs2, keepmsk | idxregs, true);
+                    pcs.base = findreg(idxregs);
+                    pcs.index = findreg(idxregs2);
+                    pcs.Sextend = cast(ubyte)(Extend.LSL | (scaled << 3));
+                    pcs.IFL1 = FL.const_;       // nothing for assignaddrc() to add
+                    freenode(e1);
+                    return Lptr();
+                }
+            }
 
             /* Replace *(e + c) with
              *      MOV     idxreg,e
