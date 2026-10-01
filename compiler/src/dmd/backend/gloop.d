@@ -19,7 +19,7 @@ import core.stdc.stdlib;
 import core.stdc.string;
 
 import dmd.backend.backconfig : debugc;
-import dmd.backend.blockopt : BlockOpt, bo, block_calloc, blockopt, compdfo;
+import dmd.backend.blockopt : BlockOpt, bo, block_calloc, block_pred, blockopt, compdfo;
 import dmd.backend.cc;
 import dmd.backend.cdef;
 import dmd.backend.evalu8 : el_toreald;
@@ -3684,6 +3684,188 @@ private void unrollWalker(elem* e, uint defnum, Symbol* v, targ_llong increment,
 }
 
 
+/********************************
+ * AArch64: completely unroll a loop of a few iterations whose body has
+ * branches, such as `continue` statements. Each iteration becomes a copy of
+ * the blocks of the loop, the copies following one another, with the
+ * increment of the loop variable becoming the assignment of its value, so
+ * the variable is a constant in each copy.
+ * The loop is entered only at its head, and only its tail, which tests
+ * (v < c) or (v <= c), leaves it.
+ * Params:
+ *      go = global optimizer state
+ *      bo = blocks of the function
+ *      l = loop to unroll
+ * Returns:
+ *      true if the loop was unrolled
+ */
+@trusted
+private bool unrollBranches(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
+{
+    enum log = false;
+    if (config.target_cpu != TARGET_AArch64)
+        return false;
+
+    block* head = l.Lhead;
+    block* tail = l.Ltail;
+    enum maxBlocks = 16;
+    block*[maxBlocks] blocks;
+    size_t nblocks = 0;
+    for (size_t i = 0; (i = vec_index(i, l.Lloop)) < bo.dfo.length; ++i)
+    {
+        block* b = bo.dfo[i];
+        if (nblocks == maxBlocks || b.Btry || (b.bc != BC.goto_ && b.bc != BC.iftrue) ||
+            (b != tail && vec_testbit(b.Bdfoidx, l.Lexit)))
+            return false;
+        blocks[nblocks++] = b;
+    }
+    bool inLoop(block* b) { return vec_testbit(b.Bdfoidx, l.Lloop) != 0; }
+    size_t indexOf(block* b)
+    {
+        foreach (i; 0 .. nblocks)
+            if (blocks[i] is b)
+                return i;
+        assert(0);
+    }
+
+    // entered only at the head, and the only back edge is from the tail
+    foreach (b; blocks[0 .. nblocks])
+        foreach (p; b.Bpred[])
+            if (b is head ? inLoop(p) && p !is tail : !inLoop(p))
+                return false;
+
+    // the tail branches back to the head while (v < c)
+    if (tail.bc != BC.iftrue || tail.Bsucc.length != 2 || tail.Bsucc[0] !is head || inLoop(tail.Bsucc[1]))
+        return false;
+    block* exit = tail.Bsucc[1];
+    elem* erel = tail.Belem;
+    while (erel.Eoper == OPcomma)
+        erel = erel.E2;
+    if ((erel.Eoper != OPlt && erel.Eoper != OPle) || erel.E1.Eoper != OPvar || erel.E2.Eoper != OPconst ||
+        !tyintegral(erel.E1.Ety) || tysize(erel.E1.Ety) > targ_llong.sizeof)
+        return false;
+    Symbol* v = erel.E1.Vsym;
+    if (!(sytab[v.Sclass] & SCRD) || !(v.Sflags & SFLdistinct))
+        return false;
+
+    elem* einitial;
+    elem* eincrement;
+    if (!findloopparameters(go, erel, einitial, eincrement))
+        return false;
+    if (einitial.E2.Eoper != OPconst || eincrement.Eoper != OPaddass || eincrement.E2.Eoper != OPconst ||
+        eincrement.E1.Voffset != erel.E1.Voffset)
+        return false;
+    const targ_llong initial = el_tolong(einitial.E2);
+    const targ_llong increment = el_tolong(eincrement.E2);
+    targ_llong final_ = el_tolong(erel.E2);
+    if (erel.Eoper == OPle)
+        ++final_;
+    if (initial < 0 && tyuns(erel.E1.Ety) || increment <= 0 || final_ <= initial ||
+        (final_ - initial) % increment)
+        return false;
+    const targ_llong n = (final_ - initial) / increment;
+    enum maxIterations = 8;
+    int cost = 0;
+    foreach (b; blocks[0 .. nblocks])
+        cost += b.Belem ? el_length(b.Belem) : 0;
+    if (n < 2 || n > maxIterations || cost * n > 400)
+        return false;
+
+    // the block with the increment
+    static bool contains(elem* e, elem* x)
+    {
+        if (e is x)
+            return true;
+        if (OTbinary(e.Eoper))
+            return contains(e.E1, x) || contains(e.E2, x);
+        if (OTunary(e.Eoper))
+            return contains(e.E1, x);
+        return false;
+    }
+    size_t incBlock = nblocks;
+    foreach (i, b; blocks[0 .. nblocks])
+        if (b.Belem && contains(b.Belem, eincrement))
+            incBlock = i;
+    if (incBlock == nblocks)
+        return false;
+
+    if (log) printf("unrollBranches() %d blocks, %d iterations\n", cast(int)nblocks, cast(int)n);
+
+    // the node of copy that corresponds to x in e, of which copy is a copy
+    static elem* corresponding(elem* e, elem* copy, elem* x)
+    {
+        if (e is x)
+            return copy;
+        if (OTbinary(e.Eoper))
+        {
+            if (auto r = corresponding(e.E1, copy.E1, x))
+                return r;
+            return corresponding(e.E2, copy.E2, x);
+        }
+        if (OTunary(e.Eoper))
+            return corresponding(e.E1, copy.E1, x);
+        return null;
+    }
+
+    // the increment of iteration k assigns the value of v for the next iteration
+    static void assignValue(elem* inc, targ_llong value)
+    {
+        inc.Eoper = OPeq;
+        inc.E2.Vllong = value;
+    }
+
+    // the copies of the blocks of each iteration after the first, in order after the loop's blocks
+    block*[maxBlocks][maxIterations] copies;
+    foreach (i; 0 .. nblocks)
+        copies[0][i] = blocks[i];
+    // the copies go after the last block of the loop in the list of blocks
+    block* last = blocks[0];
+    foreach (b; blocks[1 .. nblocks])
+        for (block* bn = last.Bnext; bn; bn = bn.Bnext)
+            if (bn is b)
+            {
+                last = b;
+                break;
+            }
+    foreach (k; 1 .. cast(size_t)n)
+    {
+        foreach (i, b; blocks[0 .. nblocks])
+        {
+            block* c = block_calloc(bo);
+            c.bc = b.bc;
+            c.Belem = b.Belem ? el_copytree(b.Belem) : null;
+            c.Bsrcpos = b.Bsrcpos;
+            c.Bflags = b.Bflags;
+            c.Bweight = b.Bweight;
+            c.Balign = b.Balign;
+            c.Bnext = last.Bnext;
+            last.Bnext = c;
+            last = c;
+            copies[k][i] = c;
+        }
+        foreach (i, b; blocks[0 .. nblocks])
+            foreach (s; b.Bsucc[])
+                copies[k][i].Bsucc.push(inLoop(s) ? copies[k][indexOf(s)] : s);
+        elem* inc = corresponding(blocks[incBlock].Belem, copies[k][incBlock].Belem, eincrement);
+        assert(inc);
+        assignValue(inc, initial + (k + 1) * increment);
+    }
+    assignValue(eincrement, initial + increment);
+
+    // the tail of each iteration goes on to the next iteration, the last one leaves
+    const tailIndex = indexOf(tail);
+    foreach (k; 0 .. cast(size_t)n)
+    {
+        block* t = copies[k][tailIndex];
+        t.Bsucc.reset();
+        t.Bsucc.push(k + 1 < n ? copies[k + 1][indexOf(head)] : exit);
+        t.bc = BC.goto_;
+    }
+    block_pred(bo.startblock);
+    go.changes++;
+    return true;
+}
+
 /*********************************
  * Unroll loop if possible.
  * Params:
@@ -3737,19 +3919,19 @@ bool loopunroll(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
             if (b.bc != BC.goto_ || b.Bsucc.length != 1 || b.Btry)
             {
                 if (log) printf("\tnot 2 blocks, but %d\n", numblocks);
-                return false;
+                return unrollBranches(go, bo, l);
             }
             b = b.Bsucc[0];
             if (!vec_testbit(b.Bdfoidx, l.Lloop) || (b != l.Ltail && b.Bpred.length != 1) || ++n > numblocks)
             {
                 if (log) printf("\tnot 2 blocks, but %d\n", numblocks);
-                return false;
+                return unrollBranches(go, bo, l);
             }
         }
         if (n != numblocks)
         {
             if (log) printf("\tnot a straight line of %d blocks\n", numblocks);
-            return false;
+            return unrollBranches(go, bo, l);
         }
         for (block* b = l.Lhead.Bsucc[0]; b != l.Ltail; b = b.Bsucc[0])
         {
@@ -3839,7 +4021,8 @@ bool loopunroll(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
     if (etail.Eoper == OPle)
         ++final_;
 
-    if (initial < 0 ||
+    // a negative initial value needs a signed compare
+    if (initial < 0 && tyuns(etail.E1.Ety) ||
         final_ < initial ||
         increment <= 0 ||
         (final_ - initial) % increment)
