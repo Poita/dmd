@@ -705,17 +705,16 @@ void floatOpAss(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
     reg_t rreg = findreg(retregs2);
 
     bool regvar = false;
-    if (0 && config.flags4 & CFG4optimized) // TODO AArch64
+    if (config.flags4 & CFG4optimized)
     {
-        // Be careful of cases like (x = x+x+x). We cannot evaluate in
-        // x if x is in a register.
+        /* Compute directly in a register variable, as e2 is already evaluated
+         */
         reg_t varreg;
         regm_t varregm;
-        if (isregvar(e1,varregm,varreg) && // if lvalue is register variable
-            doinreg(e1.Vsym,e2)            // and we can compute directly into it
-           )
+        if (!isPair && sz1 <= 8 && e1.Eoper == OPvar &&
+            tysize(e1.Ety) == tysize(e1.Vsym.Stype.Tty) &&
+            isregvar(e1,varregm,varreg) && varregm & INSTR.FLOATREGS)
         {
-            assert(!isPair);            // TODO AArch64
             regvar = true;
             retregs = varregm;
             reg = varreg;               // evaluate directly in target register
