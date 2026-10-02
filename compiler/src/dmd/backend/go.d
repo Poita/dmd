@@ -398,8 +398,9 @@ void optfunc(ref GlobalOptimizer go, ref BlockOpt bo)
         if (go.changes && go.mfoptim & MFloop && (clock() - starttime) < 30 * CLOCKS_PER_SEC)
             continue;
 
-        if (go.mfoptim & MFcnp)
-            constprop(go, bo, go.changes); /* constant propagation          */
+        /* Constant propagation ran in this round already, and nothing has
+         * changed since
+         */
         if (go.mfoptim & MFcp)
             copyprop(go, bo);           /* do copy propagation           */
 
