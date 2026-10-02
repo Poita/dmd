@@ -29,7 +29,6 @@ import dmd.backend.cgelem : doptelem, elemisone;
 import dmd.backend.debugprint : WReqn, WRfunc, tym_str;
 import dmd.backend.evalu8 : evalu8, iftrue;
 import dmd.backend.go;
-import dmd.backend.gflow : numberDefs;
 import dmd.backend.el;
 import dmd.backend.symbol;
 import dmd.backend.ty;
@@ -675,11 +674,10 @@ private __gshared
      * marking needs them, which is rare, from the trees as they are then
      */
     bool aeStale;
-    /* Induction variable elimination needs only go.defnod[], and the live
-     * variables only when there are variables to eliminate: what it does not
-     * compute is left to be computed when needed
+    /* Induction variable elimination needs the live variables only when
+     * there are variables to eliminate: what it does not compute is left to
+     * be computed when needed
      */
-    bool defsValid;         // go.defnod[] is up to date
     bool rdValid;           // the reaching definitions are up to date
     bool lvValid;           // the live variables are up to date
 }
@@ -843,17 +841,17 @@ restart:
         assert(l.Lpreheader);
         if (doflow)
         {
-            defsValid = rdValid = lvValid = false;
+            rdValid = lvValid = false;
             aeStale = true;         // available expressions when needed
             doflow = false;         /* no need to redo it           */
         }
         if (!rdValid || !lvValid)
         {
             if (!rdValid)
-                flowrd(go, bo, defsValid);  /* compute reaching definitions  */
+                flowrd(go, bo);     /* compute reaching definitions  */
             if (!lvValid)
                 flowlv(bo);         /* compute live variables        */
-            defsValid = rdValid = lvValid = true;
+            rdValid = lvValid = true;
             if (go.defnod.length == 0)     /* if no definition elems       */
                 break;              /* no need to optimize          */
         }
@@ -2032,15 +2030,11 @@ private void loopiv(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
     elimspec(go, l, bo.dfo);
     if (doflow)
     {
-        defsValid = rdValid = lvValid = false;
+        rdValid = lvValid = false;
         aeStale = true;         // available expressions when needed
         doflow = false;
     }
-    if (!defsValid)
-    {
-        numberDefs(go, bo);     // the definition elems
-        defsValid = true;
-    }
+    collectLoopDefs(l, bo.dfo[]);
     findbasivs(go, l);          /* find basic induction variables       */
     findopeqs(go, l);           // find op= variables
     if (!lvValid && (l.Livlist.length || l.Lopeqlist.length))
@@ -2067,6 +2061,43 @@ private void loopiv(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
     /* upon return to optfunc()                                   */
 }
 
+/// The definition elems of the loop being optimized, in the order of go.defnod[]
+private __gshared Barray!DefNode loopDefs;
+
+/*************************************
+ * Fill in loopDefs[] with the definition elems of loop l, without numbering
+ * the definitions of the whole function.
+ */
+@trusted
+private void collectLoopDefs(ref Loop l, block*[] dfo)
+{
+    /* Appends the definitions of e in execution order, which is the order
+     * of go.defnod[]
+     */
+    static void walk(block* b, elem* e)
+    {
+        if (ERTOL(e))
+        {
+            walk(b, e.E2);
+            walk(b, e.E1);
+        }
+        else if (OTbinary(e.Eoper))
+        {
+            walk(b, e.E1);
+            walk(b, e.E2);
+        }
+        else if (OTunary(e.Eoper))
+            walk(b, e.E1);
+        if (OTdef(e.Eoper))
+            loopDefs.push(DefNode(e, b));
+    }
+
+    loopDefs.setLength(0);
+    foreach (b; dfo)
+        if (b.Belem && vec_testbit(b.Bdfoidx, l.Lloop))
+            walk(b, b.Belem);
+}
+
 /*************************************
  * Find basic IVs of loop l.
  * A basic IV x of loop l is a variable x which has
@@ -2074,7 +2105,7 @@ private void loopiv(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
  * x += c or x -= c, where c is either a constant
  * or a LI.
  * Input:
- *      go.defnod[] loaded with all the definition elems of the loop
+ *      loopDefs[] loaded with all the definition elems of the loop
  */
 
 @trusted
@@ -2089,14 +2120,9 @@ private void findbasivs(ref GlobalOptimizer go, ref Loop l)
     notposs = vec_calloc(globsym.length);  /* vector of all variables      */
                                         /* (initially all unmarked)     */
 
-    /* for each def in go.defnod[] that is within loop l     */
-
-    foreach (const i; 0 .. go.defnod.length)
+    foreach (ref dn; loopDefs[])  // for each def within loop l
     {
-        if (!vec_testbit(go.defnod[i].DNblock.Bdfoidx,l.Lloop))
-            continue;               /* def is not in the loop       */
-
-        n = go.defnod[i].DNelem;
+        n = dn.DNelem;
         elem_debug(n);
         if (OTassign(n.Eoper) && n.E1.Eoper == OPvar)
         {
@@ -2181,15 +2207,13 @@ private void findbasivs(ref GlobalOptimizer go, ref Loop l)
         /* We have the sym idx of the basic IV. We need to find         */
         /* the parent of the increment elem for it.                     */
 
-        /* First find the go.defnod[]      */
-        foreach (j; 0 .. go.defnod.length)
+        /* First find the def in the loop      */
+        foreach (ref dn; loopDefs[])
         {
-            /* If go.defnod is a def of i and it is in the loop        */
-            if (go.defnod[j].DNelem.E1 &&     /* OPasm are def nodes  */
-                go.defnod[j].DNelem.E1.Vsym == s &&
-                vec_testbit(go.defnod[j].DNblock.Bdfoidx,l.Lloop))
+            if (dn.DNelem.E1 &&       /* OPasm are def nodes  */
+                dn.DNelem.E1.Vsym == s)
             {
-                biv.IVincr = el_parent(go.defnod[j].DNelem, go.defnod[j].DNblock.Belem);
+                biv.IVincr = el_parent(dn.DNelem, dn.DNblock.Belem);
                 assert(s == (*biv.IVincr).E1.Vsym);
 
                 debug if (debugc)
@@ -2214,7 +2238,7 @@ private void findbasivs(ref GlobalOptimizer go, ref Loop l)
  * Analogous to findbasivs().
  * Used to eliminate useless loop code normally found in benchmark programs.
  * Input:
- *      go.defnod[] loaded with all the definition elems of the loop
+ *      loopDefs[] loaded with all the definition elems of the loop
  */
 
 @trusted
@@ -2229,14 +2253,9 @@ private void findopeqs(ref GlobalOptimizer go, ref Loop l)
     notposs = vec_calloc(globsym.length);  // vector of all variables
                                         // (initially all unmarked)
 
-    // for each def in go.defnod[] that is within loop l
-
-    foreach (i; 0 .. go.defnod.length)
+    foreach (ref dn; loopDefs[])  // for each def within loop l
     {
-        if (!vec_testbit(go.defnod[i].DNblock.Bdfoidx,l.Lloop))
-            continue;               // def is not in the loop
-
-        n = go.defnod[i].DNelem;
+        n = dn.DNelem;
         elem_debug(n);
         if (OTopeq(n.Eoper) && n.E1.Eoper == OPvar)
         {
@@ -2317,15 +2336,13 @@ private void findopeqs(ref GlobalOptimizer go, ref Loop l)
         // We have the sym idx of the basic IV. We need to find
         // the parent of the increment elem for it.
 
-        // First find the go.defnod[]
-        foreach (j; 0 .. go.defnod.length)
+        // First find the def in the loop
+        foreach (ref dn; loopDefs[])
         {
-            // If go.defnod is a def of i and it is in the loop
-            if (go.defnod[j].DNelem.E1 &&     // OPasm are def nodes
-                go.defnod[j].DNelem.E1.Vsym == s &&
-                vec_testbit(go.defnod[j].DNblock.Bdfoidx,l.Lloop))
+            if (dn.DNelem.E1 &&       // OPasm are def nodes
+                dn.DNelem.E1.Vsym == s)
             {
-                biv.IVincr = el_parent(go.defnod[j].DNelem, go.defnod[j].DNblock.Belem);
+                biv.IVincr = el_parent(dn.DNelem, dn.DNblock.Belem);
                 assert(s == (*biv.IVincr).E1.Vsym);
 
                 debug if (debugc)

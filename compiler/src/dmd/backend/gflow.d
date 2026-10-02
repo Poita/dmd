@@ -79,9 +79,9 @@ void* util_realloc(void* p, size_t n, size_t size)
  */
 
 @trusted
-void flowrd(ref GlobalOptimizer go, ref BlockOpt bo, bool defsNumbered = false)
+void flowrd(ref GlobalOptimizer go, ref BlockOpt bo)
 {
-    rdgenkill(go, bo, defsNumbered);  /* Compute Bgen and Bkill for RDs       */
+    rdgenkill(go, bo);        /* Compute Bgen and Bkill for RDs       */
     if (go.defnod.length == 0)     /* if no definition elems               */
         return;             /* no analysis to be done               */
 
@@ -180,9 +180,9 @@ private struct Dirty
  */
 
 @trusted
-private void rdgenkill(ref GlobalOptimizer go, ref BlockOpt bo, bool defsNumbered)
+private void rdgenkill(ref GlobalOptimizer go, ref BlockOpt bo)
 {
-    if (defsNumbered ? go.defnod.length == 0 : !numberDefs(go, bo))
+    if (!numberDefs(go, bo))
         return;
 
     const deftop = cast(uint)go.defnod.length;
@@ -213,7 +213,7 @@ private void rdgenkill(ref GlobalOptimizer go, ref BlockOpt bo, bool defsNumbere
  *      false if there are no definition elems
  */
 @trusted
-bool numberDefs(ref GlobalOptimizer go, ref BlockOpt bo)
+private bool numberDefs(ref GlobalOptimizer go, ref BlockOpt bo)
 {
     /* Compute number of definition elems. */
     uint deftop = 0;
