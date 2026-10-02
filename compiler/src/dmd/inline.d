@@ -347,12 +347,18 @@ public:
         static if (asStatements)
         {
             /* Any return statement should be the last statement in the function being
-             * inlined, otherwise things shouldn't have gotten this far. Since the
-             * return value is being ignored (otherwise it wouldn't be inlined as a statement)
-             * we only need to evaluate `exp` for side effects.
+             * inlined, otherwise things shouldn't have gotten this far. The value is
+             * assigned to the variable the call initializes or is assigned to, if
+             * any, or else is ignored, so `exp` is evaluated only for side effects.
              * Already disallowed this if `exp` produces an object that needs destruction -
              * an enhancement would be to do the destruction here.
              */
+            if (ids.eret)
+            {
+                auto ce = new ConstructExp(s.loc, ids.eret.copy(), exp);
+                ce.type = ids.eret.type;
+                exp = ce;
+            }
             result = new ExpStatement(s.loc, exp);
         }
         else
@@ -1113,6 +1119,71 @@ public:
                 sresult = null;
                 eresult = null;
                 return s;
+            }
+
+            /* `T v = call;` and `v = call;` of a scalar local variable v: when the
+             * call cannot be inlined as an expression, and the function being
+             * scanned is small enough for the inlined statements not to crowd
+             * out its register variables, the call is inlined as statements that
+             * assign the returned value to v
+             */
+            VarDeclaration retVar(Expression e1, Expression e2)
+            {
+                auto ve = e1.isVarExp();
+                if (!ve || !e2.isCallExp())
+                    return null;
+                auto vd = ve.var.isVarDeclaration();
+                if (!vd || vd.isDataseg() || vd.isRef() || vd.storage_class & (STC.out_ | STC.lazy_) ||
+                    vd.nestedrefs.length)
+                    return null;
+                auto t = vd.type.toBasetype();
+                if (!(t.isTypeBasic() && t.ty != Tvoid) && !t.isTypePointer())
+                    return null;
+                if (!e2.type || !e2.type.toBasetype().equals(t))
+                    return null;
+                return vd;
+            }
+            enum maxCallerLines = 150;
+            const smallCaller = parent.endloc.linnum >= parent.loc.linnum &&
+                                parent.endloc.linnum - parent.loc.linnum <= maxCallerLines;
+            if (auto de = exp.isDeclarationExp())
+            {
+                auto vd = de.declaration.isVarDeclaration();
+                ExpInitializer ie;
+                AssignExp ae;
+                if (smallCaller && vd && vd._init && (ie = vd._init.isExpInitializer()) !is null &&
+                    (ae = ie.exp.isConstructExp()) !is null && ae.e1.isVarExp() &&
+                    ae.e1.isVarExp().var == vd && retVar(ae.e1, ae.e2))
+                {
+                    auto call = ae.e2.isCallExp();
+                    inlineScan(exp);
+                    if (ie.exp !is ae || ae.e2 !is call)
+                        return null;            // inlined as an expression
+                    visitCallExp(call, ae.e1, true, false);
+                    auto s = sresult;
+                    sresult = null;
+                    eresult = null;
+                    if (!s)
+                        return null;
+                    vd._init = new VoidInitializer(vd._init.loc);
+                    auto a = Statements(new ExpStatement(exp.loc, de), s);
+                    return new CompoundStatement(exp.loc, a.move());
+                }
+            }
+            if (auto ae = exp.isAssignExp())
+            {
+                if (smallCaller && (ae.op == EXP.assign || ae.op == EXP.construct) && retVar(ae.e1, ae.e2))
+                {
+                    auto call = ae.e2.isCallExp();
+                    inlineScan(exp);
+                    if (exp !is ae || ae.e2 !is call)
+                        return null;            // inlined as an expression
+                    visitCallExp(call, ae.e1, true, false);
+                    auto s = sresult;
+                    sresult = null;
+                    eresult = null;
+                    return s;
+                }
             }
 
             /* If there's a CondExp or CommaExp at the top, then its
