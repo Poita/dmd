@@ -215,112 +215,55 @@ private void rdgenkill(ref GlobalOptimizer go, ref BlockOpt bo)
 @trusted
 private bool numberDefs(ref GlobalOptimizer go, ref BlockOpt bo)
 {
-    /* Compute number of definition elems. */
-    uint deftop = 0;
+    /* go.defnod[] holds the definition elems in dfo order, each block's in
+     * order of execution, with the enclosing block
+     */
+    go.defnod.setLength(0);
     foreach (b; bo.dfo[])    // for each block
         if (b.Belem)
-            deftop += numdefelems(b.Belem);
-
-    /* Allocate array of pointers to all definition elems   */
-    /*      The elems are in dfo order.                     */
-    /*      go.defnod[]s consist of a elem pointer and a pointer */
-    /*      to the enclosing block.                         */
-    go.defnod.setLength(deftop);
-    if (deftop == 0)
-    {
-        buildDefIndex(go);
-        return false;
-    }
-
-    size_t i = deftop;
-    foreach_reverse (b; bo.dfo[])    // for each block
-        if (b.Belem)
-            asgdefelems(b, b.Belem, go.defnod[], i);    // fill in go.defnod[]
-    assert(i == 0);
+            asgdefelems(go.defnod, b, b.Belem);
     buildDefIndex(go);
-    return true;
-}
-
-/**********************
- * Compute and return # of definition elems in e.
- * Params:
- *      e = elem tree to search
- * Returns:
- *      number of definition elems
- */
-@trusted
-private uint numdefelems(const(elem)* e)
-{
-    uint n = 0;
-    while (1)
-    {
-        assert(e);
-        if (OTdef(e.Eoper))
-            ++n;
-        if (OTbinary(e.Eoper))
-        {
-            n += numdefelems(e.E1);
-            e = e.E2;
-        }
-        else if (OTunary(e.Eoper))
-        {
-            e = e.E1;
-        }
-        else
-            break;
-    }
-    return n;
+    return go.defnod.length != 0;
 }
 
 /**************************
- * Load defnod[] array.
- * Loaded in order of execution of the elems. Not sure if this is
- * necessary.
+ * Append the definition elems of n to defnod[] in order of execution,
+ * numbering them.
  */
 
 @trusted
-private void asgdefelems(block* b,elem* n, DefNode[] defnod, ref size_t i)
+private void asgdefelems(ref Barray!DefNode defnod, block* b, elem* n)
 {
     assert(b && n);
-    while (1)
+    const op = n.Eoper;
+    if (ERTOL(n))
     {
-        const op = n.Eoper;
-
-        if (OTdef(op))
-        {
-            --i;
-            defnod[i] = DefNode(n, b);
-            if (OTassign(op) && n.E1.Eoper == OPvar)
-            {
-                const t = n.E1;
-                defnod[i].DNsym = t.Vsym;
-                defnod[i].DNoff = t.Voffset;
-                defnod[i].DNtop = t.Voffset + (op == OPstreq ? type_size(n.ET) : tysize(t.Ety));
-            }
-            n.Edef = cast(uint)i;
-        }
-        else
-            n.Edef = ~0;       // just to ensure it is not in the array
-
-        if (ERTOL(n))
-        {
-            asgdefelems(b,n.E1,defnod,i);
-            n = n.E2;
-            continue;
-        }
-        else if (OTbinary(op))
-        {
-            asgdefelems(b,n.E2,defnod,i);
-            n = n.E1;
-            continue;
-        }
-        else if (OTunary(op))
-        {
-            n = n.E1;
-            continue;
-        }
-        break;
+        asgdefelems(defnod, b, n.E2);
+        asgdefelems(defnod, b, n.E1);
     }
+    else if (OTbinary(op))
+    {
+        asgdefelems(defnod, b, n.E1);
+        asgdefelems(defnod, b, n.E2);
+    }
+    else if (OTunary(op))
+        asgdefelems(defnod, b, n.E1);
+
+    if (OTdef(op))
+    {
+        n.Edef = cast(uint)defnod.length;
+        DefNode* dn = defnod.push();
+        *dn = DefNode(n, b);
+        if (OTassign(op) && n.E1.Eoper == OPvar)
+        {
+            const t = n.E1;
+            dn.DNsym = t.Vsym;
+            dn.DNoff = t.Voffset;
+            dn.DNtop = t.Voffset + (op == OPstreq ? type_size(n.ET) : tysize(t.Ety));
+        }
+    }
+    else
+        n.Edef = ~0;       // just to ensure it is not in the array
 }
 
 /*************************************
