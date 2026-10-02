@@ -17,7 +17,6 @@ module dmd.backend.go;
 import core.stdc.stdio;
 import core.stdc.stdlib;
 import core.stdc.string;
-import core.stdc.time;
 
 import dmd.backend.barray;
 import dmd.backend.cc;
@@ -122,13 +121,6 @@ struct GlobalOptimizer
 __gshared GlobalOptimizer go;
 
 
-version (OSX)
-{
-    /* Need this until the bootstrap compiler is upgraded
-     * https://github.com/dlang/druntime/pull/2237
-     */
-    enum clock_t CLOCKS_PER_SEC = 1_000_000; // was 100 until OSX 10.4/10.5
-}
 
 
 nothrow:
@@ -335,9 +327,6 @@ void optfunc(ref GlobalOptimizer go, ref BlockOpt bo)
             iterationLimit = d;
     }
 
-    // Some functions can take enormous amounts of time to optimize.
-    // We try to put a lid on it.
-    clock_t starttime = clock();
     bo.assertsSplit = false;
     int iter = 0;           // iteration count
     /* The loop optimizations and boolopt() run again only after a round in which
@@ -349,6 +338,7 @@ void optfunc(ref GlobalOptimizer go, ref BlockOpt bo)
     do
     {
         //printf("iter = %d\n", iter);
+        // the rounds are limited, as some functions could take enormous amounts of time
         if (++iter > 200)
         {   assert(iter < iterationLimit);      // infinite loop check
             break;
@@ -454,7 +444,7 @@ void optfunc(ref GlobalOptimizer go, ref BlockOpt bo)
             rmdeadass(go, bo, go.changes); /* remove dead assignments       */
 
         if (debugc) printf("changes = %d\n", go.changes);
-        if (!(go.changes && go.mfoptim & MFloop && (clock() - starttime) < 30 * CLOCKS_PER_SEC))
+        if (!(go.changes && go.mfoptim & MFloop))
             break;
     } while (1);
     if (debugc) printf("%d iterations\n",iter);
