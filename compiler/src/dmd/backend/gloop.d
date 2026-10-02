@@ -251,8 +251,79 @@ void compdom(ref BlockOpt bo)
     compdom(bo.dfo[]);
 }
 
+/* Immediate dominators by dfo[] index, for compdom()
+ */
+private __gshared Barray!uint idoms;
+
+/*******************************
+ * Compute the dominators of the blocks in dfo[], which is in reverse postorder,
+ * from their immediate dominators: those are found by "A Simple, Fast
+ * Dominance Algorithm" by Cooper, Harvey and Kennedy.
+ */
 @trusted
 private void compdom(block*[] dfo)
+{
+    assert(dfo.length);
+    enum none = uint.max;
+    const n = cast(uint)dfo.length;
+    foreach (b; dfo)
+        foreach (p; b.Bpred[])
+            if (p.Bdfoidx >= n || dfo[p.Bdfoidx] != p)
+                return compdomIterative(dfo);   // a predecessor that is not in dfo[]
+
+    idoms.setLength(n);
+    idoms[] = none;
+    idoms[0] = 0;
+
+    uint intersect(uint a, uint b)
+    {
+        while (a != b)
+        {
+            while (a > b)
+                a = idoms[a];
+            while (b > a)
+                b = idoms[b];
+        }
+        return a;
+    }
+
+    bool changes;
+    do
+    {
+        changes = false;
+        foreach (i; 1 .. n)
+        {
+            uint d = none;
+            foreach (p; dfo[i].Bpred[])
+            {
+                const pi = p.Bdfoidx;
+                if (idoms[pi] == none)
+                    continue;           // not reached yet
+                d = d == none ? pi : intersect(pi, d);
+            }
+            if (d != idoms[i])
+            {
+                idoms[i] = d;
+                changes = true;
+            }
+        }
+    } while (changes);
+
+    foreach (i, b; dfo)
+    {
+        if (i == 0 || idoms[i] == none)
+            vec_clear(b.Bdom);          // no predecessors to dominate
+        else
+            vec_copy(b.Bdom, dfo[idoms[i]].Bdom);
+        vec_setbit(i, b.Bdom);          // each block doms itself
+    }
+}
+
+/*******************************
+ * Compute the dominators of the blocks in dfo[] by iterating to a fixed point.
+ */
+@trusted
+private void compdomIterative(block*[] dfo)
 {
     assert(dfo.length);
     block* sb = dfo[0];                  // starting block
