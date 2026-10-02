@@ -208,6 +208,9 @@ private void rd_compute(ref Barray!DefNode defnod, ref BlockOpt bo, ref EqRelInc
     }
 }
 
+/// The reaching definitions constantPropagation() lists for a variable
+private __gshared Barray!(elem*) rdlBuffer;
+
 /***************************
  * Constant propagation for block b
  *      Visit each elem in order
@@ -291,7 +294,8 @@ private void constantPropagation(block* thisblock, ref EqRelInc eqrelinc, ref ui
                     // Note that the following ignores OPnegass
                     if (OTopeq(op) && sytab[t.Vsym.Sclass] & SCRD)
                     {
-                        Barray!(elem*) rdl;
+                        alias rdl = rdlBuffer;
+                        rdl.setLength(0);
                         listrds(go, IN,t,null,&rdl);
                         if (!(config.flags & CFGnowarning)) // if warnings are enabled
                             chkrd(t,rdl);
@@ -303,7 +307,6 @@ private void constantPropagation(block* thisblock, ref EqRelInc eqrelinc, ref ui
                             n.E2 = el_bin(opeqtoop(op),n.Ety,e,n.E2);
                             n.Eoper = OPeq;
                         }
-                        rdl.dtor();
                     }
                 }
                 else
@@ -386,7 +389,8 @@ private void constantPropagation(block* thisblock, ref EqRelInc eqrelinc, ref ui
         if (op == OPvar && sytab[n.Vsym.Sclass] & SCRD)
         {
             //printf("const prop: %s\n", n.Vsym.Sident.ptr);
-            Barray!(elem*) rdl;
+            alias rdl = rdlBuffer;
+            rdl.setLength(0);
             listrds(go, IN,n,null,&rdl);
 
             if (!(config.flags & CFGnowarning))     // if warnings are enabled
@@ -400,7 +404,6 @@ private void constantPropagation(block* thisblock, ref EqRelInc eqrelinc, ref ui
                 n.Ety = nty;                       // retain original type
                 n.ET = nt;
             }
-            rdl.dtor();
         }
     }
 
