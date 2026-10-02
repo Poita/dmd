@@ -328,6 +328,7 @@ void optfunc(ref GlobalOptimizer go, ref BlockOpt bo)
     }
 
     bo.assertsSplit = false;
+    bo.exitsFound = false;
     int iter = 0;           // iteration count
     /* The loop optimizations and boolopt() run again only after a round in which
      * they changed something: what the other optimizations change rarely gives
@@ -374,7 +375,26 @@ void optfunc(ref GlobalOptimizer go, ref BlockOpt bo)
 
         if (go.mfoptim & MFdc)
             blockopt(go, bo, go.changes); // do block optimization
-        out_regcand(globsym[]);         // recompute register candidates
+        /* The register candidates are recomputed by each copyprop(), and what
+         * runs after it in a round does not change them
+         */
+        if (iter == 1)
+            out_regcand(globsym[]);     // recompute register candidates
+        else debug
+        {
+            // check they are unchanged
+            Barray!uint before;
+            foreach (sym; globsym[])
+                before.push(sym.Sflags & (GTregcand | SFLdistinct));
+            Barray!SYMIDX nums;
+            foreach (sym; globsym[])
+                nums.push(sym.Ssymnum);
+            out_regcand(globsym[]);
+            foreach (i, sym; globsym[])
+                assert(before[i] == (sym.Sflags & (GTregcand | SFLdistinct)) && nums[i] == sym.Ssymnum);
+            before.dtor();
+            nums.dtor();
+        }
         go.changes = 0;                 // no changes yet
         sliceStructs(globsym, bo.startblock);
         if (iter == 1)
@@ -397,7 +417,8 @@ void optfunc(ref GlobalOptimizer go, ref BlockOpt bo)
                 b.Bweight = 1;
         dbg_optprint("boolopt\n");
 
-        if (go.mfoptim & MFcnp && boolChanged)
+        // AArch64 does without boolopt(), which costs more than it gains
+        if (go.mfoptim & MFcnp && boolChanged && config.target_cpu != TARGET_AArch64)
         {
             const before = go.changes;
             boolopt(go, bo);              // optimize boolean values

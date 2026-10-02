@@ -58,6 +58,7 @@ struct BlockOpt
     block* block_freelist;
 
     bool assertsSplit;      // blassertsplit() split the asserts of the function
+    bool exitsFound;        // blexit() ran in a block optimization of the function
 }
 
 __gshared BlockOpt bo;
@@ -441,6 +442,8 @@ void blockopt(ref GlobalOptimizer go, ref BlockOpt bo, ref uint changes)
             bo.assertsSplit = true;
             blassertsplit(bo, changes);
         }
+        const exitsFound = bo.exitsFound;
+        bo.exitsFound = true;
 
         int iterationLimit = 200;
         if (iterationLimit < bo.dfo.length)
@@ -462,7 +465,9 @@ void blockopt(ref GlobalOptimizer go, ref BlockOpt bo, ref uint changes)
                 bltailmerge(bo.startblock, changes); // do tail merging
             brtailrecursion(bo, changes);        // do tail recursion
             brcombine(bo, changes);      // convert graph to expressions
-            blexit(bo, changes);
+            // AArch64 detects the exit blocks only in the first block optimization of a function
+            if (config.target_cpu != TARGET_AArch64 || !exitsFound)
+                blexit(bo, changes);
             brmin(bo, changes);          // minimize branching
 
             // Switched to one block per Statement, do not undo it
