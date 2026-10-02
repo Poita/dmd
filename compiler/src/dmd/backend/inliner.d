@@ -280,6 +280,18 @@ private elem* tryInliningCall(elem* e)
     //elem_debug(e);
     assert(e && (e.Eoper == OPcall || e.Eoper == OPucall));
 
+    // a call through *&f, as when each function goes in an object file of its own, calls f
+    elem* e1 = e.E1;
+    if (e1.Eoper == OPind && !e1.Ecount && e1.E1.Eoper == OPrelconst && !e1.E1.Ecount &&
+        e1.E1.Voffset == 0 && tyfunc(e1.E1.Vsym.Stype.Tty))
+    {
+        const tym_t ty = e1.Ety;
+        e1 = el_selecte1(e1);
+        e1.Eoper = OPvar;
+        e1.Ety = ty;
+        e.E1 = e1;
+    }
+
     if (e.E1.Eoper != OPvar)
         return e;
 
