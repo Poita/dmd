@@ -338,6 +338,7 @@ void optfunc(ref GlobalOptimizer go, ref BlockOpt bo)
     // Some functions can take enormous amounts of time to optimize.
     // We try to put a lid on it.
     clock_t starttime = clock();
+    bo.assertsSplit = false;
     int iter = 0;           // iteration count
     /* The loop optimizations and boolopt() run again only after a round in which
      * they changed something: what the other optimizations change rarely gives

@@ -56,6 +56,8 @@ struct BlockOpt
     block* curblock;        // current block being read in
 
     block* block_freelist;
+
+    bool assertsSplit;      // blassertsplit() split the asserts of the function
 }
 
 __gshared BlockOpt bo;
@@ -434,7 +436,11 @@ void blockopt(ref GlobalOptimizer go, ref BlockOpt bo, ref uint changes)
 {
     if (OPTIMIZER)
     {
-        blassertsplit(bo, changes);  // only need this once
+        if (!bo.assertsSplit)        // only need this once a function
+        {
+            bo.assertsSplit = true;
+            blassertsplit(bo, changes);
+        }
 
         int iterationLimit = 200;
         if (iterationLimit < bo.dfo.length)
@@ -446,7 +452,11 @@ void blockopt(ref GlobalOptimizer go, ref BlockOpt bo, ref uint changes)
             changes = 0;
             bropt(bo, changes);          // branch optimization
             brrear(bo);                  // branch rearrangement
-            blident(bo, changes);        // combine identical blocks
+            /* AArch64 does without combining identical blocks, which costs
+             * time and does little for the speed of the code
+             */
+            if (config.target_cpu != TARGET_AArch64)
+                blident(bo, changes);    // combine identical blocks
             blreturn(go, bo, changes);   // split out return blocks
             if (!(go.mfoptim & MFtime))  // if optimized for space instead of time
                 bltailmerge(bo.startblock, changes); // do tail merging
