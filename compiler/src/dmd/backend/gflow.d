@@ -79,9 +79,9 @@ void* util_realloc(void* p, size_t n, size_t size)
  */
 
 @trusted
-void flowrd(ref GlobalOptimizer go, ref BlockOpt bo)
+void flowrd(ref GlobalOptimizer go, ref BlockOpt bo, bool defsNumbered = false)
 {
-    rdgenkill(go, bo);        /* Compute Bgen and Bkill for RDs       */
+    rdgenkill(go, bo, defsNumbered);  /* Compute Bgen and Bkill for RDs       */
     if (go.defnod.length == 0)     /* if no definition elems               */
         return;             /* no analysis to be done               */
 
@@ -180,45 +180,12 @@ private struct Dirty
  */
 
 @trusted
-private void rdgenkill(ref GlobalOptimizer go, ref BlockOpt bo)
+private void rdgenkill(ref GlobalOptimizer go, ref BlockOpt bo, bool defsNumbered)
 {
-    /* Compute number of definition elems. */
-    uint num_unambig_def = 0;
-    uint deftop = 0;
-    foreach (b; bo.dfo[])    // for each block
-        if (b.Belem)
-        {
-            deftop += numdefelems(b.Belem, num_unambig_def);
-        }
-
-    /* Allocate array of pointers to all definition elems   */
-    /*      The elems are in dfo order.                     */
-    /*      go.defnod[]s consist of a elem pointer and a pointer */
-    /*      to the enclosing block.                         */
-    go.defnod.setLength(deftop);
-    if (deftop == 0)
-    {
-        buildDefIndex(go);
+    if (defsNumbered ? go.defnod.length == 0 : !numberDefs(go, bo))
         return;
-    }
 
-    /* Allocate buffer for the DNunambig vectors
-     */
-    const size_t dim = (deftop + (VECBITS - 1)) >> VECSHIFT;
-    const sz = (dim + 2) * num_unambig_def;
-    go.dnunambig.setLength(sz);
-    go.dnunambig[] = 0;
-
-    go.defnod.setLength(deftop);
-    size_t i = deftop;
-    foreach_reverse (b; bo.dfo[])    // for each block
-        if (b.Belem)
-            asgdefelems(b, b.Belem, go.defnod[], i);    // fill in go.defnod[]
-    assert(i == 0);
-    buildDefIndex(go);
-
-    initDNunambigVectors(go, go.defnod[]);
-
+    const deftop = cast(uint)go.defnod.length;
     foreach (b; bo.dfo[])    // for each block
     {
         /* dump any existing vectors */
@@ -237,6 +204,54 @@ private void rdgenkill(ref GlobalOptimizer go, ref BlockOpt bo)
         b.Binrd = vec_calloc(deftop);
         b.Boutrd = vec_calloc(deftop);
     }
+}
+
+/***************************************
+ * Fill in go.defnod[] with the definition elems in dfo order, without the
+ * reaching definitions data flow.
+ * Returns:
+ *      false if there are no definition elems
+ */
+@trusted
+bool numberDefs(ref GlobalOptimizer go, ref BlockOpt bo)
+{
+    /* Compute number of definition elems. */
+    uint num_unambig_def = 0;
+    uint deftop = 0;
+    foreach (b; bo.dfo[])    // for each block
+        if (b.Belem)
+        {
+            deftop += numdefelems(b.Belem, num_unambig_def);
+        }
+
+    /* Allocate array of pointers to all definition elems   */
+    /*      The elems are in dfo order.                     */
+    /*      go.defnod[]s consist of a elem pointer and a pointer */
+    /*      to the enclosing block.                         */
+    go.defnod.setLength(deftop);
+    if (deftop == 0)
+    {
+        buildDefIndex(go);
+        return false;
+    }
+
+    /* Allocate buffer for the DNunambig vectors
+     */
+    const size_t dim = (deftop + (VECBITS - 1)) >> VECSHIFT;
+    const sz = (dim + 2) * num_unambig_def;
+    go.dnunambig.setLength(sz);
+    go.dnunambig[] = 0;
+
+    go.defnod.setLength(deftop);
+    size_t i = deftop;
+    foreach_reverse (b; bo.dfo[])    // for each block
+        if (b.Belem)
+            asgdefelems(b, b.Belem, go.defnod[], i);    // fill in go.defnod[]
+    assert(i == 0);
+    buildDefIndex(go);
+
+    initDNunambigVectors(go, go.defnod[]);
+    return true;
 }
 
 /**********************

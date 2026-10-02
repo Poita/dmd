@@ -29,6 +29,7 @@ import dmd.backend.cgelem : doptelem, elemisone;
 import dmd.backend.debugprint : WReqn, WRfunc, tym_str;
 import dmd.backend.evalu8 : evalu8, iftrue;
 import dmd.backend.go;
+import dmd.backend.gflow : numberDefs;
 import dmd.backend.el;
 import dmd.backend.symbol;
 import dmd.backend.ty;
@@ -674,6 +675,13 @@ private __gshared
      * marking needs them, which is rare, from the trees as they are then
      */
     bool aeStale;
+    /* Induction variable elimination needs only go.defnod[], and the live
+     * variables only when there are variables to eliminate: what it does not
+     * compute is left to be computed when needed
+     */
+    bool defsValid;         // go.defnod[] is up to date
+    bool rdValid;           // the reaching definitions are up to date
+    bool lvValid;           // the live variables are up to date
 }
 
 /*********************************
@@ -835,10 +843,17 @@ restart:
         assert(l.Lpreheader);
         if (doflow)
         {
-            flowrd(go, bo);         /* compute reaching definitions  */
-            flowlv(bo);             /* compute live variables        */
+            defsValid = rdValid = lvValid = false;
             aeStale = true;         // available expressions when needed
             doflow = false;         /* no need to redo it           */
+        }
+        if (!rdValid || !lvValid)
+        {
+            if (!rdValid)
+                flowrd(go, bo, defsValid);  /* compute reaching definitions  */
+            if (!lvValid)
+                flowlv(bo);         /* compute live variables        */
+            defsValid = rdValid = lvValid = true;
             if (go.defnod.length == 0)     /* if no definition elems       */
                 break;              /* no need to optimize          */
         }
@@ -2009,13 +2024,22 @@ private void loopiv(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
     elimspec(go, l, bo.dfo);
     if (doflow)
     {
-        flowrd(go, bo);         /* compute reaching defs                */
-        flowlv(bo);             /* compute live variables               */
+        defsValid = rdValid = lvValid = false;
         aeStale = true;         // available expressions when needed
         doflow = false;
     }
+    if (!defsValid)
+    {
+        numberDefs(go, bo);     // the definition elems
+        defsValid = true;
+    }
     findbasivs(go, l);          /* find basic induction variables       */
     findopeqs(go, l);           // find op= variables
+    if (!lvValid && (l.Livlist.length || l.Lopeqlist.length))
+    {
+        flowlv(bo);             /* compute live variables               */
+        lvValid = true;
+    }
     findivfams(bo, l);          /* find IV families                     */
     elimfrivivs(bo, l);         /* eliminate less useful family IVs     */
     intronvars(go, l);          /* introduce new variables              */
