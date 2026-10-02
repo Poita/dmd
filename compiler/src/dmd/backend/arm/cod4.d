@@ -1324,9 +1324,50 @@ void cdcmp(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
 
     ce = isPair ? gen1(null, INSTR.nop) : null;     // branch target for register pairs
 
+    /* A byte or short value loaded from memory is already extended to 32 bits
+     * as its type is signed or not
+     */
+    static bool cleanNarrow(const(elem)* x)
+    {
+        return !x.Ecount && (x.Eoper == OPind ||
+            x.Eoper == OPvar && x.Vsym.Sfl != FL.reg &&
+            x.Vsym.Sclass != SC.fastpar && x.Vsym.Sclass != SC.shadowreg);
+    }
+
     switch (e2.Eoper)
     {
         case OPconst:
+            /* Compare a byte or short with a constant: extend the value, unless
+             * already extended, and compare with the constant extended the same way
+             */
+            if (sz < 4 && tyintegral(tym))
+            {
+                const imms = sz == 1 ? 7 : 15;
+                long c = el_tolong(e2);
+                c = tyuns(tym) ? (sz == 1 ? cast(ubyte)c : cast(ushort)c)
+                               : (sz == 1 ? cast(byte)c : cast(short)c);
+                uint subs = 1;                          // SUBS
+                if (c < 0)
+                {
+                    c = -c;
+                    subs = 0;                           // ADDS, which sets the same flags
+                }
+                if (c < 0x1000)
+                {
+                    const clean = cleanNarrow(e1);
+                    scodelem(cg,cdb,e1,retregs,0,clean);    // compute left leaf
+                    reg = findreg(retregs);
+                    if (!clean)
+                    {
+                        getregs(cdb, retregs);
+                        cdb.gen1(tyuns(tym) ? INSTR.ubfm(0,0,0,imms,reg,reg)     // UXTB/UXTH
+                                            : INSTR.sbfm(0,0,0,imms,reg,reg));   // SXTB/SXTH
+                    }
+                    cdb.gen1(INSTR.addsub_imm(0, subs, 1, 0, cast(uint)c, reg, 31));   // CMP/CMN reg,#c
+                    freenode(e2);
+                    break;
+                }
+            }
             /* Compare with a constant that fits an immediate field:
              *  CMP Rn,#imm12{, LSL #12}
              *  CMN Rn,#imm12{, LSL #12}       for a negative constant
@@ -1360,6 +1401,9 @@ void cdcmp(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
             goto default;
 
         default:
+        {
+            const clean1 = sz < 4 && cleanNarrow(e1) && tysize(e1.Ety) == sz && !tyuns(e1.Ety) == !tyuns(tym);
+            const clean2 = sz < 4 && cleanNarrow(e2) && tysize(e2.Ety) == sz && !tyuns(e2.Ety) == !tyuns(tym);
             scodelem(cg,cdb,e1,retregs,0,true);        // compute left leaf
             rretregs = cg.allregs & ~retregs;
             scodelem(cg,cdb,e2,rretregs,retregs,true); // get right leaf
@@ -1381,24 +1425,36 @@ void cdcmp(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
             {
                 reg = findreg(retregs);                     // get reg that e1 is in
                 rreg = findreg(rretregs);
+                // the first operand of the CMP, and the second
+                reg_t rn = reverse ? rreg : reg;
+                reg_t rm = reverse ? reg : rreg;
+                const cleann = reverse ? clean2 : clean1;
+                const cleanm = reverse ? clean1 : clean2;
+                uint sf = sz == 8;
                 if (sz < 4)
                 {
-                    // bits above a narrow value may be set, so extend both operands
-                    getregs(cdb, mask(reg) | mask(rreg));
+                    /* bits above a narrow value may be set, so extend the first
+                     * operand if it is not already, and the second as part of the CMP
+                     */
                     const imms = sz == 1 ? 7 : 15;
-                    foreach (r; [reg, rreg])
-                        cdb.gen1(tyuns(tym) ? INSTR.ubfm(0,0,0,imms,r,r)     // UXTB/UXTH
-                                            : INSTR.sbfm(0,0,0,imms,r,r));   // SXTB/SXTH
+                    if (!cleann)
+                    {
+                        getregs(cdb, mask(rn));
+                        cdb.gen1(tyuns(tym) ? INSTR.ubfm(0,0,0,imms,rn,rn)     // UXTB/UXTH
+                                            : INSTR.sbfm(0,0,0,imms,rn,rn));   // SXTB/SXTH
+                    }
+                    if (!cleanm)
+                    {
+                        const Extend ext = tyuns(tym) ? (sz == 1 ? Extend.UXTB : Extend.UXTH)
+                                                      : (sz == 1 ? Extend.SXTB : Extend.SXTH);
+                        cdb.gen1(INSTR.cmp_ext(0, rm, ext, 0, rn));          // CMP rn, rm, extend
+                        break;
+                    }
                 }
-                uint ins;
-                uint sf = sz == 8;
-                if (reverse)
-                    ins = INSTR.cmp_subs_addsub_shift(sf, reg, 0, 0, rreg); // CMP rreg, reg
-                else
-                    ins = INSTR.cmp_subs_addsub_shift(sf, rreg, 0, 0, reg); // CMP reg, rreg
-                cdb.gen1(ins);
+                cdb.gen1(INSTR.cmp_subs_addsub_shift(sf, rm, 0, 0, rn));     // CMP rn, rm
             }
             break;
+        }
 
 static if (0) // TODO AArch64
 {
