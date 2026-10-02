@@ -1127,8 +1127,10 @@ Lnodep:
 bool ERTOL(const elem* e)
 {
     elem_debug(e);
+    // AArch64 code generation evaluates the right operand of a floating op= first
     return OTrtol(e.Eoper) &&
-        (!OTopeq(e.Eoper) || config.inline8087 || !tyfloating(e.Ety));
+        (!OTopeq(e.Eoper) || config.inline8087 || !tyfloating(e.Ety) ||
+         config.target_cpu == TARGET_AArch64);
 }
 
 /********************************
