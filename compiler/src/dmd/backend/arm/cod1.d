@@ -545,15 +545,16 @@ void logexp(ref CGstate cg, ref CodeBuilder cdb, elem* e, uint jcond, FL fltarg,
         return;
     }
 
-    // !b of a bool b is b ^ 1
+    // !b of a bool b is b ^ 1, with b tested as a condition of its own
     if (e.Eoper == OPxor && !e.Ecount && e.E2.Eoper == OPconst && el_tolong(e.E2) == 1 &&
         tybasic(e.E1.Ety) == TYbool)
     {
         elem* e1 = e.E1;
         freenode(e.E2);
         freenode(e);
-        e = e1;
-        jcond ^= 1;
+        logexp(cg, cdb, e1, jcond ^ 1, fltarg, targ);
+        cg.stackclean--;
+        return;
     }
 
     // x == 0 and x != 0 test x
