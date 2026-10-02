@@ -216,13 +216,10 @@ private void rdgenkill(ref GlobalOptimizer go, ref BlockOpt bo, bool defsNumbere
 bool numberDefs(ref GlobalOptimizer go, ref BlockOpt bo)
 {
     /* Compute number of definition elems. */
-    uint num_unambig_def = 0;
     uint deftop = 0;
     foreach (b; bo.dfo[])    // for each block
         if (b.Belem)
-        {
-            deftop += numdefelems(b.Belem, num_unambig_def);
-        }
+            deftop += numdefelems(b.Belem);
 
     /* Allocate array of pointers to all definition elems   */
     /*      The elems are in dfo order.                     */
@@ -235,22 +232,12 @@ bool numberDefs(ref GlobalOptimizer go, ref BlockOpt bo)
         return false;
     }
 
-    /* Allocate buffer for the DNunambig vectors
-     */
-    const size_t dim = (deftop + (VECBITS - 1)) >> VECSHIFT;
-    const sz = (dim + 2) * num_unambig_def;
-    go.dnunambig.setLength(sz);
-    go.dnunambig[] = 0;
-
-    go.defnod.setLength(deftop);
     size_t i = deftop;
     foreach_reverse (b; bo.dfo[])    // for each block
         if (b.Belem)
             asgdefelems(b, b.Belem, go.defnod[], i);    // fill in go.defnod[]
     assert(i == 0);
     buildDefIndex(go);
-
-    initDNunambigVectors(go, go.defnod[]);
     return true;
 }
 
@@ -258,27 +245,21 @@ bool numberDefs(ref GlobalOptimizer go, ref BlockOpt bo)
  * Compute and return # of definition elems in e.
  * Params:
  *      e = elem tree to search
- *      num_unambig_def = accumulate the number of unambiguous
- *              definition elems
  * Returns:
  *      number of definition elems
  */
 @trusted
-private uint numdefelems(const(elem)* e, ref uint num_unambig_def)
+private uint numdefelems(const(elem)* e)
 {
     uint n = 0;
     while (1)
     {
         assert(e);
         if (OTdef(e.Eoper))
-        {
             ++n;
-            if (OTassign(e.Eoper) && e.E1.Eoper == OPvar)
-                ++num_unambig_def;
-        }
         if (OTbinary(e.Eoper))
         {
-            n += numdefelems(e.E1, num_unambig_def);
+            n += numdefelems(e.E1);
             e = e.E2;
         }
         else if (OTunary(e.Eoper))
@@ -308,7 +289,14 @@ private void asgdefelems(block* b,elem* n, DefNode[] defnod, ref size_t i)
         if (OTdef(op))
         {
             --i;
-            defnod[i] = DefNode(n, b, null);
+            defnod[i] = DefNode(n, b);
+            if (OTassign(op) && n.E1.Eoper == OPvar)
+            {
+                const t = n.E1;
+                defnod[i].DNsym = t.Vsym;
+                defnod[i].DNoff = t.Voffset;
+                defnod[i].DNtop = t.Voffset + (op == OPstreq ? type_size(n.ET) : tysize(t.Ety));
+            }
             n.Edef = cast(uint)i;
         }
         else
@@ -332,103 +320,6 @@ private void asgdefelems(block* b,elem* n, DefNode[] defnod, ref size_t i)
             continue;
         }
         break;
-    }
-}
-
-/*************************************
- * Allocate and initialize DNumambig vectors in go.defnod[]
- */
-
-@trusted
-private void initDNunambigVectors(ref GlobalOptimizer go, DefNode[] defnod)
-{
-    //printf("initDNunambigVectors()\n");
-    const size_t numbits = defnod.length;
-    const size_t dim = (numbits + (VECBITS - 1)) >> VECSHIFT;
-
-    /* Initialize vector for DNunambig for each defnod[] entry that
-     * is an assignment to a variable
-     */
-    size_t j = 0;
-    foreach (const i; 0 .. defnod.length)
-    {
-        elem* e = defnod[i].DNelem;
-        if (OTassign(e.Eoper) && e.E1.Eoper == OPvar)
-        {
-            vec_t v = &go.dnunambig[j] + 2;
-            assert(vec_dim(v) == 0);
-            vec_dim(v) = dim;
-            vec_numbits(v) = numbits;
-            j += dim + 2;
-            defnod[i].DNunambig = v;
-        }
-    }
-    assert(j <= go.dnunambig.length);
-
-    foreach (const i; 0 .. defnod.length)
-    {
-        if (vec_t v = defnod[i].DNunambig)
-        {
-            elem* e = defnod[i].DNelem;
-            vec_setbit(i, v);        // of course it modifies itself
-            fillInDNunambig(v, e, i, defnod[]);
-        }
-    }
-}
-
-/**************************************
- * Fill in the DefNode.DNumambig vector.
- * Set bits defnod[] indices for entries
- * which are completely destroyed when e is
- * unambiguously assigned to.
- * Note that results for indices less than `start`
- * are already computed, so skip them.
- * Params:
- *      v = vector to fill in
- *      e = defnod[] entry that is an assignment to a variable
- *      start = starting index in defnod[]
- *      defnod = array of definition nodes
- */
-
-@trusted
-private void fillInDNunambig(vec_t v, elem* e, size_t start, DefNode[] defnod)
-{
-    assert(OTassign(e.Eoper));
-    elem* t = e.E1;
-    assert(t.Eoper == OPvar);
-    Symbol* d = t.Vsym;
-
-    targ_size_t toff = t.Voffset;
-    targ_size_t tsize = (e.Eoper == OPstreq) ? type_size(e.ET) : tysize(t.Ety);
-    targ_size_t ttop = toff + tsize;
-
-    // for all unambig defs of d in defnod[] after start
-    foreach (const sd; defIndex.defsOf(d))
-    {
-        const i = sd.i;
-        if (i <= start)
-            continue;
-        vec_t v2 = defnod[i].DNunambig;
-        assert(v2);
-
-        elem* tn = defnod[i].DNelem;
-        elem* tn1;
-        targ_size_t tn1size;
-
-        tn1 = tn.E1;
-
-        tn1size = (tn.Eoper == OPstreq)
-            ? type_size(tn.ET) : tysize(tn1.Ety);
-        // If t completely overlaps tn1
-        if (toff <= tn1.Voffset && tn1.Voffset + tn1size <= ttop)
-        {
-            vec_setbit(i, v);
-        }
-        // if tn1 completely overlaps t
-        if (tn1.Voffset <= toff && ttop <= tn1.Voffset + tn1size)
-        {
-            vec_setbit(start, v2);
-        }
     }
 }
 

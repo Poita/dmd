@@ -46,7 +46,7 @@ nothrow:
 char symbol_isintab(const Symbol* s) { return sytab[s.Sclass] & SCSS; }
 
 
-import dmd.backend.gother : defIndexChanged, findloopparameters;
+import dmd.backend.gother : defIndex, defIndexChanged, findloopparameters;
 
 alias Loops = Rarray!Loop;
 
@@ -1361,11 +1361,19 @@ void updaterd(ref Barray!DefNode defnod, elem* n,vec_t GEN,vec_t KILL)
     // If unambiguous def
     if (OTassign(op) && (t = n.E1).Eoper == OPvar)
     {
-        vec_t v = defnod[ni].DNunambig;
-        assert(v);
-        if (KILL)
-            vec_orass(KILL, v);
-        vec_subass(GEN, v);
+        // it kills the definitions of the bytes it assigns, itself included
+        const dn = &defnod[ni];
+        assert(dn.DNsym);
+        foreach (const sd; defIndex.defsOf(dn.DNsym))
+        {
+            const d = &defnod[sd.i];
+            if (dn.DNoff <= d.DNoff && d.DNtop <= dn.DNtop)
+            {
+                if (KILL)
+                    vec_setbit(sd.i, KILL);
+                vec_clearbit(sd.i, GEN);
+            }
+        }
     }
     else
     {

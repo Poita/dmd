@@ -82,7 +82,11 @@ struct DefNode
 {
     elem    *DNelem;        // pointer to definition elem
     block   *DNblock;       // pointer to block that the elem is in
-    vec_t    DNunambig;     // vector of unambiguous definitions
+    /* For an assignment to a variable: the variable and the bytes of it
+     * assigned, as they were when go.defnod[] was filled in
+     */
+    const(Symbol)* DNsym;
+    targ_size_t DNoff, DNtop;
 }
 
 // which kind of flow analysisis being done
@@ -106,7 +110,6 @@ struct GlobalOptimizer
     Barray!DefNode defnod;    // array of definition elems
     uint unambigtop;    // number of unambiguous defininitions ( <= deftop )
 
-    Barray!(vec_base_t) dnunambig;  // pool to allocate DNunambig vectors from
 
     Barray!(elem*) expnod;      // array of expression elems
     uint exptop;        // top of expnod[]
