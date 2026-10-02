@@ -1230,9 +1230,15 @@ int cgreg_assign(ref CGstate cg, Symbol* retsym)
     }
     Barray!Candidate candidates;
 
-    /* Evaluate the symbols with live ranges apart from those of the symbols assigned
-     * so far
+    /* AArch64 has registers enough for symbols with overlapping live ranges to be
+     * assigned in the same pass: each assignment takes its register in the blocks
+     * of the symbol's live range, so the others are evaluated again with it taken.
+     * Elsewhere only symbols with live ranges apart from those of the symbols
+     * assigned so far are.
      */
+    const bool overlap = AArch64;
+
+    /* Evaluate the symbols that can still be assigned in this pass */
     void evaluateAll()
     {
         foreach (ref c; candidates[])
@@ -1240,7 +1246,7 @@ int cgreg_assign(ref CGstate cg, Symbol* retsym)
         candidates.setLength(0);
         foreach (s; globsym[])
         {
-            if (flag && (!s.Srange || !vec_disjoint(s.Srange, assignedRange)))
+            if (flag && !overlap && (!s.Srange || !vec_disjoint(s.Srange, assignedRange)))
                 continue;
             Reg u = evaluate(s, v);
             if (u.sym && u.benefit > 0)
@@ -1271,6 +1277,11 @@ int cgreg_assign(ref CGstate cg, Symbol* retsym)
         cgreg_map(cg,t.sym,t.regmsw,t.reglsw);
         flag = true;
         vec_orass(assignedRange, t.sym.Srange);
+        if (overlap && ++rangeWalkStamp == 0)  // the register is now used in more blocks
+        {
+            walkMemo[][] = 0;
+            rangeWalkStamp = 1;
+        }
 
         if (cg.mfuncreg != mfuncregBefore)
             evaluateAll();
@@ -1278,8 +1289,18 @@ int cgreg_assign(ref CGstate cg, Symbol* retsym)
         {
             foreach (ref c; candidates[])
             {
-                if (c.u.sym && !vec_disjoint(c.u.sym.Srange, assignedRange))
-                    c.u.sym = null;
+                if (c.u.sym && !vec_disjoint(c.u.sym.Srange, t.sym.Srange))
+                {
+                    if (!overlap)
+                        c.u.sym = null;
+                    else
+                    {
+                        // the register t took is no longer free in their common blocks
+                        Reg u = evaluate(c.u.sym, v);
+                        c.u = u.sym && u.benefit > 0 ? u : Reg.init;
+                        vec_copy(c.lvreg, v);
+                    }
+                }
             }
         }
     }
