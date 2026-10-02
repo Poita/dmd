@@ -1289,6 +1289,7 @@ int cgreg_assign(ref CGstate cg, Symbol* retsym)
             }
         }
 
+        bool takes(reg_t r) { return r != NOREG && (r == t.reglsw || r == t.regmsw); }
         if (cg.mfuncreg != mfuncregBefore)
             evaluateAll();
         else
@@ -1299,9 +1300,12 @@ int cgreg_assign(ref CGstate cg, Symbol* retsym)
                 {
                     if (!overlap)
                         c.u.sym = null;
-                    else
+                    else if (takes(c.u.reglsw) || takes(c.u.regmsw))
                     {
-                        // the register t took is no longer free in their common blocks
+                        /* The registers t took are no longer free in their common
+                         * blocks, which changes only the benefit of those registers,
+                         * so the best assignment of c changes only if it is in them
+                         */
                         Reg u = evaluate(c.u.sym, v);
                         c.u = u.sym && u.benefit > 0 ? u : Reg.init;
                         vec_copy(c.lvreg, v);
