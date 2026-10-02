@@ -1280,7 +1280,8 @@ int cgreg_assign(ref CGstate cg, Symbol* retsym)
         if (overlap)
         {
             // the walks remembered for the registers t took no longer hold
-            foreach (si; 0 .. walkMemo.length / walkMemoRegs)
+            const nsyms = walkMemo.length / walkMemoRegs < globsym.length ? walkMemo.length / walkMemoRegs : globsym.length;
+            foreach (si; 0 .. nsyms)
             {
                 walkMemo[si * walkMemoRegs + t.reglsw] = 0;
                 if (t.regmsw != NOREG)
