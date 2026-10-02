@@ -880,7 +880,13 @@ public void duplicateTests(ref BlockOpt bo)
         any = true;
     }
     if (any)
+    {
         block_pred(bo.startblock);
+        // a test no longer gone to is removed
+        compdfo(bo.dfo, bo.startblock);
+        uint changes;
+        elimblks(bo, changes);
+    }
 }
 
 /*********************************
