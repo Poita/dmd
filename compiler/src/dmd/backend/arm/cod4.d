@@ -2474,6 +2474,9 @@ void cdlngsht(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         else
         {
             retregs = pretregs ? cg.allregs : 0;
+            // the low part of a value in a single register is in the register itself
+            if (e.Eoper != OP128_64 && e.Eoper != OPoffset && pretregs & cg.allregs)
+                retregs = pretregs & cg.allregs;
             codelem(cg,cdb,e.E1,retregs,readOnly);
             bool isOff = e.Eoper == OPoffset;
             if (isOff || e.Eoper == OP128_64)
