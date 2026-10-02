@@ -31,7 +31,7 @@ import dmd.backend.type;
 
 import dmd.backend.backconfig : debugb, debugc, debuge, debugf;
 import dmd.backend.blockopt : BlockOpt, bo;
-import dmd.backend.blockopt : bc_goal, block_optimizer_free, blockopt;
+import dmd.backend.blockopt : bc_goal, block_optimizer_free, blockopt, duplicateTests;
 import dmd.backend.cg : localgot;
 import dmd.backend.cgelem : combineByteLoads, doptelem, postoptelem;
 import dmd.backend.debugprint : WRfunc;
@@ -443,7 +443,10 @@ void optfunc(ref GlobalOptimizer go, ref BlockOpt bo)
     if (debugc) printf("%d iterations\n",iter);
 
     if (go.mfoptim & MFdc)
+    {
         blockopt(go, bo, go.changes);         // do block optimization
+        duplicateTests(bo);
+    }
 
     for (block* b = bo.startblock; b; b = b.Bnext)
     {

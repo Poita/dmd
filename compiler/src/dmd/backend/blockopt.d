@@ -840,6 +840,49 @@ private void bropt(ref BlockOpt bo, ref uint changes)
     }
 }
 
+/**********************************
+ * AArch64: a block that goes to a small test other than the next block,
+ * such as the test of a loop at the end of one arm of an if-else, ends with
+ * a copy of the test instead, saving the branch to it.
+ * Params:
+ *      bo = blocks of the function
+ */
+@trusted
+public void duplicateTests(ref BlockOpt bo)
+{
+    if (config.target_cpu != TARGET_AArch64)
+        return;
+    enum maxTest = 6;           // size of a test worth copying
+    static uint nodes(const(elem)* e)
+    {
+        if (OTbinary(e.Eoper))
+            return 1 + nodes(e.E1) + nodes(e.E2);
+        if (OTunary(e.Eoper))
+            return 1 + nodes(e.E1);
+        return 1;
+    }
+    bool any;
+    for (block* b = bo.startblock; b; b = b.Bnext)
+    {
+        if (b.bc != BC.goto_ || b.Bsucc.length != 1 || b.Btry)
+            continue;
+        block* t = b.Bsucc[0];
+        if (t is b.Bnext || t is b || t.Btry)
+            continue;
+        if (t.bc != BC.iftrue || !t.Belem || t.Bsucc.length != 2 ||
+            t.Bsucc[0] is t || t.Bsucc[1] is t || nodes(t.Belem) > maxTest)
+            continue;
+        b.Belem = el_combine(b.Belem, el_copytree(t.Belem));
+        b.bc = BC.iftrue;
+        b.Bsucc.reset();
+        b.Bsucc.push(t.Bsucc[0]);
+        b.Bsucc.push(t.Bsucc[1]);
+        any = true;
+    }
+    if (any)
+        block_pred(bo.startblock);
+}
+
 /*********************************
  * Do branch rearrangement.
  */
