@@ -2261,12 +2261,11 @@ public void deadvar()
         /* Compute live variables. Set bit for block in live range      */
         /* if variable is in the IN set for that block.                 */
         flowlv(bo);                       /* compute live variables       */
-        foreach (i, s; globsym[])
+        foreach (j, b; bo.dfo[])
         {
-            if (s.Srange /*&& s.Sclass != CLMOS*/)
-                foreach (j, b; bo.dfo[])
-                    if (vec_testbit(i,b.Binlv))
-                        vec_setbit(j, globsym[i].Srange);
+            for (size_t i = 0; (i = vec_index(i, b.Binlv)) < globsym.length; ++i)
+                if (vec_t r = globsym[i].Srange)
+                    vec_setbit(j, r);
         }
 
         /* Print results        */
