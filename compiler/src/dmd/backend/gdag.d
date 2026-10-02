@@ -115,6 +115,7 @@ void builddags(ref GlobalOptimizer go, ref BlockOpt bo)
         /* the code generator can only track register contents          */
         /* properly across extended basic blocks.                       */
         aevec = vec_calloc(go.exptop);
+        aeMaxGen = 0;
         foreach (i, b; bo.dfo[])
         {
             /* if not first block and (there are more than one      */
@@ -190,6 +191,11 @@ private struct AeIndex
 }
 
 private __gshared AeIndex aeIndex;
+
+/* The highest go.expnod[] index made available so far in the CSE walks: as an AE
+ * is made available only where it is, none above it can be available
+ */
+private __gshared uint aeMaxGen;
 
 /* Hash of elem n, from what el_match() requires to be equal: the operators, and the
  * symbols and offsets of the variables. The hashes of the AEs below go.expnod[limit]
@@ -270,6 +276,8 @@ private void aewalk(ref GlobalOptimizer go, ref elem* pn, vec_t ae)
              */
             foreach (i; aeIndex.sameHash(aeIndex.hashes[n.Eexp]))
             {
+                if (i > aeMaxGen)
+                    break;
                 if (!vec_testbit(i, ae))
                     continue;
                 elem* e = go.expnod[i];
@@ -446,7 +454,11 @@ private void aewalk(ref GlobalOptimizer go, ref elem* pn, vec_t ae)
 
         // GEN the lvalue of an assignment operator
         if (OTassign(op) && !OTpost(op) && t.Eexp)
+        {
             vec_setbit(t.Eexp,ae);
+            if (t.Eexp > aeMaxGen)
+                aeMaxGen = t.Eexp;
+        }
     }
     if (n.Eexp)            // if an AE
     {
@@ -457,6 +469,8 @@ private void aewalk(ref GlobalOptimizer go, ref elem* pn, vec_t ae)
         /*printf("available: ("); WReqn(n); printf(")\n");
         elem_print(n);*/
         vec_setbit(n.Eexp,ae);     /* mark this elem as available  */
+        if (n.Eexp > aeMaxGen)
+            aeMaxGen = n.Eexp;
     }
 }
 
