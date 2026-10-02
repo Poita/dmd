@@ -274,7 +274,14 @@ void codgenx(ref CGstate cg, Symbol* sfunc)
             cg.pass = BackendPass.reg;
         }
         else if (cgreg_assign(cg, cg.retsym))          // if we found some registers
-            cg.pass = BackendPass.reg;
+        {
+            /* AArch64 assigns registers to the symbols overlapping each other
+             * at once, which leaves little for later passes to assign, so the
+             * code generated with the first assignments is final unless a
+             * register variable has to be unregistered
+             */
+            cg.pass = cg.AArch64 && cg.pass == BackendPass.initial ? BackendPass.final_ : BackendPass.reg;
+        }
         else
             cg.pass = BackendPass.final_;
 
