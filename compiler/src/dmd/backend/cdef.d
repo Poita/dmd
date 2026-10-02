@@ -485,6 +485,7 @@ enum
 
 struct Config
 {
+    bool sharedLibrary;         // generating a shared library, which exports its functions
     char language;              // 'C' = C, 'D' = C++
     string _version;            /// Compiler version
     char[3] exetype;            // distinguish exe types so PH

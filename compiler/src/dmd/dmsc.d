@@ -118,6 +118,8 @@ void backend_init(const ref Param params, const ref DMDparams driverParams, cons
         cast(GetFileContentsCallback) &getFileContentsBackend,
     );
 
+    config.sharedLibrary = driverParams.dll;
+
     out_config_debug(
         driverParams.debugb,
         driverParams.debugc,

@@ -1704,11 +1704,12 @@ assert(rel.r_symbolnum);
         if (s.Sclass == SC.comdat)
         {
             sym.n_desc = N_WEAK_DEF;
-            /* A weak function that is not exported can be hidden by the linker
-             * (weak_def_can_be_hidden), so calls to it within the linked image
-             * branch directly instead of through a stub
+            /* A weak function that is not exported, outside a shared library,
+             * can be hidden by the linker (weak_def_can_be_hidden), so calls to
+             * it within the linked image branch directly instead of through a stub
              */
-            if (config.target_cpu == TARGET_AArch64 && tyfunc(s.ty()) && !(s.ty() & mTYexport))
+            if (config.target_cpu == TARGET_AArch64 && tyfunc(s.ty()) && !(s.ty() & mTYexport) &&
+                !config.sharedLibrary)
                 sym.n_desc |= N_WEAK_REF;
         }
         sym.n_sect = remap(s.Sseg);
