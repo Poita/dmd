@@ -670,6 +670,10 @@ Lret:
 private __gshared
 {
     bool doflow;             // true if flow analysis has to be redone
+    /* The available expressions are computed only when loop invariant
+     * marking needs them, which is rare, from the trees as they are then
+     */
+    bool aeStale;
 }
 
 /*********************************
@@ -833,7 +837,7 @@ restart:
         {
             flowrd(go, bo);         /* compute reaching definitions  */
             flowlv(bo);             /* compute live variables        */
-            flowae(go, bo);         // compute available expressions
+            aeStale = true;         // available expressions when needed
             doflow = false;         /* no need to redo it           */
             if (go.defnod.length == 0)     /* if no definition elems       */
                 break;              /* no need to optimize          */
@@ -847,7 +851,7 @@ restart:
                 unmarkall(bo.dfo[i].Belem);       /* unmark all elems     */
 
         /* Find & mark all LIs   */
-        vec_t gin = vec_clone(l.Lpreheader.Bout);
+        vec_t gin = null;       // the expressions available entering the loop, when needed
         vec_t rd = vec_calloc(go.defnod.length);        /* allocate our running RD vector */
         for (uint i = 0; (i = cast(uint) vec_index(i, lv)) < bo.dfo.length; ++i) // for each block in loop
         {
@@ -866,7 +870,7 @@ restart:
                     }
                     printf("rd    : "); vec_println(rd);
                 }
-                markInvariants(go, b != l.Lhead, b, lv, gin, b.Belem, rd);
+                markInvariants(go, b != l.Lhead, b, lv, gin, l.Lpreheader, b.Belem, rd);
                 static if (0)
                 {
                     printf("B%d\n", i);
@@ -943,7 +947,8 @@ restart:
  */
 
 @trusted
-private void markInvariants(ref GlobalOptimizer go, int gref, block* gblock, vec_t lv, vec_t gin, elem* n, vec_t rd)
+private void markInvariants(ref GlobalOptimizer go, int gref, block* gblock, vec_t lv, ref vec_t gin,
+    block* preheader, elem* n, vec_t rd)
 {
 
     void markinvar(elem* n,vec_t rd)
@@ -1224,6 +1229,15 @@ private void markInvariants(ref GlobalOptimizer go, int gref, block* gblock, vec
                                 int j;
 
                                 //printf("\tn is: "); WReqn(n); printf("\n");
+                                if (!gin)
+                                {
+                                    if (aeStale)
+                                    {
+                                        flowae(go, bo);
+                                        aeStale = false;
+                                    }
+                                    gin = vec_clone(preheader.Bout);
+                                }
                                 for (j = 0; (j = cast(uint) vec_index(j, gin)) < go.exptop; ++j)
                                 {
                                     elem* e = go.expnod[j];
@@ -1997,7 +2011,7 @@ private void loopiv(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
     {
         flowrd(go, bo);         /* compute reaching defs                */
         flowlv(bo);             /* compute live variables               */
-        flowae(go, bo);         // compute available expressions
+        aeStale = true;         // available expressions when needed
         doflow = false;
     }
     findbasivs(go, l);          /* find basic induction variables       */
