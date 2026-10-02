@@ -1769,6 +1769,33 @@ private elem* elor(elem* e, Goal goal)
             e1.Eoper = OPror;
             return el_selecte1(e);
         }
+        /* (a >> s) | (a << (-s & (bits - 1))) and
+         * (a << s) | (a >> (-s & (bits - 1)))
+         */
+        static bool negMasked(elem* m, elem* s, uint bits)
+        {
+            return m.Eoper == OPand && m.E2.Eoper == OPconst && el_tolong(m.E2) == bits - 1 &&
+                   m.E1.Eoper == OPneg && el_match5(m.E1.E1, s);
+        }
+        if (e1.Eoper == OPshr && e2.Eoper == OPshl &&
+            tyuns(e1.E1.Ety) &&
+            negMasked(e2.E2, e1.E2, sz * 8) &&
+            el_match5(e1.E1, e2.E1) &&
+            !el_sideeffect(e)
+           )
+        {
+            e1.Eoper = OPror;
+            return el_selecte1(e);
+        }
+        if (e1.Eoper == OPshl && e2.Eoper == OPshr &&
+            tyuns(e2.E1.Ety) &&
+            negMasked(e2.E2, e1.E2, sz * 8) &&
+            el_match5(e1.E1, e2.E1) &&
+            !el_sideeffect(e)
+           )
+        {
+            return rol();
+        }
         // rotate left by a constant
         if (e1.Eoper == OPshl && e2.Eoper == OPshr &&
             tyuns(e2.E1.Ety) &&
