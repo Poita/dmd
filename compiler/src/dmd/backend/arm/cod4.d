@@ -1327,6 +1327,27 @@ void cdcmp(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
     /* A byte or short value loaded from memory is already extended to 32 bits
      * as its type is signed or not
      */
+    /* Whether instruction c leaves in reg a byte or short (sz) extended to
+     * 32 bits as uns says
+     */
+    static bool extendsInto(const(code)* c, reg_t reg, uint sz, bool uns)
+    {
+        if (!c)
+            return false;
+        const imms = sz == 1 ? 7 : 15;
+        const op = c.Iop & ~(0x1F << 5);           // any Rn
+        if (op == (uns ? INSTR.ubfm(0,0,0,imms,0,reg) : INSTR.sbfm(0,0,0,imms,0,reg)))
+            return true;                            // UXTB/UXTH/SXTB/SXTH reg,Rn
+        if (uns)
+        {
+            uint N, immr, ims;
+            if (encodeNImmrImms(sz == 1 ? 0x0000_00FF_0000_00FF : 0x0000_FFFF_0000_FFFF, N, immr, ims) &&
+                op == INSTR.log_imm(0, 0, N, immr, ims, 0, reg))
+                return true;                        // AND reg,Rn,#0xFF or #0xFFFF
+        }
+        return false;
+    }
+
     static bool cleanNarrow(const(elem)* x)
     {
         return !x.Ecount && (x.Eoper == OPind ||
@@ -1354,9 +1375,10 @@ void cdcmp(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
                 }
                 if (c < 0x1000)
                 {
-                    const clean = cleanNarrow(e1);
+                    bool clean = cleanNarrow(e1);
                     scodelem(cg,cdb,e1,retregs,0,clean);    // compute left leaf
                     reg = findreg(retregs);
+                    clean |= extendsInto(cdb.last(), reg, sz, tyuns(tym) != 0);
                     if (!clean)
                     {
                         getregs(cdb, retregs);
@@ -1403,10 +1425,12 @@ void cdcmp(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         default:
         {
             const clean1 = sz < 4 && cleanNarrow(e1) && tysize(e1.Ety) == sz && !tyuns(e1.Ety) == !tyuns(tym);
-            const clean2 = sz < 4 && cleanNarrow(e2) && tysize(e2.Ety) == sz && !tyuns(e2.Ety) == !tyuns(tym);
+            bool clean2 = sz < 4 && cleanNarrow(e2) && tysize(e2.Ety) == sz && !tyuns(e2.Ety) == !tyuns(tym);
             scodelem(cg,cdb,e1,retregs,0,true);        // compute left leaf
             rretregs = cg.allregs & ~retregs;
             scodelem(cg,cdb,e2,rretregs,retregs,true); // get right leaf
+            if (sz < 4 && !isPair)
+                clean2 |= extendsInto(cdb.last(), findreg(rretregs), sz, tyuns(tym) != 0);
             if (isPair)
             {
                 // Compare MSW, if they're equal then compare the LSW

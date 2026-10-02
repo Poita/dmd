@@ -54,8 +54,27 @@ int refDirty(ubyte x, ubyte y, byte p, byte q, ushort s, short t)
     return r;
 }
 
+// a byte loaded into a register variable, then compared
+pragma(inline, false) uint scan(const(ubyte)[] state, const(ubyte)[] owner, ubyte own)
+{
+    uint best = uint.max;
+    foreach (cell, st; state)
+    {
+        if (st != 1 || owner[cell] != own)
+            continue;
+        best = cast(uint) cell;
+    }
+    return best;
+}
+
 void main()
 {
+    ubyte[6] st = [0, 1, 2, 1, 1, 0x81];
+    ubyte[6] ow = [3, 3, 3, 4, 3, 3];
+    assert(scan(st[], ow[], 3) == 4);
+    assert(scan(st[], ow[], 4) == 3);
+    assert(scan(st[], ow[], 5) == uint.max);
+
     ubyte[4] a = [2, 255, 0, 2];
     byte[4] b = [-128, 127, -101, 5];
     ushort[4] c = [60001, 60001, 1, 65535];
