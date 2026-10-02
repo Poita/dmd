@@ -339,6 +339,12 @@ void optfunc(ref GlobalOptimizer go, ref BlockOpt bo)
     // We try to put a lid on it.
     clock_t starttime = clock();
     int iter = 0;           // iteration count
+    /* The loop optimizations and boolopt() run again only after a round in which
+     * they changed something: what the other optimizations change rarely gives
+     * them more to do, and they are costly
+     */
+    bool loopChanged = true;
+    bool boolChanged = true;
     do
     {
         //printf("iter = %d\n", iter);
@@ -385,16 +391,27 @@ void optfunc(ref GlobalOptimizer go, ref BlockOpt bo)
         if (go.mfoptim & MFcnp)
             constprop(go, bo, go.changes);  /* make relationals unsigned     */
         if (go.mfoptim & (MFli | MFliv))
-            loopopt(go, bo);                /* remove loop invariants and    */
-                                        /* induction vars                */
-                                        /* do loop rotation              */
+        {
+            if (loopChanged)
+            {
+                const before = go.changes;
+                loopopt(go, bo);            /* remove loop invariants and    */
+                                            /* induction vars                */
+                                            /* do loop rotation              */
+                loopChanged = go.changes != before;
+            }
+        }
         else
             foreach (b; BlockRange(bo.startblock))
                 b.Bweight = 1;
         dbg_optprint("boolopt\n");
 
-        if (go.mfoptim & MFcnp)
+        if (go.mfoptim & MFcnp && boolChanged)
+        {
+            const before = go.changes;
             boolopt(go, bo);              // optimize boolean values
+            boolChanged = go.changes != before;
+        }
         if (go.changes && go.mfoptim & MFloop && (clock() - starttime) < 30 * CLOCKS_PER_SEC)
             continue;
 
