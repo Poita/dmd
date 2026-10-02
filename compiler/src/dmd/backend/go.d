@@ -412,11 +412,9 @@ void optfunc(ref GlobalOptimizer go, ref BlockOpt bo)
             boolopt(go, bo);              // optimize boolean values
             boolChanged = go.changes != before;
         }
-        if (go.changes && go.mfoptim & MFloop && (clock() - starttime) < 30 * CLOCKS_PER_SEC)
-            continue;
-
-        /* Constant propagation ran in this round already, and nothing has
-         * changed since
+        /* The rest of the round runs whatever changed so far, as starting the
+         * next round at once takes more rounds to settle. Constant propagation
+         * runs once a round, at its start.
          */
         if (go.mfoptim & MFcp)
             copyprop(go, bo);           /* do copy propagation           */
