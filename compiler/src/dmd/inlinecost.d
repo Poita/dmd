@@ -39,7 +39,7 @@ import dmd.visitor;
 import dmd.visitor.postorder;
 import dmd.inline : restEndsWithReturn;
 
-enum COST_MAX = 500;
+enum COST_MAX = 250;
 
 private enum STATEMENT_COST = 0x1000;
 private enum STATEMENT_COST_MAX = 250 * STATEMENT_COST;
