@@ -1629,7 +1629,7 @@ public:
          */
         bool withinBudget(FuncDeclaration fd)
         {
-            enum cheapCost = 20;        // cost of a function about as cheap as the call
+            enum cheapCost = 10;        // cost of a function about as cheap as the call
             enum budget = 500;          // cost a function may inline outside loops
             if (loopDepth || fd.inlining == PINLINE.always)
                 return true;
