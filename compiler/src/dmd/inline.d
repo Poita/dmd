@@ -1063,6 +1063,16 @@ private Result doInlineAs(Result)(Expression e, InlineDoState ids)
  * Walk the trees, looking for functions to inline.
  * Inline any that can be.
  */
+/// The costs canInline() computed, by function
+private __gshared int[void*] inlineCosts;
+
+private int inlineCostOf(FuncDeclaration fd)
+{
+    if (auto p = cast(void*)fd in inlineCosts)
+        return *p;
+    return 0;
+}
+
 private extern (C++) final class InlineScanVisitor : Visitor
 {
     alias visit = Visitor.visit;
@@ -1071,6 +1081,8 @@ public:
     FuncDeclaration parent;     // function being scanned
     PASS pass;
     ErrorSink eSink;
+    int inlinedCost;            // cost of the functions inlined outside loops
+    int loopDepth;              // number of loops around what is being scanned
 
     // As the visit method cannot return a value, these variables
     // are used to pass the result from 'visit' back to 'inlineScan'
@@ -1251,35 +1263,45 @@ public:
 
     override void visit(WhileStatement s)
     {
+        ++loopDepth;
         inlineScan(s.condition);
         inlineScan(s._body);
+        --loopDepth;
     }
 
     override void visit(DoStatement s)
     {
+        ++loopDepth;
         inlineScan(s._body);
         inlineScan(s.condition);
+        --loopDepth;
     }
 
     override void visit(ForStatement s)
     {
         inlineScan(s._init);
+        ++loopDepth;
         inlineScan(s.condition);
         inlineScan(s.increment);
         inlineScan(s._body);
+        --loopDepth;
     }
 
     override void visit(ForeachStatement s)
     {
         inlineScan(s.aggr);
+        ++loopDepth;
         inlineScan(s._body);
+        --loopDepth;
     }
 
     override void visit(ForeachRangeStatement s)
     {
         inlineScan(s.lwr);
         inlineScan(s.upr);
+        ++loopDepth;
         inlineScan(s._body);
+        --loopDepth;
     }
 
     override void visit(IfStatement s)
@@ -1601,6 +1623,25 @@ public:
      */
     void visitCallExp(CallExp e, Expression eret, bool asStatements, bool propagateNRVO)
     {
+        /* Inlining a call outside loops saves little time, while what is
+         * inlined is optimized again in each caller: past a budget, only
+         * functions about as cheap as the call are inlined there
+         */
+        bool withinBudget(FuncDeclaration fd)
+        {
+            enum cheapCost = 20;        // cost of a function about as cheap as the call
+            enum budget = 500;          // cost a function may inline outside loops
+            if (loopDepth || fd.inlining == PINLINE.always)
+                return true;
+            const cost = inlineCostOf(fd);
+            if (cost <= cheapCost)
+                return true;
+            if (inlinedCost + cost > budget)
+                return false;
+            inlinedCost += cost;
+            return true;
+        }
+
         inlineScan(e.e1);
         arrayInlineScan(e.arguments);
 
@@ -1639,7 +1680,7 @@ public:
                 hasThis = parent == fd.toParent2();
             }
 
-            if (canInline(fd, hasThis, asStates, pass, eSink))
+            if (canInline(fd, hasThis, asStates, pass, eSink) && withinBudget(fd))
             {
                 expandInline(e, fd, parent, eret, explicitThis, asStates, propagateNRVO,
                              eresult, sresult, again);
@@ -2193,6 +2234,7 @@ private bool canInline(FuncDeclaration fd, bool hasThis, bool statementsToo, PAS
         scope v = new InlineScanVisitorDsymbol(pass, eSink);
         fd.accept(v);
         cost = inlineCostFunction(fd, hasThis);
+        inlineCosts[cast(void*)fd] = cost;
     }
     static if (CANINLINE_LOG)
     {
