@@ -1277,10 +1277,15 @@ int cgreg_assign(ref CGstate cg, Symbol* retsym)
         cgreg_map(cg,t.sym,t.regmsw,t.reglsw);
         flag = true;
         vec_orass(assignedRange, t.sym.Srange);
-        if (overlap && ++rangeWalkStamp == 0)  // the register is now used in more blocks
+        if (overlap)
         {
-            walkMemo[][] = 0;
-            rangeWalkStamp = 1;
+            // the walks remembered for the registers t took no longer hold
+            foreach (si; 0 .. walkMemo.length / walkMemoRegs)
+            {
+                walkMemo[si * walkMemoRegs + t.reglsw] = 0;
+                if (t.regmsw != NOREG)
+                    walkMemo[si * walkMemoRegs + t.regmsw] = 0;
+            }
         }
 
         if (cg.mfuncreg != mfuncregBefore)
