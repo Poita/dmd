@@ -2056,6 +2056,18 @@ private AggVal genAgg(elem* e)
                 v.r = av.slots;
                 return v;
             }
+            if (Reg r = varReg(e.Vsym))
+            {
+                // an integer register variable read as an aggregate passed in one register
+                if (rcOf(r) != RC.gp || e.Voffset)
+                {
+                    fail("register variable as aggregate");
+                    return v;
+                }
+                v.kind = AggVal.Kind.parts;
+                v.r[0] = r;
+                return v;
+            }
             goto case OPind;
 
         case OPind:
@@ -2104,6 +2116,26 @@ private Reg[4] aggParts(ref AggVal v, ref const AggregateABI a)
         case AggVal.Kind.slots:
         case AggVal.Kind.parts:
             r = v.r;
+            if (a.kind == AggregateABI.Kind.hfa && r[0] && rcOf(r[0]) == RC.gp)
+            {
+                // the elements of an HFA held in an integer register
+                if (a.size > 8)
+                {
+                    fail("hfa in integer register");
+                    break;
+                }
+                Reg w = r[0];
+                foreach (k; 0 .. a.nregs)
+                {
+                    Reg t = w;
+                    if (k)
+                    {
+                        t = newVreg(RC.gp, 8);
+                        emitIns(LOp.lsri, 8, t, w, noReg, k * a.esz * 8);
+                    }
+                    r[k] = asClass(t, RC.fp, a.esz);
+                }
+            }
             break;
 
         case AggVal.Kind.mem:
@@ -2543,9 +2575,9 @@ private Mem memOf(elem* e, bool allowIndex = true)
     Mem m;
     if (e.Eoper == OPvar)
     {
-        if (aggOf(e.Vsym))
+        if (aggOf(e.Vsym) || varReg(e.Vsym))
         {
-            fail("aggregate in memory");
+            fail("register variable in memory");
             m.base = newVreg(RC.gp, 8);
             return m;
         }
