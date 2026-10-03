@@ -3232,8 +3232,6 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
     else if (e1.E1.Eoper == OPrelconst && !e1.E1.Ecount && e1.E1.Voffset == 0 &&
              tyfunc(e1.E1.Vsym.ty()) && isStatic(e1.E1.Vsym))
         sf = e1.E1.Vsym;            // called directly, as BL reaches any function
-    else
-        target = gen(e1.E1);
 
     // the arguments are evaluated from the first to the last, as cdfunc() does
     Reg[16] vals;
@@ -3271,6 +3269,10 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
             r = extend(r, ty, 4);   // the callee expects narrow integers extended to 32 bits
         vals[i] = r;
     }
+    // the address of the function, after the arguments, which may assign what it is computed from
+    if (!sf)
+        target = gen(e1.E1);
+
     // the stack arguments, in an area below SP for the call
     if (stackArgs)
     {
