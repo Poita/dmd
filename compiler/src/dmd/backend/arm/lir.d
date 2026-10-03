@@ -230,6 +230,8 @@ bool lirCodegen(ref CGstate cg)
     select();
     if (failed)
     {
+        if (getenv("DMD_NEWCG_WHY"))
+            fprintf(stderr, "newcg-why: select:%s %s\n", whyNot, funcsym_p.Sident.ptr);
         undoVariables();
         return false;
     }
@@ -250,6 +252,16 @@ bool lirCodegen(ref CGstate cg)
 /******************************* Support check ******************************/
 
 private __gshared const(char)* whyNot;      // what supported() found not handled
+
+/* Give up on the function, for the reason why
+ */
+@trusted
+private void fail(const(char)* why)
+{
+    if (!failed)
+        whyNot = why;
+    failed = true;
+}
 
 /* Whether every block and elem of the function is handled
  */
@@ -274,6 +286,7 @@ private bool supported(ref CGstate cg)
             fprintf(stderr, "newcg-rettype: %s\n", tym_str(tyr));
         return false;
     }
+    whyNot = "other";
 
     foreach (s; globsym[])
     {
@@ -284,8 +297,6 @@ private bool supported(ref CGstate cg)
             case SC.parameter:
                 break;
             case SC.fastpar:
-                if (s.Spreg2 != NOREG && !(s.Sflags & SFLdead))
-                    return false;
                 break;
             default:
                 whyNot = "symbol class";
@@ -303,6 +314,7 @@ private bool supported(ref CGstate cg)
             case BC.exit:
                 break;
             case BC.retexp:
+                whyNot = "retexp";
                 if (!b.Belem)
                     return false;
                 break;
@@ -381,6 +393,7 @@ private bool supportedElem(const(elem)* e)
                 continue;
 
             case OPrelconst:
+                whyNot = "address of variable";
                 return varSupported(e.Vsym);
 
             case OPind:
@@ -417,8 +430,17 @@ private bool supportedElem(const(elem)* e)
             case OPandass: case OPorass: case OPxorass:
             case OPshlass: case OPshrass: case OPashrass:
             case OPpostinc: case OPpostdec:
-                if (op == OPeq && !scalarType(e.Ety))
+                if (op == OPeq && !scalarType(e.E1.Ety))
+                {
+                    whyNot = "aggregate assign";
+                    if (getenv("DMD_NEWCG_WHY"))
+                    {
+                        import dmd.backend.debugprint : oper_str;
+                        fprintf(stderr, "newcg-agg: %s %d %s %s\n", tym_str(e.Ety), cast(int)tysize(e.Ety),
+                            oper_str(e.E1.Eoper), oper_str(e.E2.Eoper));
+                    }
                     return false;
+                }
                 if (!supportedElem(e.E1))
                     return false;
                 e = e.E2;
@@ -1246,7 +1268,7 @@ private Reg genx(elem* e)
         {
             if (rc != RC.fp)
             {
-                failed = true;
+                fail("fp op");
                 return newVreg(rc, sz);
             }
             Reg a = gen(e.E1);
@@ -1389,7 +1411,7 @@ private Reg genx(elem* e)
             return newVreg(RC.gp, 4);
 
         default:
-            failed = true;
+            fail("gen op");
             return newVreg(rc, sz);
     }
 }
@@ -1407,7 +1429,7 @@ private Reg genCall(elem* e)
     Parameter[16] pbuf;
     if (np > pbuf.length || e.Nflags & NFLhidden || e.numParams)
     {
-        failed = true;
+        fail("call form");
         return newVreg(RC.gp, 8);
     }
     Parameter[] params = pbuf[0 .. np];
@@ -1425,7 +1447,7 @@ private Reg genCall(elem* e)
         if (holdsAggregate(ep.Ety, ep.ET) || !scalarType(ep.Ety) ||
             !FuncParamRegs_alloc(*cgp, fpr, ep.ET, ep.Ety, p.reg, p.reg2) || p.reg2 != NOREG)
         {
-            failed = true;
+            fail("call arg");
             return newVreg(RC.gp, 8);
         }
     }
@@ -1510,7 +1532,7 @@ private Reg genAssign(elem* e)
     }
     if (e1.Eoper != OPind)
     {
-        failed = true;
+        fail("assign target");
         return newVreg(RC.gp, 8);
     }
     Reg v;
@@ -1668,7 +1690,7 @@ private Reg genBinary(elem* e)
     }
     if (tyfloating(ty) && tyfloating(e2.Ety) && tysize(e2.Ety) != sz)
     {
-        failed = true;
+        fail("opass size");
         return newVreg(RC.fp, sz);
     }
     return arith(op, ty, a, e2, b);
@@ -1714,7 +1736,7 @@ private Reg genOpAssign(elem* e)
     }
     else if (e1.Eoper != OPind)
     {
-        failed = true;
+        fail("opass target");
         return newVreg(RC.gp, 8);
     }
 
