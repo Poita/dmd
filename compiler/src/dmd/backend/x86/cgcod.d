@@ -225,6 +225,21 @@ void codgenx(ref CGstate cg, Symbol* sfunc)
             cg.regcon.params &= ~noparams;
         }
 
+        /* On AArch64 the code may be generated through virtual registers,
+         * which allocates the registers itself, in one pass
+         */
+        if (cg.AArch64 && config.flags4 & CFG4optimized && cg.pass == BackendPass.initial)
+        {
+            import dmd.backend.arm.lir : lirCodegen;
+            if (lirCodegen(cg))
+            {
+                if (nretblocks == 0 && !(sfunc.ty() & mTYnaked))
+                    sfunc.Sflags |= SFLexit;
+                cg.pass = BackendPass.final_;
+                break;
+            }
+        }
+
         if (config.flags4 & CFG4optimized)
         {
             if (nretblocks == 0 &&                  // if no return blocks in function
