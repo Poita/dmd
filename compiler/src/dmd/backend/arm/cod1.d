@@ -79,7 +79,7 @@ void loadFromEA(ref code cs, reg_t reg, uint szw, uint szr)
     assert(szr <= szw);
     cs.Iop = INSTR.nop;
     assert(reg != NOREG);
-    if (mask(reg) & INSTR.FLOATREGS)       // if floating point store
+    if (reg & 32)       // if a floating point register (v0-v31)
     {
         if (cs.reg != NOREG)
         {
@@ -237,7 +237,7 @@ void storeToEA(ref code cs, reg_t reg, uint sz)
     static if (log) debug printf("storeToEA() reg: %d, sz: %d offset: %d\n", reg, sz, cast(int)cs.IEV1.Voffset);
     cs.Iop = INSTR.nop;
     assert(reg != NOREG);
-    if (mask(reg) & INSTR.FLOATREGS)       // if floating point store
+    if (reg & 32)       // if a floating point register (v0-v31)
     {
         if (cs.reg != NOREG)
         {

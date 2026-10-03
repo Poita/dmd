@@ -31,6 +31,7 @@ import dmd.backend.global : REGSIZE, mask;
 import dmd.backend.oper;
 import dmd.backend.symbol;
 import dmd.backend.ty;
+import dmd.backend.debugprint : tym_str;
 import dmd.backend.type;
 import dmd.backend.x86.code_x86;
 import dmd.backend.arm.cod1 : loadFromEA, storeToEA;
@@ -87,6 +88,7 @@ enum LOp : ubyte
     br,             // jump to target
     bcond,          // jump to target if cond
     brk,            // trap
+    call,           // call sym, or the address in a; imm is the mask of argument registers
 }
 
 /// Flags of an instruction
@@ -191,7 +193,11 @@ bool lirCodegen(ref CGstate cg)
     if (!enabledFor(funcsym_p.Sident.ptr))
         return false;
     if (!supported(cg))
+    {
+        if (getenv("DMD_NEWCG_WHY"))
+            fprintf(stderr, "newcg-why: %s %s\n", whyNot, funcsym_p.Sident.ptr);
         return false;
+    }
 
     cgp = &cg;
     failed = false;
@@ -227,6 +233,8 @@ bool lirCodegen(ref CGstate cg)
         undoVariables();
         return false;
     }
+    if (getenv("DMD_NEWCG_VERIFY"))
+        verify();
     computeLiveness();
     allocate();
     if (getenv("DMD_NEWCG_DUMP"))
@@ -241,20 +249,31 @@ bool lirCodegen(ref CGstate cg)
 
 /******************************* Support check ******************************/
 
+private __gshared const(char)* whyNot;      // what supported() found not handled
+
 /* Whether every block and elem of the function is handled
  */
 @trusted
 private bool supported(ref CGstate cg)
 {
+    whyNot = "other";
+    whyNot = "naked";
     if (funcsym_p.ty() & mTYnaked)
         return false;
+    whyNot = "variadic";
     if (variadic(funcsym_p.Stype))
         return false;
+    whyNot = "alloca";
     if (cg.Alloca.size)
         return false;
+    whyNot = "return type";
     const tyr = tybasic(funcsym_p.Stype.Tnext.Tty);
     if (tyr != TYvoid && !scalarType(tyr))
+    {
+        if (getenv("DMD_NEWCG_WHY"))
+            fprintf(stderr, "newcg-rettype: %s\n", tym_str(tyr));
         return false;
+    }
 
     foreach (s; globsym[])
     {
@@ -269,6 +288,7 @@ private bool supported(ref CGstate cg)
                     return false;
                 break;
             default:
+                whyNot = "symbol class";
                 return false;
         }
     }
@@ -280,16 +300,21 @@ private bool supported(ref CGstate cg)
             case BC.goto_:
             case BC.iftrue:
             case BC.ret:
+            case BC.exit:
                 break;
             case BC.retexp:
                 if (!b.Belem)
                     return false;
                 break;
             default:
+                whyNot = "block kind";
                 return false;
         }
         if (b.Btry)
+        {
+            whyNot = "try";
             return false;
+        }
         if (b.Belem && !supportedElem(b.Belem))
             return false;
     }
@@ -318,16 +343,42 @@ private bool supportedElem(const(elem)* e)
     while (1)
     {
         const op = e.Eoper;
-        if (!(op == OPcolon) && !(op == OPcomma) && !(op == OPeq) &&
-            !scalarType(e.Ety) && tybasic(e.Ety) != TYvoid)
+        if (!(op == OPcolon) && !(op == OPcomma) && !(op == OPeq) && !(op == OPparam) &&
+            !scalarType(e.Ety) && tybasic(e.Ety) != TYvoid && tybasic(e.Ety) != TYnoreturn)
+        {
+            whyNot = "type";
             return false;
+        }
         switch (op)
         {
             case OPconst:
             case OPvar:
                 if (op == OPvar && !varSupported(e.Vsym))
+                {
+                    whyNot = "variable";
                     return false;
+                }
                 return true;
+
+            case OPcall:
+            case OPucall:
+            {
+                if (!supportedCallee(e.E1))
+                {
+                    whyNot = "callee";
+                    return false;
+                }
+                if (op == OPucall)
+                    return true;
+                e = e.E2;
+                continue;
+            }
+
+            case OPparam:
+                if (!supportedElem(e.E1))
+                    return false;
+                e = e.E2;
+                continue;
 
             case OPrelconst:
                 return varSupported(e.Vsym);
@@ -374,7 +425,11 @@ private bool supportedElem(const(elem)* e)
                 continue;
 
             default:
+            {
+                import dmd.backend.debugprint : oper_str;
+                whyNot = oper_str(op);
                 return false;
+            }
         }
     }
 }
@@ -391,9 +446,46 @@ private bool varSupported(const Symbol* s)
         case SC.parameter:
         case SC.fastpar:
             return true;
+        case SC.static_:
+        case SC.extern_:
+        case SC.global:
+        case SC.comdat:
+        case SC.locstat:
+        case SC.comdef:
+            return !(s.ty() & mTYthread);
         default:
             return false;
     }
+}
+
+/* Whether s is in static memory
+ */
+private bool isStatic(const Symbol* s)
+{
+    switch (s.Sclass)
+    {
+        case SC.static_:
+        case SC.extern_:
+        case SC.global:
+        case SC.comdat:
+        case SC.locstat:
+        case SC.comdef:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* Whether the function called through e1 is handled
+ */
+@trusted
+private bool supportedCallee(const(elem)* e1)
+{
+    if (e1.Eoper == OPvar)
+        return tyfunc(e1.Vsym.ty()) && isStatic(e1.Vsym) && strcmp(e1.Vsym.Sident.ptr, "alloca") != 0;
+    if (e1.Eoper == OPind)
+        return supportedElem(e1.E1);
+    return false;
 }
 
 /******************************* Variables ******************************/
@@ -481,9 +573,9 @@ private void undoVariables()
 @trusted
 private void finishVariables()
 {
-    foreach (k, s; globsym[])
+    foreach (k, r; symReg[])
     {
-        const r = symReg[k];
+        Symbol* s = globsym[k];
         if (!r)
             continue;
         const v = &vinfo[r - firstVreg];
@@ -572,9 +664,9 @@ private void select()
 {
     blockStart.push(0);
     // copy the parameters out of the registers they are passed in
-    foreach (k, s; globsym[])
+    foreach (k, r; symReg[])
     {
-        const r = symReg[k];
+        Symbol* s = globsym[k];
         if (!r)
             continue;
         if (s.Sclass == SC.fastpar)
@@ -622,6 +714,7 @@ private void select()
             }
 
             case BC.ret:
+            case BC.exit:
                 if (b.Belem)
                     genEffect(b.Belem);
                 break;
@@ -717,6 +810,22 @@ private void genEffect(elem* e)
         }
 
         default:
+            // an unused value without side effects of its own needs only its operands'
+            if (!e.Ecount && !OTsideff(e.Eoper) && e.Eoper != OPind && e.Eoper != OPcall &&
+                e.Eoper != OPucall && e.Eoper != OPparam)
+            {
+                if (OTbinary(e.Eoper))
+                {
+                    genEffect(e.E1);
+                    genEffect(e.E2);
+                    return;
+                }
+                if (OTunary(e.Eoper))
+                {
+                    genEffect(e.E1);
+                    return;
+                }
+            }
             break;
     }
     gen(e);
@@ -915,6 +1024,18 @@ private void copyOut(Reg d, Reg a, uint sz)
         i.flags |= F.condDef;
 }
 
+/* r as a register of class rc, moving it between the integer and float registers if needed
+ */
+@trusted
+private Reg asClass(Reg r, RC rc, uint sz)
+{
+    if (rcOf(r) == rc)
+        return r;
+    Reg d = newVreg(rc, sz);
+    emitIns(LOp.copy, sz, d, r);
+    return d;
+}
+
 /* Mark where d, assigned only conditionally below, starts being live
  */
 @trusted
@@ -986,6 +1107,14 @@ private Mem memOf(elem* e)
     Mem m;
     if (e.Eoper == OPvar)
     {
+        if (isStatic(e.Vsym))
+        {
+            m.base = newVreg(RC.gp, 8);
+            auto i = emitIns(LOp.lea, 8, m.base, noReg, noReg, 0);
+            i.sym = e.Vsym;
+            m.offset = e.Voffset;
+            return m;
+        }
         m.sym = e.Vsym;
         m.offset = e.Voffset;
         usesFrame = true;
@@ -1059,7 +1188,7 @@ private Reg genx(elem* e)
         case OPvar:
         {
             if (Reg r = varReg(e.Vsym))
-                return r;
+                return asClass(r, rc, sz);
             Reg d = newVreg(rc, sz);
             load(d, memOf(e), ty);
             return d;
@@ -1070,9 +1199,14 @@ private Reg genx(elem* e)
             Reg d = newVreg(RC.gp, 8);
             auto i = emitIns(LOp.lea, 8, d, noReg, noReg, e.Voffset);
             i.sym = e.Vsym;
-            usesFrame = true;
+            if (!isStatic(e.Vsym))
+                usesFrame = true;
             return d;
         }
+
+        case OPcall:
+        case OPucall:
+            return genCall(e);
 
         case OPind:
         {
@@ -1260,6 +1394,95 @@ private Reg genx(elem* e)
     }
 }
 
+/* The call e, returning the register of its result
+ */
+@trusted
+private Reg genCall(elem* e)
+{
+    import dmd.backend.x86.cod1 : Parameter, fillParameters, FuncParamRegs_create, FuncParamRegs_alloc;
+    import dmd.backend.arm.cod1 : holdsAggregate;
+
+    const tyf = tybasic(e.E1.Ety);
+    const np = e.Eoper == OPcall ? el_nparams(e.E2) : 0;
+    Parameter[16] pbuf;
+    if (np > pbuf.length || e.Nflags & NFLhidden || e.numParams)
+    {
+        failed = true;
+        return newVreg(RC.gp, 8);
+    }
+    Parameter[] params = pbuf[0 .. np];
+    if (np)
+    {
+        int n = 0;
+        fillParameters(e.E2, params, n);
+    }
+    // registers are allocated from the last argument to the first, as cdfunc() does
+    FuncParamRegs fpr = FuncParamRegs_create(tyf);
+    for (int i = np; --i >= 0;)
+    {
+        Parameter* p = &params[i];
+        elem* ep = p.e;
+        if (holdsAggregate(ep.Ety, ep.ET) || !scalarType(ep.Ety) ||
+            !FuncParamRegs_alloc(*cgp, fpr, ep.ET, ep.Ety, p.reg, p.reg2) || p.reg2 != NOREG)
+        {
+            failed = true;
+            return newVreg(RC.gp, 8);
+        }
+    }
+
+    // the function called
+    Symbol* sf;
+    Reg target;
+    elem* e1 = e.E1;
+    if (e1.Eoper == OPvar)
+        sf = e1.Vsym;
+    else if (e1.E1.Eoper == OPrelconst && !e1.E1.Ecount && e1.E1.Voffset == 0 &&
+             tyfunc(e1.E1.Vsym.ty()) && isStatic(e1.E1.Vsym))
+        sf = e1.E1.Vsym;            // called directly, as BL reaches any function
+    else
+        target = gen(e1.E1);
+
+    // the arguments are evaluated from the first to the last, as cdfunc() does
+    Reg[16] vals;
+    foreach (i, ref p; params)
+    {
+        Reg r = gen(p.e);
+        const ty = tybasic(p.e.Ety);
+        if (!tyfloating(ty) && tysize(ty) < 4)
+            r = extend(r, ty, 4);   // the callee expects narrow integers extended to 32 bits
+        vals[i] = r;
+    }
+    regm_t argRegs;
+    foreach (i, ref p; params)
+    {
+        const ty = tybasic(p.e.Ety);
+        emitIns(LOp.copy, tyfloating(ty) ? tysize(ty) : 8, phys(p.reg), vals[i]);
+        hintCopy(vals[i], phys(p.reg));
+        argRegs |= mask(p.reg);
+    }
+
+    auto c = emitIns(LOp.call, 0, noReg, target, noReg, cast(long)argRegs);
+    c.sym = sf;
+    if (!sf || sf == funcsym_p || !sf.Sfunc || !(sf.Sfunc.Fflags & Fnothrow))
+        funcsym_p.Sfunc.Fflags &= ~Fnothrow;        // the call may throw
+
+    const tyr = tybasic(e.Ety);
+    if (tyr == TYvoid || tyr == TYnoreturn)
+        return newVreg(RC.gp, 8);
+    const sz = tysize(tyr);
+    if (tyfloating(tyr))
+    {
+        Reg d = newVreg(RC.fp, sz);
+        emitIns(LOp.copy, sz, d, phys(32));
+        hintCopy(d, phys(32));
+        return d;
+    }
+    Reg d = newVreg(RC.gp, sz);
+    emitIns(LOp.copy, 8, d, phys(0));
+    hintCopy(d, phys(0));
+    return d;
+}
+
 /* e1 = e2
  */
 @trusted
@@ -1272,6 +1495,11 @@ private Reg genAssign(elem* e)
         if (Reg r = varReg(e1.Vsym))
         {
             Reg v = gen(e.E2);
+            if (rcOf(r) != rcOf(v))
+            {
+                copyOut(r, asClass(v, rcOf(r), tysize(ty)), tysize(ty));
+                return v;
+            }
             copyOut(r, v, rcOf(r) == RC.fp ? tysize(ty) : 8);
             hintCopy(r, v);
             return r;
@@ -1463,10 +1691,19 @@ private Reg genOpAssign(elem* e)
         if (Reg r = varReg(e1.Vsym))
         {
             Reg b = gen(e.E2);
+            const rc = fp ? RC.fp : RC.gp;
+            if (rcOf(r) != rc)
+            {
+                // the variable is accessed as a type of the other register class
+                Reg v = asClass(r, rc, sz);
+                Reg d = arith(op, ty, v, e.E2, b);
+                copyOut(r, asClass(d, rcOf(r), sz), sz);
+                return post ? v : d;
+            }
             Reg old;
             if (post)
             {
-                old = newVreg(fp ? RC.fp : RC.gp, sz);
+                old = newVreg(rc, sz);
                 emitIns(LOp.copy, fp ? sz : 8, old, r);
             }
             Reg d = arith(op, ty, r, e.E2, b);
@@ -1504,7 +1741,20 @@ private void forUses(ref LIns i, scope void delegate(Reg) nothrow dg)
     if (i.a) dg(i.a);
     if (i.b) dg(i.b);
     if (i.c) dg(i.c);
+    if (i.op == LOp.call)
+    {
+        // the argument registers
+        const regm_t m = cast(regm_t)i.imm;
+        foreach (p; 0 .. 64)
+            if (m & (1UL << p))
+                dg(phys(p));
+    }
 }
+
+/* The registers a call destroys
+ */
+private enum regm_t callClobbers = (0x7_FFFF | (1UL << 30)) |       // x0 .. x18, x30
+                                   (0xFFUL << 32) | (0xFFFF_0000UL << 32);   // v0 .. v7, v16 .. v31
 
 @trusted
 private void addRange(Reg r, uint from, uint to)
@@ -1769,8 +2019,10 @@ private void allocate()
     foreach (ref o; occupied)
         o.setLength(0);
 
-    // the physical registers are occupied from their definition to their last use
-    // in the block, as parameters and return values are copied
+    /* The physical registers are occupied from their definition to their next
+     * use in the block, or to its end if there is none, as for a return value.
+     * A call destroys the caller saved registers.
+     */
     foreach (bi; 0 .. blocks.length)
     {
         uint[64] lastDef = uint.max;
@@ -1783,14 +2035,36 @@ private void allocate()
                 const p = physOf(r);
                 const from = lastDef[p] == uint.max ? usePos(blockStart[bi]) : lastDef[p];
                 occupied[p].push(Range(from, usePos(n) + 1));
+                lastDef[p] = uint.max;
             }
             forUses(*i, &use);
-            if (isPhys(i.d))
+            if (i.op == LOp.call)
             {
-                // live until the end of the block, as for a return value
-                occupied[physOf(i.d)].push(Range(defPos(n), usePos(blockStart[bi + 1]) + 1));
+                foreach (p; 0 .. 64)
+                    if (callClobbers & (1UL << p))
+                    {
+                        occupied[p].push(Range(defPos(n), defPos(n) + 1));
+                        lastDef[p] = uint.max;
+                    }
+                // the result registers
+                lastDef[0] = lastDef[1] = defPos(n);
+                lastDef[32] = lastDef[33] = defPos(n);
             }
+            if (isPhys(i.d))
+                lastDef[physOf(i.d)] = defPos(n);
         }
+        // defined and not used in the block: a return value
+        foreach (p; 0 .. 64)
+            if (lastDef[p] != uint.max && !(lastDef[p] == defPos(blockStart[bi + 1] - 1) && false))
+            {
+                // a call's unused result registers need not be kept
+                bool isCallResult = false;
+                const dn = lastDef[p] / 2;
+                if (dn < ins.length && ins[dn].op == LOp.call)
+                    isCallResult = true;
+                if (!isCallResult)
+                    occupied[p].push(Range(lastDef[p], usePos(blockStart[bi + 1]) + 1));
+            }
     }
     foreach (ref o; occupied)
     {
@@ -2342,15 +2616,7 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
             if (i.sym)
                 symEA(cs, i.sym, i.imm);
             else
-            {
-                cs.Iflags = CF.off;
-                cs.IFL1 = FL.offset;
-                cs.IEV1.Voffset = i.imm;
-                cs.reg = NOREG;
-                cs.index = NOREG;
-                cs.base = cast(reg_t)pr(i.a);
-                cs.Sextend = 0;
-            }
+                baseEA(cs, pr(i.a));
             if (d < 32 && i.flags & F.signed)
                 cs.Sextend = cast(ubyte)(i.sz == 1 ? Extend.SXTB : i.sz == 2 ? Extend.SXTH :
                                          i.sz == 4 ? Extend.SXTW : Extend.LSL);
@@ -2358,6 +2624,8 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
                 cs.Sextend = cast(ubyte)(i.sz == 1 ? Extend.UXTB : i.sz == 2 ? Extend.UXTH :
                                          i.sz == 4 ? Extend.UXTW : Extend.LSL);
             loadFromEA(cs, cast(reg_t)d, i.sz == 8 ? 8 : 4, i.sz);
+            if (!i.sym)
+                setBaseOffset(cdb, cs, i.imm);
             cdb.gen(&cs);
             break;
         }
@@ -2368,16 +2636,10 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
             if (i.sym)
                 symEA(cs, i.sym, i.imm);
             else
-            {
-                cs.Iflags = CF.off;
-                cs.IFL1 = FL.offset;
-                cs.IEV1.Voffset = i.imm;
-                cs.reg = NOREG;
-                cs.index = NOREG;
-                cs.base = cast(reg_t)pr(i.b);
-                cs.Sextend = 0;
-            }
+                baseEA(cs, pr(i.b));
             storeToEA(cs, cast(reg_t)pr(i.a), i.sz);
+            if (!i.sym)
+                setBaseOffset(cdb, cs, i.imm);
             cdb.gen(&cs);
             break;
         }
@@ -2387,6 +2649,26 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
             const d = pr(i.d);
             def(d);
             Symbol* s = i.sym;
+            if (isStatic(s))
+            {
+                import dmd.backend.machobj : MachObj_isGOTRef;
+                FL fl = s.Sfl;
+                if (fl == FL.func)
+                    fl = FL.extern_;                // not a PC relative address
+                cdb.gencs1(INSTR.adr(1, 0, d), 0, fl, s);       // ADRP d,sym@PAGE
+                const isFunc = tyfunc(s.ty()) && (s.Sclass == SC.global || s.Sclass == SC.extern_ || s.Sclass == SC.comdat);
+                const uint w = config.objfmt == OBJ_MACH && (MachObj_isGOTRef(s) || isFunc)
+                    ? INSTR.ldr_imm_gen(1, d, d, 0)             // LDR d,[d,sym@GOTPAGEOFF]
+                    : INSTR.addsub_imm(1, 0, 0, 0, 0, d, d);    // ADD d,d,sym@PAGEOFF
+                cdb.gencs1(w, 0, fl, s);
+                cdb.last.Iflags |= CF.add;
+                if (i.imm)
+                {
+                    import dmd.backend.arm.cod3 : genaddimm;
+                    genaddimm(cdb, cast(reg_t)d, cast(reg_t)d, i.imm);
+                }
+                break;
+            }
             code cs;
             symEA(cs, s, 0);
             cs.Iop = INSTR.addsub_imm(1, 0, 0, 0, 0, 29, d);
@@ -2420,6 +2702,23 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
         case LOp.brk:
             cdb.gen1(INSTR.brk(0));
             break;
+
+        case LOp.call:
+        {
+            cgp.calledafunc = 1;
+            if (Symbol* s = i.sym)
+            {
+                FL fl = FL.func;
+                if (!tyfunc(s.ty()))
+                    fl = s.Sfl;
+                cdb.gencs1(INSTR.branch_imm(1, 0), 0, fl, s);      // BL s
+                code_orflag(cdb.last(), CF.selfrel | CF.off | CF.selfrel26);
+            }
+            else
+                cdb.gen1(INSTR.blr(pr(i.a)));                     // BLR a
+            used |= callClobbers & (INSTR.ALLREGS | INSTR.FLOATREGS);
+            break;
+        }
 
         default:
             assert(0);
@@ -2496,4 +2795,90 @@ private void dump()
         }
         default: return "?";
     }
+}
+
+/* Check the register classes of the operands, printing what is wrong
+ */
+@trusted
+private void verify()
+{
+    foreach (n, ref i; ins[])
+    {
+        void want(Reg r, RC rc, const(char)* what)
+        {
+            if (r && rcOf(r) != rc)
+                fprintf(stderr, "newcg-verify: %s ins %d %s operand %s has the wrong class\n",
+                    funcsym_p.Sident.ptr, cast(int)n, lopName(i.op), what);
+        }
+        switch (i.op)
+        {
+            case LOp.add: .. case LOp.mvn:
+            case LOp.sext, LOp.zext, LOp.cmp, LOp.cmpi, LOp.cset, LOp.csel, LOp.movi:
+                want(i.d, RC.gp, "d"); want(i.a, RC.gp, "a"); want(i.b, RC.gp, "b"); want(i.c, RC.gp, "c");
+                break;
+            case LOp.fadd: .. case LOp.fcsel:
+            case LOp.fmovi, LOp.fcvt:
+                want(i.d, RC.fp, "d"); want(i.a, RC.fp, "a"); want(i.b, RC.fp, "b");
+                break;
+            case LOp.scvtf, LOp.ucvtf:
+                want(i.d, RC.fp, "d"); want(i.a, RC.gp, "a");
+                break;
+            case LOp.fcvtzs, LOp.fcvtzu:
+                want(i.d, RC.gp, "d"); want(i.a, RC.fp, "a");
+                break;
+            case LOp.ld:
+                want(i.a, RC.gp, "a");
+                break;
+            case LOp.st:
+                want(i.b, RC.gp, "b");
+                break;
+            case LOp.lea:
+                want(i.d, RC.gp, "d");
+                break;
+            default:
+                break;
+        }
+    }
+}
+
+/* Address [base] for loadFromEA()/storeToEA(), its offset added by setBaseOffset()
+ */
+private void baseEA(ref code cs, uint base)
+{
+    cs.Iflags = cast(CF)0;
+    cs.IFL1 = FL.unde;
+    cs.IEV1.Voffset = 0;
+    cs.reg = NOREG;
+    cs.index = NOREG;
+    cs.base = cast(reg_t)base;
+    cs.Sextend = 0;
+}
+
+/* Encode the offset of load/store cs of [base, #0] (unsigned immediate form):
+ * scaled if it fits, else unscaled for -256..255, else computed into x16
+ */
+@trusted
+private void setBaseOffset(ref CodeBuilder cdb, ref code cs, long off)
+{
+    uint ins = cs.Iop;
+    assert(field(ins, 25, 24) == 1);
+    uint shift = field(ins, 31, 30);
+    if (field(ins, 26, 26) && field(ins, 23, 22) & 2 && shift == 0)
+        shift = 4;                                  // 128 bit vector register
+    if (off >= 0 && !(off & ((1 << shift) - 1)) && (off >> shift) < 0x1000)
+        ins = setField(ins, 21, 10, cast(uint)(off >> shift));
+    else if (off >= -256 && off < 256)
+    {
+        ins = setField(ins, 25, 24, 0);             // LDUR/STUR
+        ins = setField(ins, 21, 10, 0);
+        ins = setField(ins, 20, 12, cast(uint)off & 0x1FF);
+    }
+    else
+    {
+        enum R16 = 16;
+        movregconstant(cdb, R16, off, true);
+        cdb.gen1(INSTR.addsub_shift(1, 0, 0, 0, R16, 0, cast(reg_t)field(ins, 9, 5), R16)); // ADD x16,base,x16
+        ins = setField(ins, 9, 5, R16);
+    }
+    cs.Iop = ins;
 }
