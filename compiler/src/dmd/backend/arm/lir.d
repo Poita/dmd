@@ -190,7 +190,8 @@ private bool enabledFor(const(char)* name)
     }
     if (!enabled)
         return false;
-    if (filter && !strstr(name, filter))
+    // a filter starting with ^ is a prefix, else any part of the name
+    if (filter && (*filter == '^' ? strncmp(name, filter + 1, strlen(filter + 1)) != 0 : !strstr(name, filter)))
         return false;
     // DMD_NEWCG_MAX limits it to that many functions, for bisecting
     __gshared long limit = -2;
@@ -2174,8 +2175,7 @@ private void genMemOp(elem* e)
         }
         Reg n = gen(p.E2);
         Reg d = gen(e.E1);
-        Reg[3] args = [d, s, n];
-        emitLibCall(getRtlsym(RTLSYM.MEMCPY), args[]);
+        copyLoop(d, s, n);
         return;
     }
 
@@ -2218,8 +2218,87 @@ private void genMemOp(elem* e)
         value = newVreg(RC.gp, 4);
         emitIns(LOp.movi, 4, value, noReg, noReg, 0);
     }
-    Reg[3] args = [s, value, n];
-    emitLibCall(getRtlsym(RTLSYM.MEMSET8), args[]);
+    // the value in each byte of 8
+    Reg v8 = newVreg(RC.gp, 8);
+    Reg k = newVreg(RC.gp, 8);
+    emitIns(LOp.movi, 8, k, noReg, noReg, 0x0101_0101_0101_0101);
+    emitIns(LOp.mul, 8, v8, value, k);
+    fillLoop(s, v8, n);
+}
+
+/* for (i = 0; i < n; ) copy 8, 4 then 1 bytes from s + i to d + i, as cdmemcpy() does
+ */
+@trusted
+private void copyLoop(Reg d, Reg s, Reg n)
+{
+    blockLoop(d, s, noReg, n);
+}
+
+/* Store the byte repeated in v8 at s .. s + n
+ */
+@trusted
+private void fillLoop(Reg s, Reg v8, Reg n)
+{
+    blockLoop(s, noReg, v8, n);
+}
+
+/* Copy n bytes from src to dst, or with src noReg store v8 to them: 8 bytes at a
+ * time while there are 8, then 4, then 1
+ */
+@trusted
+private void blockLoop(Reg dst, Reg src, Reg v8, Reg n)
+{
+    const lend = newLabel();
+    const l4 = newLabel();
+    const l8 = newLabel();
+    const l1 = newLabel();
+    const l1t = newLabel();
+    Reg i = newVreg(RC.gp, 8);
+    Reg r = newVreg(RC.gp, 8);
+    void step(uint size)
+    {
+        Mem md;
+        md.base = dst;
+        md.index = i;
+        Reg t = v8;
+        if (src)
+        {
+            Mem ms;
+            ms.base = src;
+            ms.index = i;
+            t = newVreg(RC.gp, size);
+            load(t, ms, chunkType(size));
+        }
+        store(t, md, chunkType(size));
+        Reg i2 = newVreg(RC.gp, 8);
+        emitIns(LOp.addi, 8, i2, i, noReg, size);
+        emitIns(LOp.copy, 8, i, i2);
+    }
+    emitIns(LOp.movi, 8, i, noReg, noReg, 0);
+    jumpTo(lend, COND.eq);
+    ins[ins.length - 1].op = LOp.cbz;               // CBZ n,lend
+    ins[ins.length - 1].a = n;
+    ins[ins.length - 1].sz = 8;
+    emitIns(LOp.cmpi, 8, noReg, n, noReg, 8);
+    jumpTo(l4, COND.cc);
+    placeLabel(l8);
+    step(8);
+    emitIns(LOp.sub, 8, r, n, i);
+    emitIns(LOp.cmpi, 8, noReg, r, noReg, 8);
+    jumpTo(l8, COND.cs);
+    placeLabel(l4);
+    emitIns(LOp.sub, 8, r, n, i);
+    emitIns(LOp.cmpi, 8, noReg, r, noReg, 4);
+    jumpTo(l1t, COND.cc);
+    step(4);
+    placeLabel(l1t);
+    emitIns(LOp.cmp, 8, noReg, n, i);
+    jumpTo(lend, COND.eq);
+    placeLabel(l1);
+    step(1);
+    emitIns(LOp.cmp, 8, noReg, n, i);
+    jumpTo(l1, COND.ne);
+    placeLabel(lend);
 }
 
 /* A call of the C library function f with integer arguments args
