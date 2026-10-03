@@ -484,6 +484,7 @@ private bool supportedElem(const(elem)* e)
 
             case OPind:
             case OPneg:
+            case OPnegass:
             case OPcom:
             case OPnot:
             case OPbool:
@@ -776,20 +777,37 @@ private void assignAggregates()
         if (b.Belem)
             infer(b.Belem);
 
-    // the candidates, with their ABI
+    // the candidates, with their ABI; a 16 byte pair is two 8 byte integer parts
+    Barray!AggregateABI abis;
+    abis.setLength(globsym.length);
     Barray!bool ok;
     ok.setLength(globsym.length);
     ok[][] = false;
     bool any;
     foreach (k, s; globsym[])
     {
-        if (!aggType[k] || s.Sclass != SC.auto_ && s.Sclass != SC.register ||
+        // a pair passed in two integer registers is one too
+        const pairParam = s.Sclass == SC.fastpar && pairType(s.Stype.Tty) &&
+            s.Spreg != NOREG && s.Spreg2 != NOREG && s.Spreg < 32 && s.Spreg2 < 32;
+        if (s.Sclass != SC.auto_ && s.Sclass != SC.register && !pairParam ||
             s.ty() & (mTYvolatile | mTYshared) || s.Sflags & SFLdead)
             continue;
-        const a = aarch64Aggregate(aggType[k]);
-        if (a.kind == AggregateABI.Kind.hfa && a.esz <= 8 ||
-            a.kind == AggregateABI.Kind.gpr && a.nregs == 1 && (a.size == 1 || a.size == 2 || a.size == 4 || a.size == 8))
+        AggregateABI a;
+        if (aggType[k])
+            a = aarch64Aggregate(aggType[k]);
+        else if (pairType(s.Stype.Tty))
         {
+            a.kind = AggregateABI.Kind.gpr;
+            a.nregs = 2;
+            a.size = 16;
+        }
+        else
+            continue;
+        if (a.kind == AggregateABI.Kind.hfa && a.esz <= 8 ||
+            a.kind == AggregateABI.Kind.gpr && a.nregs == 1 && (a.size == 1 || a.size == 2 || a.size == 4 || a.size == 8) ||
+            a.kind == AggregateABI.Kind.gpr && a.nregs == 2 && a.size == 16)
+        {
+            abis[k] = a;
             ok[k] = true;
             any = true;
         }
@@ -797,31 +815,48 @@ private void assignAggregates()
     if (!any)
     {
         ok.dtor();
+        abis.dtor();
         return;
     }
 
-    void walk(const(elem)* e)
+    void walk(const(elem)* e, bool isWrite = false)
     {
         while (1)
         {
+            if (OTassign(e.Eoper) && e.E1.Eoper == OPvar)
+            {
+                // the target is written, and for op= also read, at the same size
+                walk(e.E1, true);
+                if (OTbinary(e.Eoper))
+                {
+                    e = e.E2;
+                    continue;
+                }
+                return;
+            }
             if (e.Eoper == OPvar || e.Eoper == OPrelconst)
             {
                 const s = e.Vsym;
                 const k = s.Ssymnum;
                 if (k < globsym.length && globsym[k] is s && ok[k])
                 {
-                    const a = aarch64Aggregate(aggType[k]);
+                    const a = abis[k];
                     // the whole, possibly typed as an integer of its size as an argument is
                     const whole = e.Voffset == 0 && (tyaggregate(e.Ety) ||
                         (tyintegral(e.Ety) || pairType(e.Ety)) && tysize(e.Ety) >= a.size);
+                    const sz = tysize(e.Ety);
                     bool good;
                     if (e.Eoper == OPvar && whole)
                         good = true;
                     else if (e.Eoper == OPvar && a.kind == AggregateABI.Kind.hfa)
                         good = e.Voffset % a.esz == 0 && e.Voffset / a.esz < a.nregs &&
-                               tyfloating(e.Ety) && tysize(e.Ety) == a.esz;
+                               tyfloating(e.Ety) && sz == a.esz;
+                    else if (e.Eoper == OPvar && a.nregs == 2)
+                        // a part of a pair, read in its low bytes or written whole
+                        good = (e.Voffset == 0 || e.Voffset == 8) && !tyfloating(e.Ety) && scalarType(e.Ety) &&
+                               (isWrite ? sz == 8 : sz <= 8);
                     else if (e.Eoper == OPvar)
-                        good = e.Voffset == 0 && !tyfloating(e.Ety) && scalarType(e.Ety) && tysize(e.Ety) == a.size;
+                        good = e.Voffset == 0 && !tyfloating(e.Ety) && scalarType(e.Ety) && sz == a.size;
                     if (!good)
                     {
                         ok[k] = false;
@@ -852,18 +887,20 @@ private void assignAggregates()
         if (!ok[k])
             continue;
         AggVar av;
-        av.abi = aarch64Aggregate(aggType[k]);
+        av.abi = abis[k];
         const hfa = av.abi.kind == AggregateABI.Kind.hfa;
         foreach (j; 0 .. av.abi.nregs)
         {
-            Reg r = newVreg(hfa ? RC.fp : RC.gp, hfa ? av.abi.esz : av.abi.size);
+            Reg r = newVreg(hfa ? RC.fp : RC.gp, hfa ? av.abi.esz : av.abi.nregs == 2 ? 8 : av.abi.size);
             vinfo[r - firstVreg].sym = s;
             av.slots[j] = r;
         }
+        av.sym = s;
         symAgg[k] = cast(int)aggs.length;
         aggs.push(av);
     }
     ok.dtor();
+    abis.dtor();
     aggType.dtor();
 }
 
@@ -898,7 +935,7 @@ private Reg varRegOf(const(elem)* e)
             }
             return av.slots[e.Voffset / av.abi.esz];
         }
-        return av.slots[0];
+        return av.slots[e.Voffset / 8];
     }
     return noReg;
 }
@@ -938,6 +975,17 @@ private void finishVariables()
         s.Sreglsw = cast(reg_t)preg;
         s.Sregmsw = NOREG;
         s.Sregm = mask(preg);
+    }
+    // pair parameters held in registers are copied from where they are passed
+    foreach (ref av; aggs[])
+    {
+        Symbol* s = av.sym;
+        if (s.Sclass != SC.fastpar)
+            continue;
+        s.Sfl = FL.reg;
+        s.Sreglsw = s.Spreg;
+        s.Sregmsw = s.Spreg2;
+        s.Sregm = mask(s.Spreg) | mask(s.Spreg2);
     }
 }
 
@@ -1050,6 +1098,16 @@ private void select()
             i.flags = tyuns(s.Stype.Tty) ? 0 : F.signed;
             usesFrame = true;
         }
+    }
+    foreach (ref av; aggs[])
+    {
+        Symbol* s = av.sym;
+        if (s.Sclass != SC.fastpar)
+            continue;
+        emitIns(LOp.copy, 8, av.slots[0], phys(s.Spreg));
+        emitIns(LOp.copy, 8, av.slots[1], phys(s.Spreg2));
+        vi(av.slots[0]).hint = phys(s.Spreg);
+        vi(av.slots[1]).hint = phys(s.Spreg2);
     }
     paramEnd = cast(uint)ins.length;
     hoisted.setLength(0);
@@ -1668,6 +1726,7 @@ struct AggVar
 {
     AggregateABI abi;
     Reg[4] slots;
+    Symbol* sym;
 }
 
 /* An aggregate value: the registers of an aggregate variable, the registers it is
@@ -1727,6 +1786,15 @@ private Pair genPairx(elem* e)
     switch (e.Eoper)
     {
         case OPvar:
+            if (auto av = aggOf(e.Vsym))
+            {
+                if (av.abi.kind == AggregateABI.Kind.gpr && av.abi.nregs == 2 && e.Voffset == 0)
+                    return Pair(av.slots[0], av.slots[1]);
+                fail("pair of aggregate");
+                return Pair(newVreg(RC.gp, 8), newVreg(RC.gp, 8));
+            }
+            goto case OPind;
+
         case OPind:
             return loadPair(memOf(e, false));
 
@@ -2229,6 +2297,23 @@ private void storePair(Pair p, Mem m)
 private Pair genAssignPair(elem* e)
 {
     elem* e1 = e.E1;
+    if (e1.Eoper == OPvar)
+    {
+        if (auto av = aggOf(e1.Vsym))
+        {
+            if (av.abi.kind != AggregateABI.Kind.gpr || av.abi.nregs != 2 || e1.Voffset != 0)
+            {
+                fail("pair assign of aggregate");
+                return Pair(newVreg(RC.gp, 8), newVreg(RC.gp, 8));
+            }
+            Pair v = genPair(e.E2);
+            copyOut(av.slots[0], v.lo, 8);
+            copyOut(av.slots[1], v.hi, 8);
+            hintCopy(av.slots[0], v.lo);
+            hintCopy(av.slots[1], v.hi);
+            return v;
+        }
+    }
     if (e1.Eoper != OPvar && e1.Eoper != OPind)
     {
         fail("pair assign target");
@@ -2516,6 +2601,9 @@ private Reg genx(elem* e)
             emitIns(rc == RC.fp ? LOp.fneg : LOp.neg, rc == RC.fp ? sz : (sz <= 4 ? 4 : 8), d, a);
             return d;
         }
+
+        case OPnegass:
+            return genNegAssign(e);
 
         case OPabs:
         case OPsqrt:
@@ -3291,6 +3379,46 @@ private Reg genBinary(elem* e)
         return newVreg(RC.fp, sz);
     }
     return arith(op, ty, a, e2, b, e.E1.Ety);
+}
+
+/* e1 = -e1
+ */
+@trusted
+private Reg genNegAssign(elem* e)
+{
+    elem* e1 = e.E1;
+    const ty = tybasic(e1.Ety);
+    const sz = tysize(ty);
+    const fp = tyfloating(ty) != 0;
+    const rc = fp ? RC.fp : RC.gp;
+    if (e1.Eoper == OPvar)
+    {
+        if (Reg r = varRegOf(e1))
+        {
+            if (rcOf(r) != rc)
+            {
+                fail("negass type");
+                return r;
+            }
+            Reg d = newVreg(rc, sz);
+            emitIns(fp ? LOp.fneg : LOp.neg, fp ? sz : (sz <= 4 ? 4 : 8), d, r);
+            copyOut(r, d, fp ? sz : 8);
+            hintCopy(r, d);
+            return r;
+        }
+    }
+    else if (e1.Eoper != OPind)
+    {
+        fail("negass target");
+        return newVreg(rc, sz);
+    }
+    Mem m = memOf(e1);
+    Reg old = newVreg(rc, sz);
+    load(old, m, ty);
+    Reg d = newVreg(rc, sz);
+    emitIns(fp ? LOp.fneg : LOp.neg, fp ? sz : (sz <= 4 ? 4 : 8), d, old);
+    store(d, m, ty);
+    return d;
 }
 
 /* e1 rol e2 or e1 ror e2, rotating left by n being rotating right by -n
@@ -4560,10 +4688,11 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
         {
             const uint op = i.cond == COND.ne;
             const sf2 = i.sz == 8;
+            const uint w = INSTR.compbranch(sf2, op, 0, cast(ubyte)pr(i.a));        // CBZ/CBNZ
             if (i.flags & F.toLabel)
             {
                 code cs;
-                cs.Iop = INSTR.compbranch(sf2, op, 0, cast(ubyte)pr(i.a));
+                cs.Iop = w;
                 cs.Iflags = CF.zero;
                 cs.IFL1 = FL.code;
                 cs.IEV1.Vcode = cast(code*)cast(size_t)i.target;     // label number, resolved in emit()
@@ -4572,7 +4701,7 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
             else
             {
                 code cs;
-                cs.Iop = INSTR.compbranch(sf2, op, 0, cast(ubyte)pr(i.a));
+                cs.Iop = w;
                 cs.IFL1 = FL.block;
                 cs.IEV1.Vblock = blocks[i.target];
                 cdb.gen(&cs);
