@@ -39,7 +39,12 @@ import dmd.visitor;
 import dmd.visitor.postorder;
 import dmd.inline : restEndsWithReturn;
 
-enum COST_MAX = 250;
+/// Cost from which a function is never inlined, also what marks a function
+/// that cannot be inlined
+enum COST_MAX = 1000;
+
+/// Cost from which a function is inlined only into loops
+enum COST_MAX_OUTSIDE_LOOPS = 250;
 
 private enum STATEMENT_COST = 0x1000;
 private enum STATEMENT_COST_MAX = 250 * STATEMENT_COST;
@@ -58,6 +63,18 @@ static assert(STATEMENT_COST > COST_MAX);
 bool tooCostly(int cost) pure nothrow @safe
 {
     return ((cost & (STATEMENT_COST - 1)) >= COST_MAX);
+}
+
+/// The part of `cost` that is not for statements
+int expressionCost(int cost) pure nothrow @safe
+{
+    return cost & (STATEMENT_COST - 1);
+}
+
+/// Whether a function of `cost` is too costly to inline outside loops
+bool tooCostlyOutsideLoops(int cost) pure nothrow @safe
+{
+    return ((cost & (STATEMENT_COST - 1)) >= COST_MAX_OUTSIDE_LOOPS);
 }
 
 /*********************************

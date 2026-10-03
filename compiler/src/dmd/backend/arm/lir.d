@@ -184,20 +184,32 @@ private __gshared
     bool usesFrame;             // the code refers to locals or parameters in memory
 }
 
-/// Whether the new code generator is enabled, from DMD_NEWCG, and for which
-/// functions, from DMD_NEWCG_NAME (a substring of the mangled name)
+/// Whether the new code generator is enabled, from DMD_NEWCG
 @trusted
-private bool enabledFor(const(char)* name)
+bool newCodegenEnabled()
 {
     __gshared int enabled = -1;
-    __gshared const(char)* filter;
     if (enabled < 0)
     {
         auto p = getenv("DMD_NEWCG");
         enabled = p && *p != '0';
-        filter = getenv("DMD_NEWCG_NAME");
     }
-    if (!enabled)
+    return enabled != 0;
+}
+
+/// Whether the new code generator is enabled for the function, also from
+/// DMD_NEWCG_NAME (a substring of the mangled name)
+@trusted
+private bool enabledFor(const(char)* name)
+{
+    __gshared const(char)* filter;
+    __gshared bool filterRead;
+    if (!filterRead)
+    {
+        filter = getenv("DMD_NEWCG_NAME");
+        filterRead = true;
+    }
+    if (!newCodegenEnabled())
         return false;
     // a filter starting with ^ is a prefix, else any part of the name
     if (filter && (*filter == '^' ? strncmp(name, filter + 1, strlen(filter + 1)) != 0 : !strstr(name, filter)))

@@ -1082,6 +1082,7 @@ public:
     PASS pass;
     ErrorSink eSink;
     int inlinedCost;            // cost of the functions inlined outside loops
+    int loopInlinedCost;        // cost of the functions too costly outside loops inlined into loops
     int loopDepth;              // number of loops around what is being scanned
 
     // As the visit method cannot return a value, these variables
@@ -1133,7 +1134,7 @@ public:
                 return s;
             }
 
-            /* `T v = call;` and `v = call;` of a scalar local variable v: when the
+            /* `T v = call;` and `v = call;` of a scalar or POD struct local variable v: when the
              * call cannot be inlined as an expression, and the function being
              * scanned is small enough for the inlined statements not to crowd
              * out its register variables, the call is inlined as statements that
@@ -1149,9 +1150,11 @@ public:
                     vd.nestedrefs.length)
                     return null;
                 auto t = vd.type.toBasetype();
-                if (!(t.isTypeBasic() && t.ty != Tvoid) && !t.isTypePointer())
+                auto ts = t.isTypeStruct();
+                if (!(t.isTypeBasic() && t.ty != Tvoid) && !t.isTypePointer() &&
+                    !(ts && ts.sym.isPOD() && !ts.sym.hasCopyCtor))
                     return null;
-                if (!e2.type || !e2.type.toBasetype().equals(t))
+                if (!e2.type || !equivalent(e2.type.toBasetype(), t))
                     return null;
                 return vd;
             }
@@ -1631,9 +1634,25 @@ public:
         {
             enum cheapCost = 10;        // cost of a function about as cheap as the call
             enum budget = 500;          // cost a function may inline outside loops
-            if (loopDepth || fd.inlining == PINLINE.always)
+            if (fd.inlining == PINLINE.always)
                 return true;
             const cost = inlineCostOf(fd);
+            if (loopDepth)
+            {
+                /* what is too costly outside loops is inlined into loops up to a
+                 * budget, as each inlined function is optimized again in the caller
+                 */
+                enum loopBudget = 700;
+                if (!tooCostlyOutsideLoops(cost))
+                    return true;
+                const c = expressionCost(cost);
+                if (loopInlinedCost + c > loopBudget)
+                    return false;
+                loopInlinedCost += c;
+                return true;
+            }
+            if (tooCostlyOutsideLoops(cost))
+                return false;
             if (cost <= cheapCost)
                 return true;
             if (inlinedCost + cost > budget)
