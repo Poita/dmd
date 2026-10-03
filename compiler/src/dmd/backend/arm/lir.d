@@ -156,6 +156,8 @@ private __gshared
     Barray!Reg symReg;          // by globsym index: the register of the variable, or noReg
     Barray!bool symAssigned;    // by globsym index: the function assigns the variable
     Barray!int symAgg;          // by globsym index: the index in aggs of an aggregate held in registers, or -1
+    Barray!HoistedConst hoisted;    // constants used in loops, made once on entry
+    uint paramEnd;              // the instruction after the parameter copies
     Barray!AggVar aggs;
     Barray!(const(elem)*) crossBlockVars;   // sorted: variable reads shared by more than one block
     Barray!(const(Symbol)*) blockAssigned;  // the variables the current block assigns
@@ -249,6 +251,8 @@ bool lirCodegen(ref CGstate cg)
 
     assignVariables();
     select();
+    if (!failed)
+        insertHoisted();
     if (failed)
     {
         if (getenv("DMD_NEWCG_WHY"))
@@ -1047,6 +1051,8 @@ private void select()
             usesFrame = true;
         }
     }
+    paramEnd = cast(uint)ins.length;
+    hoisted.setLength(0);
 
     foreach (bi, b; blocks[])
     {
@@ -1643,6 +1649,16 @@ private bool isCrossBlockVar(const(elem)* e)
             hi = mid;
     }
     return false;
+}
+
+/* A constant made in a register on entry to the function, for its uses in loops
+ */
+struct HoistedConst
+{
+    long bits;
+    ubyte sz;
+    RC rc;
+    Reg r;
 }
 
 /* An aggregate variable held in registers: the elements of an HFA, or a whole
@@ -2277,10 +2293,17 @@ private Mem memOf(elem* e, bool allowIndex = true)
     elem* a = e.E1;
     if (a.Eoper == OPadd && !a.Ecount && a.E2.Eoper == OPconst && tysize(a.Ety) == 8)
     {
-        const long c = el_tolong(a.E2);
+        // base + c1 + c2 ... with the constants in the offset
+        long c = el_tolong(a.E2);
+        elem* b = a.E1;
+        while (b.Eoper == OPadd && !b.Ecount && b.E2.Eoper == OPconst && tysize(b.Ety) == 8)
+        {
+            c += el_tolong(b.E2);
+            b = b.E1;
+        }
         if (c > -256 && c < 0x8000)
         {
-            m.base = gen(a.E1);
+            m.base = gen(b);
             m.offset = c;
             return m;
         }
@@ -2394,10 +2417,17 @@ private Reg genx(elem* e)
                     double f = e.Vdouble;
                     bits = *cast(long*)&f;
                 }
+                if (Reg h = hoistConst(bits, cast(ubyte)sz, RC.fp))
+                    return h;
                 emitIns(LOp.fmovi, sz, d, noReg, noReg, bits);
             }
             else
-                emitIns(LOp.movi, sz <= 4 ? 4 : 8, d, noReg, noReg, el_tolong(e));
+            {
+                const isz = sz <= 4 ? 4 : 8;
+                if (Reg h = hoistConst(el_tolong(e), cast(ubyte)isz, RC.gp))
+                    return h;
+                emitIns(LOp.movi, isz, d, noReg, noReg, el_tolong(e));
+            }
             return d;
         }
 
@@ -2694,6 +2724,86 @@ private bool selectable(const(elem)* e)
     }
     const ty = tybasic(e.Ety);
     return scalarType(ty) && !pairType(ty) && cheap(e.E2.E1) && cheap(e.E2.E2);
+}
+
+/* The register made on entry for a constant that takes more than one instruction
+ * to make, used in a loop, or noReg
+ */
+@trusted
+private Reg hoistConst(long bits, ubyte sz, RC rc)
+{
+    if (blocks[curBlock].Bweight <= blocks[0].Bweight)
+        return noReg;
+    if (rc == RC.fp)
+    {
+        import dmd.backend.arm.disasmarm : encodeHFD;
+        if (bits == 0)
+            return noReg;
+        double v;
+        if (sz == 4)
+        {
+            uint b = cast(uint)bits;
+            v = *cast(float*)&b;
+        }
+        else
+            v = *cast(double*)&bits;
+        ubyte imm8;
+        if (encodeHFD(v, imm8))
+            return noReg;
+    }
+    else
+    {
+        // MOVZ/MOVN of one halfword is one instruction
+        const ulong u = sz == 4 ? cast(uint)bits : cast(ulong)bits;
+        int nonzero, nonones;
+        foreach (k; 0 .. sz / 2)
+        {
+            const h = (u >> (16 * k)) & 0xFFFF;
+            nonzero += h != 0;
+            nonones += h != 0xFFFF;
+        }
+        if (nonzero <= 1 || nonones <= 1)
+            return noReg;
+    }
+    foreach (ref h; hoisted[])
+        if (h.bits == bits && h.sz == sz && h.rc == rc)
+            return h.r;
+    HoistedConst h;
+    h.bits = bits;
+    h.sz = sz;
+    h.rc = rc;
+    h.r = newVreg(rc, sz);
+    hoisted.push(h);
+    return h.r;
+}
+
+/* Put the making of the hoisted constants after the parameter copies
+ */
+@trusted
+private void insertHoisted()
+{
+    const k = hoisted.length;
+    if (!k)
+        return;
+    const at = paramEnd;
+    const n = ins.length;
+    ins.setLength(n + k);
+    foreach_reverse (i; at .. n)
+        ins[i + k] = ins[i];
+    foreach (j, ref h; hoisted[])
+    {
+        LIns i;
+        i.op = h.rc == RC.fp ? LOp.fmovi : LOp.movi;
+        i.sz = h.sz;
+        i.d = h.r;
+        i.imm = h.bits;
+        ins[at + j] = i;
+    }
+    foreach (ref b; blockStart[1 .. $])
+        b += k;
+    foreach (ref v; vinfo[])
+        if (v.loadIns != uint.max && v.loadIns >= at)
+            v.loadIns += k;
 }
 
 /* The call e, returning the register of its result, or in pair a 16 byte result
