@@ -152,6 +152,7 @@ struct VInfo
     uint loadIns = uint.max;    // the load defining it, if any
     Reg copyOf;                 // the register it is a copy of, when that copy is its only definition
     uint ndefs;                 // number of definitions
+    uint rematIns = uint.max;   // its only definition, a one instruction constant, made again at each use when spilled
 }
 
 private __gshared
@@ -1201,7 +1202,8 @@ private void select()
             {
                 elem* e = b.Belem;
                 // a result returned through the hidden pointer returns that pointer instead
-                const ty = tybasic(e.Ety);
+                const fty = tybasic(funcsym_p.Stype.Tnext.Tty);
+                const ty = typtr(e.Ety) && !typtr(fty) ? tybasic(e.Ety) : fty;
                 if (pairType(ty))
                 {
                     Pair p = genPair(e);
@@ -3904,6 +3906,41 @@ private __gshared
     Barray!uint segSucc;
 }
 
+/* Whether i makes a constant in one instruction, not using x16
+ */
+@trusted
+private bool cheapConstant(ref const LIns i)
+{
+    if (i.flags & F.condDef)
+        return false;
+    if (i.op == LOp.movi)
+    {
+        const ulong v = i.sz == 8 ? cast(ulong)i.imm : cast(uint)i.imm;
+        const ulong nv = i.sz == 8 ? ~v : ~v & 0xFFFF_FFFF;
+        return v <= 0xFFFF || nv <= 0xFFFF;
+    }
+    if (i.op == LOp.fmovi)
+    {
+        if (i.imm == 0)
+            return true;
+        double v;
+        if (i.sz == 4)
+        {
+            uint bits = cast(uint)i.imm;
+            v = *cast(float*)&bits;
+        }
+        else
+        {
+            long bits = i.imm;
+            v = *cast(double*)&bits;
+        }
+        import dmd.backend.arm.disasmarm : encodeHFD;
+        ubyte imm8;
+        return encodeHFD(v, imm8);
+    }
+    return false;
+}
+
 @trusted
 private void computeLiveness()
 {
@@ -3918,6 +3955,7 @@ private void computeLiveness()
             auto v = vi(i.d);
             ++v.ndefs;
             v.copyOf = i.op == LOp.copy && !isPhys(i.a) && !(i.flags & F.condDef) ? i.a : noReg;
+            v.rematIns = v.ndefs == 1 && cheapConstant(i) ? cast(uint)(&i - ins[].ptr) : uint.max;
             ++defStart[i.d - firstVreg + 1];
         }
     foreach (k; 1 .. defStart.length)
@@ -4070,7 +4108,8 @@ private void computeLiveness()
             if (i.d && !isPhys(i.d))
             {
                 setFrom(i.d, defPos(n));
-                vi(i.d).cost += weight;
+                if (vi(i.d).rematIns != n)
+                    vi(i.d).cost += weight;     // a constant made again at its uses needs no store
             }
             void use(Reg r)
             {
@@ -5037,6 +5076,8 @@ private void rewriteSpills()
             LIns i = old[n];
             if (i.op == LOp.nop)
                 continue;
+            if (i.d && !isPhys(i.d) && vi(i.d).spilled && vi(i.d).rematIns == n)
+                continue;       // made at each use instead
             uint gpUsed, fpUsed;
             Reg scratch(RC rc)
             {
@@ -5058,6 +5099,14 @@ private void rewriteSpills()
                     return;
                 auto v = vi(r);
                 Reg s = scratch(v.rc);
+                if (v.rematIns != uint.max)
+                {
+                    LIns c = old[v.rematIns];
+                    c.d = s;
+                    ins.push(c);
+                    r = s;
+                    return;
+                }
                 LIns l;
                 l.op = LOp.ld;
                 l.sz = v.rc == RC.fp ? v.sz : 8;
@@ -5078,6 +5127,11 @@ private void rewriteSpills()
                     m.sz = v.rc == RC.fp ? v.sz : 8;
                     m.a = i.a;
                     m.sym = slotOf(v);
+                }
+                else if (vi(i.a).rematIns != uint.max)
+                {
+                    m = old[vi(i.a).rematIns];
+                    m.d = i.d;
                 }
                 else
                 {
