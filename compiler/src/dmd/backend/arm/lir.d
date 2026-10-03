@@ -722,6 +722,23 @@ private RC rcOf(Reg r)
 @trusted
 private LIns* emitIns(LOp op, uint sz, Reg d = noReg, Reg a = noReg, Reg b = noReg, long imm = 0)
 {
+    // a 32 bit operation zeroes the upper half of its 64 bit register
+    if (sz == 4 && d && !isPhys(d) && rcOf(d) == RC.gp)
+    {
+        switch (op)
+        {
+            case LOp.movi:
+            case LOp.add: .. case LOp.rorv:
+            case LOp.addi: .. case LOp.rori:
+            case LOp.msub, LOp.neg, LOp.mvn, LOp.cset, LOp.csel:
+            case LOp.fcvtzs, LOp.fcvtzu:
+                if (!vi(d).sym)
+                    knownExtended(d, 32, false, 8);
+                break;
+            default:
+                break;
+        }
+    }
     LIns i;
     i.op = op;
     i.sz = cast(ubyte)sz;
@@ -901,7 +918,7 @@ private Reg extendFrom(Reg r, uint bits, bool signed, uint toSize)
     }
     Reg d = newVreg(RC.gp, toSize);
     emitIns(signed ? LOp.sext : LOp.zext, toSize, d, r, noReg, bits);
-    knownExtended(d, bits, signed, toSize);
+    knownExtended(d, bits, signed, signed ? toSize : 8);    // UXTB/UXTH Wd zero the upper half
     return d;
 }
 
@@ -1238,6 +1255,8 @@ private void leaveCond(size_t mark)
 @trusted
 private void copyOut(Reg d, Reg a, uint sz)
 {
+    if (!isPhys(d))
+        vi(d).extBits = 0;          // d has more than one definition
     auto i = emitIns(LOp.copy, sz, d, a);
     if (condDepth)
         i.flags |= F.condDef;
@@ -1861,6 +1880,15 @@ private Reg genx(elem* e)
         case OPd_f:
         case OPf_d:
         {
+            elem* e1 = e.E1;
+            if (op == OPd_f && (e1.Eoper == OPs32_d || e1.Eoper == OPu32_d) && !e1.Ecount)
+            {
+                // a 32 bit integer converts to double exactly, so rounding to float once is the same
+                Reg a = gen(e1.E1);
+                Reg d = newVreg(RC.fp, sz);
+                emitIns(e1.Eoper == OPs32_d ? LOp.scvtf : LOp.ucvtf, sz, d, a, noReg, tysize(e1.E1.Ety));
+                return d;
+            }
             Reg a = gen(e.E1);
             Reg d = newVreg(RC.fp, sz);
             emitIns(LOp.fcvt, sz, d, a, noReg, tysize(e.E1.Ety));
@@ -2114,6 +2142,25 @@ private Reg arith(OPER op, tym_t ty, Reg a, elem* e2, Reg b)
     LOp lop = binop(op, ty);
     Reg d = newVreg(fp ? RC.fp : RC.gp, sz);
 
+    if (!b)
+    {
+        // e2 is a constant, used as an immediate operand if it can be
+        if (!fp)
+        {
+            long v = el_tolong(e2);
+            const narrowShr = sz < 4 && (lop == LOp.lsrv || lop == LOp.asrv);
+            LOp iop = narrowShr ? LOp.nop : immForm(lop, v, isz);
+            if (iop != LOp.nop)
+            {
+                if ((lop == LOp.add && iop == LOp.subi) || (lop == LOp.sub && iop == LOp.addi))
+                    v = -v;
+                emitIns(iop, isz, d, a, noReg, v);
+                return d;
+            }
+        }
+        b = gen(e2);
+    }
+
     if (fp)
     {
         emitIns(lop, sz, d, a, b);
@@ -2267,7 +2314,7 @@ private Reg genOpAssign(elem* e)
     {
         if (Reg r = varReg(e1.Vsym))
         {
-            Reg b = gen(e.E2);
+            Reg b = e.E2.Eoper == OPconst && !fp ? noReg : gen(e.E2);
             const rc = fp ? RC.fp : RC.gp;
             if (rcOf(r) != rc)
             {
@@ -2296,7 +2343,7 @@ private Reg genOpAssign(elem* e)
     }
 
     // in memory: E2 is evaluated first, as code generation does
-    Reg b = gen(e.E2);
+    Reg b = e.E2.Eoper == OPconst && !fp ? noReg : gen(e.E2);
     Mem m = memOf(e1);
     Reg old = newVreg(fp ? RC.fp : RC.gp, sz);
     load(old, m, ty);
