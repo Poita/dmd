@@ -722,7 +722,8 @@ private void assignVariables()
                 partial[k], (s.Sflags & GTregcand) != 0, tym_str(s.Stype.Tty), (s.Sflags & SFLdead) != 0);
         if (partial[k])
             continue;
-        if (!(s.Sflags & GTregcand) || s.ty() & (mTYvolatile | mTYshared))
+        // as cgreg_init() has them, but for the weight of parameters
+        if (!(s.Sflags & GTregcand) || !s.Srange || s.ty() & (mTYvolatile | mTYshared))
             continue;
         if (!scalarType(s.Stype.Tty))
             continue;

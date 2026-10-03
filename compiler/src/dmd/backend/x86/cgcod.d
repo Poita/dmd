@@ -97,7 +97,12 @@ void codgenx(ref CGstate cg, Symbol* sfunc)
     assert(sfunc == funcsym_p);
     assert(cseg == funcsym_p.Sseg);
 
-    cgreg_init();
+    /* On AArch64 with optimization the code may be generated through virtual registers
+     * without the register candidates cgreg_init() works out, so it is done once that fails
+     */
+    const tryLir = config.target_cpu == TARGET_AArch64 && config.flags4 & CFG4optimized;
+    if (!tryLir)
+        cgreg_init();
     CSE.initialize();
 
     cg.Alloca.initialize();
@@ -228,16 +233,21 @@ void codgenx(ref CGstate cg, Symbol* sfunc)
         /* On AArch64 the code may be generated through virtual registers,
          * which allocates the registers itself, in one pass
          */
-        if (cg.AArch64 && config.flags4 & CFG4optimized && cg.pass == BackendPass.initial)
+        if (tryLir && cg.pass == BackendPass.initial)
         {
             import dmd.backend.arm.lir : lirCodegen;
             if (lirCodegen(cg))
             {
-                if (nretblocks == 0 && !(sfunc.ty() & mTYnaked))
+                bool returns;
+                foreach (b; bo.dfo[])
+                    if (b.bc == BC.ret || b.bc == BC.retexp)
+                        returns = true;
+                if (!returns && !(sfunc.ty() & mTYnaked))
                     sfunc.Sflags |= SFLexit;
                 cg.pass = BackendPass.final_;
                 break;
             }
+            cgreg_init();
         }
 
         if (config.flags4 & CFG4optimized)
