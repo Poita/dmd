@@ -97,6 +97,7 @@ enum F : ubyte
     signed  = 1,    // ld sign extends
     toLabel = 2,    // target is a label rather than a block
     condDef = 4,    // a definition that is made on only some paths through its block
+    scaled  = 8,    // ld/st: the index register is shifted left by the log2 of the size
 }
 
 /// An instruction of the intermediate representation
@@ -133,6 +134,9 @@ struct VInfo
     Symbol* sym;                // the variable it holds, if any
     Barray!Range ranges;        // sorted, disjoint
     uint globalId = uint.max;   // index in the live variable bit sets
+    ubyte extBits;              // if not 0, the value is extended from this many bits
+    ubyte extTo;                // to this many bytes
+    bool extSigned;             // by sign extension
 }
 
 private __gshared
@@ -149,6 +153,7 @@ private __gshared
     bool failed;                // the function uses something not handled
     Barray!(elem*) cseElems;    // CSEs evaluated, with their registers in cseRegs
     Barray!Reg cseRegs;
+    Barray!Reg cseHis;          // the high halves of pair CSEs, else noReg
     uint curBlock;
     uint condDepth;             // number of conditionally evaluated regions being selected
     bool usesFrame;             // the code refers to locals or parameters in memory
@@ -211,6 +216,7 @@ bool lirCodegen(ref CGstate cg)
     labelPos.setLength(0);
     cseElems.setLength(0);
     cseRegs.setLength(0);
+    cseHis.setLength(0);
     usesFrame = false;
     condDepth = 0;
 
@@ -232,6 +238,8 @@ bool lirCodegen(ref CGstate cg)
     {
         if (getenv("DMD_NEWCG_WHY"))
             fprintf(stderr, "newcg-why: select:%s %s\n", whyNot, funcsym_p.Sident.ptr);
+        if (getenv("DMD_NEWCG_DUMP"))
+            dumpTrees();
         undoVariables();
         return false;
     }
@@ -280,7 +288,7 @@ private bool supported(ref CGstate cg)
         return false;
     whyNot = "return type";
     const tyr = tybasic(funcsym_p.Stype.Tnext.Tty);
-    if (tyr != TYvoid && !scalarType(tyr))
+    if (tyr != TYvoid && !scalarType(tyr) && !pairType(tyr))
     {
         if (getenv("DMD_NEWCG_WHY"))
             fprintf(stderr, "newcg-rettype: %s\n", tym_str(tyr));
@@ -333,6 +341,29 @@ private bool supported(ref CGstate cg)
     return true;
 }
 
+/* Whether the operator op is handled for 16 byte values
+ */
+private bool pairOp(OPER op)
+{
+    switch (op)
+    {
+        case OPvar: case OPind: case OPpair: case OPrpair: case OPconst:
+        case OPcomma: case OPeq: case OPcall: case OPucall: case OPcond: case OPcolon:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* Whether ty is a 16 byte value held in two integer registers
+ */
+@trusted
+private bool pairType(tym_t ty)
+{
+    ty = tybasic(ty);
+    return (ty == TYucent || ty == TYcent || ty == TYdarray || ty == TYdelegate) && tysize(ty) == 16;
+}
+
 /* Whether ty is an integer, pointer, float or double held in one register
  */
 private bool scalarType(tym_t ty)
@@ -341,7 +372,7 @@ private bool scalarType(tym_t ty)
     if (tyfloating(ty))
         return (ty == TYfloat || ty == TYdouble || ty == TYidouble || ty == TYifloat ||
                 ty == TYdouble_alias);
-    if (tyintegral(ty) || typtr(ty) || ty == TYnullptr || ty == TYbool)
+    if (tyintegral(ty) || typtr(ty) || tyref(ty) || ty == TYnullptr || ty == TYbool)
     {
         const sz = tysize(ty);
         return sz == 1 || sz == 2 || sz == 4 || sz == 8;
@@ -356,7 +387,8 @@ private bool supportedElem(const(elem)* e)
     {
         const op = e.Eoper;
         if (!(op == OPcolon) && !(op == OPcomma) && !(op == OPeq) && !(op == OPparam) &&
-            !scalarType(e.Ety) && tybasic(e.Ety) != TYvoid && tybasic(e.Ety) != TYnoreturn)
+            !scalarType(e.Ety) && tybasic(e.Ety) != TYvoid && tybasic(e.Ety) != TYnoreturn &&
+            !(pairType(e.Ety) && pairOp(op)))
         {
             whyNot = "type";
             return false;
@@ -410,6 +442,7 @@ private bool supportedElem(const(elem)* e)
             case OPs32_d: case OPu32_d: case OPs64_d: case OPu64_d:
             case OPd_s32: case OPd_u32: case OPd_s64: case OPd_u64:
             case OPd_s16: case OPd_u16:
+            case OPmsw: case OP128_64:
             case OPhalt:
                 if (OTunary(op))
                 {
@@ -422,6 +455,7 @@ private bool supportedElem(const(elem)* e)
             case OPand: case OPor: case OPxor:
             case OPshl: case OPshr: case OPashr:
             case OProl: case OPror:
+            case OPpair: case OPrpair:
             case OPeq:
             case OPcomma:
             case OPandand: case OPoror:
@@ -431,7 +465,7 @@ private bool supportedElem(const(elem)* e)
             case OPandass: case OPorass: case OPxorass:
             case OPshlass: case OPshrass: case OPashrass:
             case OPpostinc: case OPpostdec:
-                if (op == OPeq && !scalarType(e.E1.Ety))
+                if (op == OPeq && !scalarType(e.E1.Ety) && !pairType(e.E1.Ety))
                 {
                     whyNot = "aggregate assign";
                     if (getenv("DMD_NEWCG_WHY"))
@@ -556,8 +590,12 @@ private void assignVariables()
         if (b.Belem)
             mark(b.Belem);
 
+    const logVars = getenv("DMD_NEWCG_VARS") !is null;
     foreach (k, s; globsym[])
     {
+        if (logVars)
+            fprintf(stderr, "newcg-var: %s partial=%d regcand=%d ty=%s dead=%d\n", s.Sident.ptr,
+                partial[k], (s.Sflags & GTregcand) != 0, tym_str(s.Stype.Tty), (s.Sflags & SFLdead) != 0);
         if (partial[k])
             continue;
         if (!(s.Sflags & GTregcand) || s.ty() & (mTYvolatile | mTYshared))
@@ -746,6 +784,13 @@ private void select()
             {
                 elem* e = b.Belem;
                 const ty = tybasic(funcsym_p.Stype.Tnext.Tty);
+                if (pairType(ty))
+                {
+                    Pair p = genPair(e);
+                    emitIns(LOp.copy, 8, phys(0), p.lo);
+                    emitIns(LOp.copy, 8, phys(1), p.hi);
+                    break;
+                }
                 Reg r = gen(e);
                 if (tyfloating(ty))
                     emitIns(LOp.copy, tysize(ty), phys(32), r);
@@ -777,9 +822,37 @@ private Reg extend(Reg r, tym_t ty, uint toSize)
     const sz = tysize(ty);
     if (sz >= toSize)
         return r;
+    return extendFrom(r, sz * 8, !(tyuns(ty) || tybasic(ty) == TYbool), toSize);
+}
+
+/* r sign or zero extended from bits to toSize (4 or 8) bytes
+ */
+@trusted
+private Reg extendFrom(Reg r, uint bits, bool signed, uint toSize)
+{
+    if (!isPhys(r))
+    {
+        // already extended as asked, as by a narrow load
+        auto v = vi(r);
+        if (v.extBits && !v.sym && toSize <= v.extTo &&
+            (v.extSigned == signed ? v.extBits <= bits : !v.extSigned && v.extBits < bits))
+            return r;
+    }
     Reg d = newVreg(RC.gp, toSize);
-    emitIns(tyuns(ty) || tybasic(ty) == TYbool ? LOp.zext : LOp.sext, toSize, d, r, noReg, sz * 8);
+    emitIns(signed ? LOp.sext : LOp.zext, toSize, d, r, noReg, bits);
+    knownExtended(d, bits, signed, toSize);
     return d;
+}
+
+/* Record that temporary d holds a value extended from bits to toSize bytes
+ */
+@trusted
+private void knownExtended(Reg d, uint bits, bool signed, uint toSize)
+{
+    auto v = vi(d);
+    v.extBits = cast(ubyte)bits;
+    v.extSigned = signed;
+    v.extTo = cast(ubyte)toSize;
 }
 
 /* Evaluate e for its side effects
@@ -851,7 +924,10 @@ private void genEffect(elem* e)
             }
             break;
     }
-    gen(e);
+    if (pairType(e.Ety))
+        genPair(e);
+    else
+        gen(e);
 }
 
 /* Jump to block t if e is true (or false if !jumpIfTrue)
@@ -958,7 +1034,7 @@ private COND compare(elem* e)
     int i;
     if (tyfloating(ty))
         i = 2;
-    else if (tyuns(ty) || tyuns(e2.Ety))
+    else if (tyuns(ty) || tyuns(e2.Ety) || tyref(ty) || tyref(e2.Ety))
         i = 1;
     else
         i = 0;
@@ -987,7 +1063,7 @@ private COND compare(elem* e)
         Reg a = gen(e1);
         if (sz < 4)
             a = extend(a, ty, 4);
-        if (e2.Eoper == OPconst && !e2.Ecount)
+        if (e2.Eoper == OPconst)
         {
             const long v = el_tolong(e2);
             if (v >= 0 && v < 4096)
@@ -1078,6 +1154,7 @@ private void cseForget(size_t mark)
 {
     cseElems.setLength(mark);
     cseRegs.setLength(mark);
+    cseHis.setLength(mark);
 }
 
 @trusted
@@ -1111,8 +1188,164 @@ private Reg gen(elem* e)
         }
         cseElems.push(e);
         cseRegs.push(r);
+        cseHis.push(noReg);
     }
     return r;
+}
+
+/* A 16 byte value held in two integer registers, lo the bytes 0..7 and hi 8..15
+ */
+struct Pair
+{
+    Reg lo, hi;
+}
+
+/* Evaluate the 16 byte value e into two registers
+ */
+@trusted
+private Pair genPair(elem* e)
+{
+    if (e.Ecount)
+    {
+        foreach (i, x; cseElems[])
+            if (x is e)
+                return Pair(cseRegs[i], cseHis[i]);
+    }
+    Pair p = genPairx(e);
+    if (e.Ecount && p.lo)
+    {
+        cseElems.push(e);
+        cseRegs.push(p.lo);
+        cseHis.push(p.hi);
+    }
+    return p;
+}
+
+@trusted
+private Pair genPairx(elem* e)
+{
+    switch (e.Eoper)
+    {
+        case OPvar:
+        case OPind:
+            return loadPair(memOf(e, false));
+
+        case OPpair:
+        case OPrpair:
+        {
+            Reg a = pairHalf(e.E1);
+            Reg b = pairHalf(e.E2);
+            return e.Eoper == OPpair ? Pair(a, b) : Pair(b, a);
+        }
+
+        case OPconst:
+        {
+            Pair p = Pair(newVreg(RC.gp, 8), newVreg(RC.gp, 8));
+            emitIns(LOp.movi, 8, p.lo, noReg, noReg, cast(long)e.Vcent.lo);
+            emitIns(LOp.movi, 8, p.hi, noReg, noReg, cast(long)e.Vcent.hi);
+            return p;
+        }
+
+        case OPcomma:
+            genEffect(e.E1);
+            return genPair(e.E2);
+
+        case OPeq:
+            return genAssignPair(e);
+
+        case OPcall:
+        case OPucall:
+        {
+            Pair p;
+            genCall(e, &p);
+            return p;
+        }
+
+        case OPcond:
+        {
+            Pair d = Pair(newVreg(RC.gp, 8), newVreg(RC.gp, 8));
+            const lfalse = newLabel();
+            const lend = newLabel();
+            defineHere(d.lo);
+            defineHere(d.hi);
+            genCond(e.E1, false, lfalse);
+            auto m = enterCond();
+            Pair a = genPair(e.E2.E1);
+            copyOut(d.lo, a.lo, 8);
+            copyOut(d.hi, a.hi, 8);
+            leaveCond(m);
+            jumpTo(lend);
+            placeLabel(lfalse);
+            m = enterCond();
+            Pair b = genPair(e.E2.E2);
+            copyOut(d.lo, b.lo, 8);
+            copyOut(d.hi, b.hi, 8);
+            leaveCond(m);
+            placeLabel(lend);
+            return d;
+        }
+
+        default:
+            fail("pair op");
+            return Pair(newVreg(RC.gp, 8), newVreg(RC.gp, 8));
+    }
+}
+
+/* One half of OPpair or OPrpair, in an integer register
+ */
+@trusted
+private Reg pairHalf(elem* e)
+{
+    const sz = tysize(e.Ety);
+    Reg r = gen(e);
+    if (tyfloating(e.Ety))
+        return asClass(r, RC.gp, sz);
+    return r;
+}
+
+@trusted
+private Pair loadPair(Mem m)
+{
+    Pair p = Pair(newVreg(RC.gp, 8), newVreg(RC.gp, 8));
+    load(p.lo, m, TYullong);
+    m.offset += 8;
+    load(p.hi, m, TYullong);
+    return p;
+}
+
+@trusted
+private void storePair(Pair p, Mem m)
+{
+    store(p.lo, m, TYullong);
+    m.offset += 8;
+    store(p.hi, m, TYullong);
+}
+
+/* e1 = e2 for 16 byte values
+ */
+@trusted
+private Pair genAssignPair(elem* e)
+{
+    elem* e1 = e.E1;
+    if (e1.Eoper != OPvar && e1.Eoper != OPind)
+    {
+        fail("pair assign target");
+        return Pair(newVreg(RC.gp, 8), newVreg(RC.gp, 8));
+    }
+    Pair v;
+    Mem m;
+    if (ERTOL(e))
+    {
+        v = genPair(e.E2);
+        m = memOf(e1, false);
+    }
+    else
+    {
+        m = memOf(e1, false);
+        v = genPair(e.E2);
+    }
+    storePair(v, m);
+    return v;
 }
 
 /* The memory an lvalue refers to: a register base and offset, or a variable
@@ -1122,10 +1355,15 @@ struct Mem
     Reg base;
     long offset;
     Symbol* sym;
+    Reg index;          // added to base, extended by ext and shifted if scaled
+    ubyte ext = Extend.LSL;
+    bool scaled;
 }
 
+/* The memory e refers to, as [base, index] when allowIndex and the address is a sum
+ */
 @trusted
-private Mem memOf(elem* e)
+private Mem memOf(elem* e, bool allowIndex = true)
 {
     Mem m;
     if (e.Eoper == OPvar)
@@ -1155,6 +1393,44 @@ private Mem memOf(elem* e)
             return m;
         }
     }
+    if (allowIndex && a.Eoper == OPadd && !a.Ecount && tysize(a.Ety) == 8 && a.E2.Eoper != OPconst)
+    {
+        const accSz = tysize(e.Ety);
+        bool scaledIndex(elem* x)
+        {
+            if (x.Eoper != OPshl || x.Ecount || x.E2.Eoper != OPconst || accSz < 2)
+                return false;
+            const sh = el_tolong(x.E2);
+            return sh >= 0 && sh < 4 && (1 << sh) == accSz;
+        }
+        // the index is the scaled operand if there is one, else E2
+        const indexFirst = scaledIndex(a.E1) && !scaledIndex(a.E2);
+        Reg genIndex(elem* x)
+        {
+            if (scaledIndex(x))
+            {
+                m.scaled = true;
+                x = x.E1;
+            }
+            if ((x.Eoper == OPu32_64 || x.Eoper == OPs32_64) && !x.Ecount)
+            {
+                m.ext = x.Eoper == OPu32_64 ? Extend.UXTW : Extend.SXTW;
+                x = x.E1;
+            }
+            return gen(x);
+        }
+        if (indexFirst)
+        {
+            m.index = genIndex(a.E1);
+            m.base = gen(a.E2);
+        }
+        else
+        {
+            m.base = gen(a.E1);
+            m.index = genIndex(a.E2);
+        }
+        return m;
+    }
     m.base = gen(a);
     return m;
 }
@@ -1162,10 +1438,22 @@ private Mem memOf(elem* e)
 @trusted
 private void load(Reg d, Mem m, tym_t ty)
 {
-    auto i = emitIns(LOp.ld, tysize(ty), d, m.base, noReg, m.offset);
+    auto i = emitIns(LOp.ld, tysize(ty), d, m.base, m.index, m.offset);
     i.sym = m.sym;
+    i.cond = m.ext;
+    if (m.scaled)
+        i.flags |= F.scaled;
     if (!tyuns(ty) && !tyfloating(ty) && tybasic(ty) != TYbool)
-        i.flags = F.signed;
+        i.flags |= F.signed;
+    const sz = tysize(ty);
+    if (!tyfloating(ty) && sz < 8 && !isPhys(d) && !vi(d).sym)
+    {
+        // LDRSB/LDRSH sign extend into a W register; the other loads zero extend to 64 bits
+        if (i.flags & F.signed && sz < 4)
+            knownExtended(d, sz * 8, true, 4);
+        else
+            knownExtended(d, sz * 8, false, 8);
+    }
 }
 
 @trusted
@@ -1173,6 +1461,10 @@ private void store(Reg v, Mem m, tym_t ty)
 {
     auto i = emitIns(LOp.st, tysize(ty), noReg, v, m.base, m.offset);
     i.sym = m.sym;
+    i.c = m.index;
+    i.cond = m.ext;
+    if (m.scaled)
+        i.flags |= F.scaled;
 }
 
 @trusted
@@ -1182,6 +1474,14 @@ private Reg genx(elem* e)
     const ty = tybasic(e.Ety);
     const sz = tysize(ty);
     const RC rc = tyfloating(ty) ? RC.fp : RC.gp;
+    if (pairType(ty))
+    {
+        import dmd.backend.debugprint : oper_str;
+        if (getenv("DMD_NEWCG_WHY"))
+            fprintf(stderr, "newcg-pairscalar: %s %s\n", oper_str(op), funcsym_p.Sident.ptr);
+        fail("pair as scalar");
+        return newVreg(RC.gp, 8);
+    }
 
     switch (op)
     {
@@ -1230,6 +1530,19 @@ private Reg genx(elem* e)
         case OPcall:
         case OPucall:
             return genCall(e);
+
+        case OP128_64:
+            return genPair(e.E1).lo;
+
+        case OPmsw:
+        {
+            if (tysize(e.E1.Ety) == 16)
+                return genPair(e.E1).hi;
+            Reg a = gen(e.E1);
+            Reg d = newVreg(RC.gp, sz);
+            emitIns(LOp.lsri, 8, d, a, noReg, tysize(e.E1.Ety) * 4);
+            return d;
+        }
 
         case OPind:
         {
@@ -1355,22 +1668,12 @@ private Reg genx(elem* e)
         case OPs32_64:
         case OPs16_32:
         case OPs8_16:
-        {
-            Reg a = gen(e.E1);
-            Reg d = newVreg(RC.gp, sz);
-            emitIns(LOp.sext, sz <= 4 ? 4 : 8, d, a, noReg, tysize(e.E1.Ety) * 8);
-            return d;
-        }
+            return extendFrom(gen(e.E1), tysize(e.E1.Ety) * 8, true, sz <= 4 ? 4 : 8);
 
         case OPu32_64:
         case OPu16_32:
         case OPu8_16:
-        {
-            Reg a = gen(e.E1);
-            Reg d = newVreg(RC.gp, sz);
-            emitIns(LOp.zext, sz <= 4 ? 4 : 8, d, a, noReg, tysize(e.E1.Ety) * 8);
-            return d;
-        }
+            return extendFrom(gen(e.E1), tysize(e.E1.Ety) * 8, false, sz <= 4 ? 4 : 8);
 
         case OP64_32:
         case OP32_16:
@@ -1417,11 +1720,13 @@ private Reg genx(elem* e)
     }
 }
 
-/* The call e, returning the register of its result
+/* The call e, returning the register of its result, or in pair a 16 byte result
  */
 @trusted
-private Reg genCall(elem* e)
+private Reg genCall(elem* e, Pair* pair = null)
 {
+    if (pair)
+        *pair = Pair(newVreg(RC.gp, 8), newVreg(RC.gp, 8));     // also the result if this fails
     import dmd.backend.x86.cod1 : Parameter, fillParameters, FuncParamRegs_create, FuncParamRegs_alloc;
     import dmd.backend.arm.cod1 : holdsAggregate;
 
@@ -1445,8 +1750,10 @@ private Reg genCall(elem* e)
     {
         Parameter* p = &params[i];
         elem* ep = p.e;
-        if (holdsAggregate(ep.Ety, ep.ET) || !scalarType(ep.Ety) ||
-            !FuncParamRegs_alloc(*cgp, fpr, ep.ET, ep.Ety, p.reg, p.reg2) || p.reg2 != NOREG)
+        const isPair = pairType(ep.Ety);
+        if (!isPair && (holdsAggregate(ep.Ety, ep.ET) || !scalarType(ep.Ety)) ||
+            !FuncParamRegs_alloc(*cgp, fpr, ep.ET, ep.Ety, p.reg, p.reg2) ||
+            (p.reg2 != NOREG) != isPair || (isPair && (p.reg >= 32 || p.reg2 >= 32)))
         {
             fail("call arg");
             return newVreg(RC.gp, 8);
@@ -1467,8 +1774,16 @@ private Reg genCall(elem* e)
 
     // the arguments are evaluated from the first to the last, as cdfunc() does
     Reg[16] vals;
+    Reg[16] his;
     foreach (i, ref p; params)
     {
+        if (p.reg2 != NOREG)
+        {
+            Pair v = genPair(p.e);
+            vals[i] = v.lo;
+            his[i] = v.hi;
+            continue;
+        }
         Reg r = gen(p.e);
         const ty = tybasic(p.e.Ety);
         if (!tyfloating(ty) && tysize(ty) < 4)
@@ -1482,6 +1797,12 @@ private Reg genCall(elem* e)
         emitIns(LOp.copy, tyfloating(ty) ? tysize(ty) : 8, phys(p.reg), vals[i]);
         hintCopy(vals[i], phys(p.reg));
         argRegs |= mask(p.reg);
+        if (p.reg2 != NOREG)
+        {
+            emitIns(LOp.copy, 8, phys(p.reg2), his[i]);
+            hintCopy(his[i], phys(p.reg2));
+            argRegs |= mask(p.reg2);
+        }
     }
 
     auto c = emitIns(LOp.call, 0, noReg, target, noReg, cast(long)argRegs);
@@ -1490,7 +1811,15 @@ private Reg genCall(elem* e)
         funcsym_p.Sfunc.Fflags &= ~Fnothrow;        // the call may throw
 
     const tyr = tybasic(e.Ety);
-    if (tyr == TYvoid || tyr == TYnoreturn)
+    if (pair)
+    {
+        emitIns(LOp.copy, 8, pair.lo, phys(0));
+        emitIns(LOp.copy, 8, pair.hi, phys(1));
+        hintCopy(pair.lo, phys(0));
+        hintCopy(pair.hi, phys(1));
+        return pair.lo;
+    }
+    if (tyr == TYvoid || tyr == TYnoreturn || pairType(tyr))
         return newVreg(RC.gp, 8);
     const sz = tysize(tyr);
     if (tyfloating(tyr))
@@ -1513,6 +1842,11 @@ private Reg genAssign(elem* e)
 {
     elem* e1 = e.E1;
     const ty = tybasic(e1.Ety);
+    if (pairType(ty))
+    {
+        genAssignPair(e);
+        return noReg;
+    }
     if (e1.Eoper == OPvar)
     {
         if (Reg r = varReg(e1.Vsym))
@@ -1557,6 +1891,8 @@ private Reg genAssign(elem* e)
 @trusted
 private void hintCopy(Reg a, Reg b)
 {
+    if (!a || !b)
+        return;
     if (!isPhys(b) && !vi(b).hint)
         vi(b).hint = a;
     if (!isPhys(a) && !vi(a).hint)
@@ -1663,7 +1999,7 @@ private Reg genBinary(elem* e)
     if (op == OProl || op == OPror)
         return genRotate(e);
 
-    if (!tyfloating(ty) && e2.Eoper == OPconst && !e2.Ecount)
+    if (!tyfloating(ty) && e2.Eoper == OPconst)
     {
         const isz = sz <= 4 ? 4 : 8;
         long v = el_tolong(e2);
@@ -1715,7 +2051,7 @@ private Reg genRotate(elem* e)
     const bits = sz * 8;
     Reg a = gen(e.E1);
     Reg d = newVreg(RC.gp, sz);
-    if (e.E2.Eoper == OPconst && !e.E2.Ecount)
+    if (e.E2.Eoper == OPconst)
     {
         long n = el_tolong(e.E2) & (bits - 1);
         if (e.Eoper == OProl)
@@ -2681,6 +3017,11 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
         {
             const d = pr(i.d);
             def(d);
+            if (i.b)
+            {
+                cdb.gen1(indexedLoadStore(true, i, d, pr(i.a), pr(i.b)));
+                break;
+            }
             code cs;
             if (i.sym)
                 symEA(cs, i.sym, i.imm);
@@ -2701,6 +3042,11 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
 
         case LOp.st:
         {
+            if (i.c)
+            {
+                cdb.gen1(indexedLoadStore(false, i, pr(i.a), pr(i.b), pr(i.c)));
+                break;
+            }
             code cs;
             if (i.sym)
                 symEA(cs, i.sym, i.imm);
@@ -2950,4 +3296,48 @@ private void setBaseOffset(ref CodeBuilder cdb, ref code cs, long off)
         ins = setField(ins, 9, 5, R16);
     }
     cs.Iop = ins;
+}
+
+/* Print the elem trees of the blocks
+ */
+@trusted
+private void dumpTrees()
+{
+    import dmd.backend.debugprint : WReqn;
+    printf("=== %s (not generated)\n", funcsym_p.Sident.ptr);
+    int n;
+    for (block* b = bo.startblock; b; b = b.Bnext)
+    {
+        printf("B%d:\n", n++);
+        if (b.Belem)
+        {
+            printf("  ");
+            WReqn(b.Belem);
+            printf("\n");
+        }
+    }
+}
+
+/* LDR/STR t,[base, index{, extend {#log2 size}}] for ld/st i
+ */
+private uint indexedLoadStore(bool isLoad, ref const LIns i, uint t, uint base, uint index)
+{
+    const sz = i.sz;
+    const size = sz == 1 ? 0 : sz == 2 ? 1 : sz == 4 ? 2 : 3;
+    uint VR = 0;
+    uint opc;
+    if (t >= 32)
+    {
+        VR = 1;
+        opc = isLoad ? 1 : 0;
+    }
+    else if (!isLoad)
+        opc = 0;
+    else if (i.flags & F.signed && sz < 4)
+        opc = 3;                    // LDRSB/LDRSH into a W register
+    else
+        opc = 1;
+    const S = (i.flags & F.scaled) != 0;
+    return INSTR.ldst_regoff(size, VR, opc, cast(reg_t)(index & 31), i.cond, S,
+                             cast(reg_t)(base & 31), cast(reg_t)(t & 31));
 }
