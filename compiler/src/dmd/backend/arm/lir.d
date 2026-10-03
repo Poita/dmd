@@ -2744,10 +2744,9 @@ private void hintCopy(Reg a, Reg b)
 
 /* The operation of a binary operator on values of type ty
  */
-private LOp binop(OPER op, tym_t ty)
+private LOp binop(OPER op, tym_t ty, bool uns = false)
 {
     const fp = tyfloating(ty) != 0;
-    const uns = tyuns(ty) != 0;
     switch (op)
     {
         case OPadd: case OPaddass: case OPpostinc: return fp ? LOp.fadd : LOp.add;
@@ -2765,15 +2764,17 @@ private LOp binop(OPER op, tym_t ty)
     }
 }
 
-/* d = a op b, with b possibly a constant, for values of type ty
+/* d = a op b, with b possibly a constant, for values of type ty, a being of type ty1.
+ * A division is unsigned if an operand is, the result type not mattering
  */
 @trusted
-private Reg arith(OPER op, tym_t ty, Reg a, elem* e2, Reg b)
+private Reg arith(OPER op, tym_t ty, Reg a, elem* e2, Reg b, tym_t ty1)
 {
     const sz = tysize(ty);
     const fp = tyfloating(ty) != 0;
     const isz = sz <= 4 ? 4 : 8;
-    LOp lop = binop(op, ty);
+    const uns = tyuns(ty1) || tyuns(e2.Ety);
+    LOp lop = binop(op, ty, uns);
     Reg d = newVreg(fp ? RC.fp : RC.gp, sz);
 
     if (!b)
@@ -2805,9 +2806,11 @@ private Reg arith(OPER op, tym_t ty, Reg a, elem* e2, Reg b)
     const isMod = op == OPmod || op == OPmodass;
     if (sz < 4 && (lop == LOp.sdiv || lop == LOp.udiv || lop == LOp.lsrv || lop == LOp.asrv))
     {
-        a = extend(a, ty, 4);
+        // the extension is that of the division or shift
+        const signed = lop == LOp.sdiv || lop == LOp.asrv;
+        a = extendFrom(a, sz * 8, signed, 4);
         if (lop == LOp.sdiv || lop == LOp.udiv)
-            b = extend(b, ty, 4);
+            b = extendFrom(b, sz * 8, signed, 4);
     }
 
     if (isMod)
@@ -2929,7 +2932,7 @@ private Reg genBinary(elem* e)
         fail("opass size");
         return newVreg(RC.fp, sz);
     }
-    return arith(op, ty, a, e2, b);
+    return arith(op, ty, a, e2, b, e.E1.Ety);
 }
 
 /* e1 rol e2 or e1 ror e2, rotating left by n being rotating right by -n
@@ -2988,7 +2991,7 @@ private Reg genOpAssign(elem* e)
             {
                 // the variable is accessed as a type of the other register class
                 Reg v = asClass(r, rc, sz);
-                Reg d = arith(op, ty, v, e.E2, b);
+                Reg d = arith(op, ty, v, e.E2, b, ty);
                 copyOut(r, asClass(d, rcOf(r), sz), sz);
                 return post ? v : d;
             }
@@ -2998,7 +3001,7 @@ private Reg genOpAssign(elem* e)
                 old = newVreg(rc, sz);
                 emitIns(LOp.copy, fp ? sz : 8, old, r);
             }
-            Reg d = arith(op, ty, r, e.E2, b);
+            Reg d = arith(op, ty, r, e.E2, b, ty);
             copyOut(r, d, fp ? sz : 8);
             hintCopy(r, d);
             return post ? old : r;
@@ -3015,7 +3018,7 @@ private Reg genOpAssign(elem* e)
     Mem m = memOf(e1);
     Reg old = newVreg(fp ? RC.fp : RC.gp, sz);
     load(old, m, ty);
-    Reg d = arith(op, ty, old, e.E2, b);
+    Reg d = arith(op, ty, old, e.E2, b, ty);
     store(d, m, ty);
     return post ? old : d;
 }
@@ -3660,6 +3663,30 @@ private void rewriteSpills()
                 l.sym = slotOf(v);
                 ins.push(l);
                 r = s;
+            }
+            // a copy to or from a spilled register is a store or a load
+            if (i.op == LOp.copy && !(i.flags & F.condDef) && i.d && i.a && !isPhys(i.d) && !isPhys(i.a) &&
+                rcOf(i.d) == rcOf(i.a) && vi(i.d).spilled != vi(i.a).spilled)
+            {
+                LIns m;
+                if (vi(i.d).spilled)
+                {
+                    auto v = vi(i.d);
+                    m.op = LOp.st;
+                    m.sz = v.rc == RC.fp ? v.sz : 8;
+                    m.a = i.a;
+                    m.sym = slotOf(v);
+                }
+                else
+                {
+                    auto v = vi(i.a);
+                    m.op = LOp.ld;
+                    m.sz = v.rc == RC.fp ? v.sz : 8;
+                    m.d = i.d;
+                    m.sym = slotOf(v);
+                }
+                ins.push(m);
+                continue;
             }
             // a register both used and defined is reloaded into the same scratch
             Reg defOrig = i.d;
