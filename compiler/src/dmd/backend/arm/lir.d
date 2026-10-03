@@ -271,6 +271,7 @@ bool lirCodegen(ref CGstate cg)
             if (!getenv("DMD_NEWCG_LICM1"))
                 hoistInvariants();      // again, for what is invariant in an enclosing loop
         }
+        foldAddresses();
     }
     if (failed)
     {
@@ -4166,6 +4167,112 @@ private uint segEnd(size_t si)
     const ns = segStart.length - 1;
     const bi = segBlock[si];
     return si + 1 < ns && segBlock[si + 1] == bi ? segStart[si + 1] : blockStart[bi + 1];
+}
+
+/******************************* Addresses ******************************/
+
+/* A load or store through a register used only by it, the sum of two registers
+ * computed just before (one of them maybe shifted by the log2 of the size), uses
+ * them as base and index instead
+ */
+@trusted
+private void foldAddresses()
+{
+    buildSegments();
+    const ns = segStart.length - 1;
+    Barray!uint ndefs, nuses, defAt;
+    ndefs.setLength(vinfo.length);
+    nuses.setLength(vinfo.length);
+    defAt.setLength(vinfo.length);
+    ndefs[][] = 0;
+    nuses[][] = 0;
+    foreach (n, ref i; ins[])
+    {
+        if (i.d && !isPhys(i.d))
+        {
+            ++ndefs[i.d - firstVreg];
+            defAt[i.d - firstVreg] = cast(uint)n;
+        }
+        void use(Reg r) { if (!isPhys(r)) ++nuses[r - firstVreg]; }
+        forUses(i, &use);
+    }
+    bool single(Reg r) { return r && !isPhys(r) && ndefs[r - firstVreg] == 1 && nuses[r - firstVreg] == 1; }
+
+    foreach (si; 0 .. ns)
+    {
+        const start = segStart[si];
+        foreach (n; start .. segEnd(si))
+        {
+            LIns* m = &ins[n];
+            const isLoad = m.op == LOp.ld;
+            if (!isLoad && m.op != LOp.st)
+                continue;
+            Reg base = isLoad ? m.a : m.b;
+            if (m.sym || m.imm || (isLoad ? m.b : m.c) || m.sz > 8)
+                continue;
+            // through single use copies to the sum
+            Reg r = base;
+            uint[4] dead;
+            uint ndead;
+            uint k;
+            while (true)
+            {
+                if (!single(r))
+                    break;
+                k = defAt[r - firstVreg];
+                if (k < start || k >= n)
+                    break;
+                const op = ins[k].op;
+                if (op == LOp.copy && !isPhys(ins[k].a) && ndead < dead.length - 1)
+                {
+                    dead[ndead++] = k;
+                    r = ins[k].a;
+                    continue;
+                }
+                break;
+            }
+            if (!single(r) || ins[k].op != LOp.add || ins[k].d != r || k < start || k >= n)
+                continue;
+            LIns* a = &ins[k];
+            if (a.sz != 8)
+                continue;
+            bool scaled;
+            if (a.flags & F.shifted)
+            {
+                if (a.cond != 0 || (1L << a.imm) != m.sz)
+                    continue;
+                scaled = true;
+            }
+            const x = a.a, y = a.b;
+            // x and y keep their values up to the load or store
+            bool ok = true;
+            foreach (j; k + 1 .. n)
+                if (ins[j].d == x || ins[j].d == y)
+                    ok = false;
+            if (!ok)
+                continue;
+            if (isLoad)
+            {
+                m.a = x;
+                m.b = y;
+            }
+            else
+            {
+                m.b = x;
+                m.c = y;
+            }
+            m.cond = Extend.LSL;
+            if (scaled)
+                m.flags |= F.scaled;
+            dead[ndead++] = k;
+            foreach (d; dead[0 .. ndead])
+            {
+                ins[d].op = LOp.nop;
+                ins[d].d = ins[d].a = ins[d].b = ins[d].c = noReg;
+            }
+        }
+    }
+    ndefs.dtor(); nuses.dtor(); defAt.dtor();
 }
 
 /******************************* Loop invariants ******************************/
