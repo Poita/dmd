@@ -258,7 +258,8 @@ bool lirCodegen(ref CGstate cg)
         if (!getenv("DMD_NEWCG_NOLICM"))
         {
             hoistInvariants();
-            hoistInvariants();      // again, for what is invariant in an enclosing loop
+            if (!getenv("DMD_NEWCG_LICM1"))
+                hoistInvariants();      // again, for what is invariant in an enclosing loop
         }
     }
     if (failed)
@@ -3883,6 +3884,7 @@ private uint segEnd(size_t si)
 /* Whether the result of i depends only on its operands, and computing it
  * where it was not computed before can do no harm
  */
+@trusted
 private bool pureOp(ref const LIns i)
 {
     switch (i.op)
@@ -3895,7 +3897,7 @@ private bool pureOp(ref const LIns i)
         case LOp.lea:
             return true;
         case LOp.copy:
-            return !isPhys(i.a);
+            return !isPhys(i.a) && !getenv("DMD_NEWCG_LICMNOCOPY");
         default:
             return false;
     }
@@ -4044,28 +4046,35 @@ private void hoistInvariants()
     moveTo.setLength(ins.length);
     moveTo[][] = uint.max;
 
-    // the loops, from their back edges, smallest first
+    // the loops, one for each header with the segments of all its back edges, smallest first
     static struct Loop { uint header; uint size; uint[] body; }
     Barray!Loop loops;
     Barray!bool inLoop;
     inLoop.setLength(ns);
+    Barray!bool isHeader;
+    isHeader.setLength(ns);
+    isHeader[][] = false;
     foreach (s; 0 .. ns)
         foreach (h; segSucc[segSuccStart[s] .. segSuccStart[s + 1]])
+            if (dominates(h, cast(uint)s))
+                isHeader[h] = true;
+    foreach (h; 0 .. ns)
         {
-            if (!dominates(h, cast(uint)s))
+            if (!isHeader[h])
                 continue;
-            // the segments reaching s without passing through h
+            // the segments reaching a back edge to h without passing through h
             inLoop[][] = false;
             inLoop[h] = true;
             Barray!uint work;
             Barray!uint body;
-            body.push(h);
-            if (!inLoop[s])
-            {
-                inLoop[s] = true;
-                work.push(cast(uint)s);
-                body.push(cast(uint)s);
-            }
+            body.push(cast(uint)h);
+            foreach (p; preds[predStart[h] .. predStart[h + 1]])
+                if (dominates(cast(uint)h, p) && !inLoop[p])
+                {
+                    inLoop[p] = true;
+                    work.push(p);
+                    body.push(p);
+                }
             while (work.length)
             {
                 const v = work[work.length - 1];
@@ -4079,7 +4088,7 @@ private void hoistInvariants()
                     }
             }
             Loop lp;
-            lp.header = h;
+            lp.header = cast(uint)h;
             lp.size = cast(uint)body.length;
             lp.body = (cast(uint*)mem_malloc(body.length * uint.sizeof))[0 .. body.length];
             lp.body[] = body[];
@@ -4133,12 +4142,16 @@ private void hoistInvariants()
         else
             at = ((pend - 1) << 1) | 1;     // after the last instruction
 
-        // the registers defined in the loop, not counting what is hoisted
+        // the registers defined in the loop, where their definitions are now
         defInLoop[][] = false;
-        foreach (v; lp.body)
-            foreach (n; segStart[v] .. segEnd(v))
-                if (moveTo[n] == uint.max && ins[n].d && !isPhys(ins[n].d))
-                    defInLoop[ins[n].d - firstVreg] = true;
+        foreach (n, ref i; ins[])
+        {
+            if (!i.d || isPhys(i.d))
+                continue;
+            const loc = moveTo[n] == uint.max ? n : moveTo[n] >> 1;
+            if (inLoop[segOf[loc]])
+                defInLoop[i.d - firstVreg] = true;
+        }
 
         bool progress = true;
         while (progress)
@@ -4163,7 +4176,17 @@ private void hoistInvariants()
                         continue;
                     moveTo[n] = at;
                     if (getenv("DMD_NEWCG_LICM"))
-                        fprintf(stderr, "newcg-licm:   hoist %d %s to %d\n", cast(int)n, lopName(i.op), at);
+                    {
+                        fprintf(stderr, "newcg-licm:   hoist %d %s %%%d <- %%%d to %d; body", cast(int)n, lopName(i.op),
+                            i.d - firstVreg, i.a ? i.a - firstVreg : -1, at);
+                        foreach (bv; lp.body)
+                            fprintf(stderr, " [%d,%d)", segStart[bv], segEnd(bv));
+                        fprintf(stderr, "; defs of a:");
+                        foreach (m, ref x; ins[])
+                            if (x.d == i.a && i.a)
+                                fprintf(stderr, " %d", cast(int)m);
+                        fprintf(stderr, "\n");
+                    }
                     defInLoop[i.d - firstVreg] = false;
                     progress = true;
                     any = true;
@@ -4237,7 +4260,7 @@ private void hoistInvariants()
 
     foreach (ref lp; loops[])
         mem_free(lp.body.ptr);
-    loops.dtor(); inLoop.dtor(); defInLoop.dtor(); moveTo.dtor(); segOf.dtor(); ndefs.dtor();
+    loops.dtor(); inLoop.dtor(); isHeader.dtor(); defInLoop.dtor(); moveTo.dtor(); segOf.dtor(); ndefs.dtor();
     idom.dtor(); rpo.dtor(); order.dtor(); preds.dtor(); predStart.dtor();
 }
 
