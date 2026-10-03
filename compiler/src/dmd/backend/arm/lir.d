@@ -93,6 +93,9 @@ enum LOp : ubyte
     brk,            // trap
     spsub,          // SP -= imm
     spadd,          // SP += imm
+    frameptr,       // d = the address of the frame nested functions refer to
+    ldp,            // d, c = [a + imm], [a + imm + sz]
+    stp,            // [b + imm], [b + imm + sz] = a, c
     call,           // call sym, or the address in a; imm is the mask of argument registers
 }
 
@@ -158,6 +161,7 @@ private __gshared
     Barray!uint blockStart;     // first instruction of each block, then the end
     Barray!Reg symReg;          // by globsym index: the register of the variable, or noReg
     Barray!bool symAssigned;    // by globsym index: the function assigns the variable
+    Barray!bool symCached;      // by globsym index: the register holds a copy of what is in memory
     Barray!int symAgg;          // by globsym index: the index in aggs of an aggregate held in registers, or -1
     Barray!HoistedConst hoisted;    // constants used in loops, made once on entry
     Barray!(block*) switchBlocks;   // switches done as comparisons
@@ -283,6 +287,7 @@ bool lirCodegen(ref CGstate cg)
     if (getenv("DMD_NEWCG_DUMP"))
         dump();
     rewriteSpills();
+    pairMemoryOps();
     emit(cg);
     finishVariables();
     foreach (b; switchBlocks[])
@@ -520,6 +525,7 @@ private bool supportedElem(const(elem)* e)
             case OPd_s16: case OPd_u16:
             case OPmsw: case OP128_64:
             case OPstrpar:
+            case OPframeptr:
             case OPhalt:
                 if (OTunary(op))
                 {
@@ -642,6 +648,8 @@ private void assignVariables()
     partial[][] = false;
     symAssigned.setLength(globsym.length);
     symAssigned[][] = false;
+    symCached.setLength(globsym.length);
+    symCached[][] = false;
     static struct Use { const(elem)* e; uint block; }
     Barray!Use varCses;
     uint markBlock;
@@ -733,8 +741,15 @@ private void assignVariables()
                 partial[k], (s.Sflags & GTregcand) != 0, tym_str(s.Stype.Tty), (s.Sflags & SFLdead) != 0);
         if (partial[k])
             continue;
+        /* A parameter a nested function refers to is volatile, but its value can be
+         * kept in a register too if nothing can change it: a reference, or a const one
+         * never assigned. It keeps its place in memory for the nested function
+         */
+        const cached = s.Sclass == SC.fastpar && s.ty() & mTYvolatile && !(s.ty() & mTYshared) &&
+            (tyref(s.Stype.Tty) || s.ty() & (mTYconst | mTYimmutable)) && !symAssigned[k] &&
+            scalarType(s.Stype.Tty) && s.Spreg2 == NOREG;
         // as cgreg_init() has them, but for the weight of parameters
-        if (!(s.Sflags & GTregcand) || !s.Srange || s.ty() & (mTYvolatile | mTYshared))
+        if (!cached && (!(s.Sflags & GTregcand) || !s.Srange || s.ty() & (mTYvolatile | mTYshared)))
             continue;
         if (!scalarType(s.Stype.Tty))
             continue;
@@ -744,6 +759,7 @@ private void assignVariables()
         Reg r = newVreg(tyfloating(s.Stype.Tty) ? RC.fp : RC.gp, sz);
         vinfo[r - firstVreg].sym = s;
         symReg[k] = r;
+        symCached[k] = cached;
     }
     partial.dtor();
     assignAggregates();
@@ -992,6 +1008,8 @@ private void finishVariables()
         const v = &vinfo[r - firstVreg];
         if (s.Sclass == SC.parameter)
             continue;           // its stack slot is the caller's
+        if (symCached[k])
+            continue;           // it stays in memory as well
         s.Sfl = FL.reg;
         const preg = s.Sclass == SC.fastpar ? s.Spreg : (v.spilled ? 0 : v.preg);
         s.Sreglsw = cast(reg_t)preg;
@@ -2727,6 +2745,14 @@ private Reg genx(elem* e)
         case OPmemset:
             fail("memory operation value");
             return newVreg(RC.gp, 8);
+
+        case OPframeptr:
+        {
+            Reg d = newVreg(RC.gp, 8);
+            emitIns(LOp.frameptr, 8, d);
+            usesFrame = true;
+            return d;
+        }
 
         case OPmsw:
         {
@@ -4490,6 +4516,116 @@ private void hoistInvariants()
     idom.dtor(); rpo.dtor(); order.dtor(); preds.dtor(); predStart.dtor();
 }
 
+/******************************* Pairing ******************************/
+
+/* The register r has after allocation
+ */
+@trusted
+private uint allocated(Reg r)
+{
+    return isPhys(r) ? physOf(r) : vi(r).preg;
+}
+
+/* Combine loads (or stores) of adjacent memory through the same base register
+ * into LDP (or STP)
+ */
+@trusted
+private void pairMemoryOps()
+{
+    foreach (bi; 0 .. blocks.length)
+    {
+        const end = blockStart[bi + 1];
+        foreach (n; blockStart[bi] .. end)
+        {
+            LIns* a = &ins[n];
+            const isLoad = a.op == LOp.ld;
+            if (!isLoad && a.op != LOp.st)
+                continue;
+            if (!pairable(*a, isLoad))
+                continue;
+            const base = allocated(isLoad ? a.a : a.b);
+            const fp = (isLoad ? allocated(a.d) : allocated(a.a)) >= 32;
+            if (isLoad && allocated(a.d) == base)
+                continue;
+            // look a few instructions ahead for its partner
+            foreach (m; n + 1 .. (n + 5 < end ? n + 5 : end))
+            {
+                LIns* b = &ins[m];
+                if (b.op == a.op && pairable(*b, isLoad) && b.sz == a.sz &&
+                    allocated(isLoad ? b.a : b.b) == base &&
+                    ((isLoad ? allocated(b.d) : allocated(b.a)) >= 32) == fp &&
+                    (b.imm == a.imm + a.sz || b.imm == a.imm - a.sz))
+                {
+                    const lo = b.imm < a.imm ? b.imm : a.imm;
+                    if (lo % a.sz || lo / a.sz < -64 || lo / a.sz > 63)
+                        break;
+                    if (isLoad && (allocated(b.d) == allocated(a.d) || allocated(b.d) == base))
+                        break;
+                    // what is between may not depend on or change what the move of b changes
+                    bool ok = true;
+                    foreach (k; n + 1 .. m)
+                    {
+                        LIns* x = &ins[k];
+                        if (x.op == LOp.label || x.op == LOp.br || x.op == LOp.bcond || x.op == LOp.cbz ||
+                            x.op == LOp.call || x.op == LOp.st || x.op == LOp.stp ||
+                            x.op == LOp.spsub || x.op == LOp.spadd ||
+                            !isLoad && (x.op == LOp.ld || x.op == LOp.ldp))
+                        {
+                            ok = false;
+                            break;
+                        }
+                        void check(Reg r)
+                        {
+                            const p = allocated(r);
+                            if (p == base || isLoad && p == allocated(b.d) || !isLoad && p == allocated(b.a))
+                                ok = false;
+                        }
+                        if (x.d)
+                            check(x.d);
+                        if (isLoad)
+                            forUses(*x, &check);
+                    }
+                    if (!ok)
+                        break;
+                    LIns p = *a;
+                    if (isLoad)
+                    {
+                        p.op = LOp.ldp;
+                        p.d = b.imm < a.imm ? b.d : a.d;
+                        p.c = b.imm < a.imm ? a.d : b.d;
+                        p.a = a.a;
+                        p.b = noReg;
+                    }
+                    else
+                    {
+                        p.op = LOp.stp;
+                        p.a = b.imm < a.imm ? b.a : a.a;
+                        p.c = b.imm < a.imm ? a.a : b.a;
+                        p.b = a.b;
+                    }
+                    p.imm = lo;
+                    *a = p;
+                    b.op = LOp.nop;
+                    b.d = b.a = b.b = b.c = noReg;
+                    break;
+                }
+                if (b.op == LOp.label || b.op == LOp.br || b.op == LOp.bcond || b.op == LOp.cbz || b.op == LOp.call)
+                    break;
+            }
+        }
+    }
+}
+
+/* Whether load or store i of a register at a base register and offset can be one of a pair
+ */
+private bool pairable(ref const LIns i, bool isLoad)
+{
+    if (i.sym || (isLoad ? i.b : i.c) || i.sz != 4 && i.sz != 8)
+        return false;
+    // LDP of W registers zero extends, as the loads it replaces do unless signed
+    return !(i.flags & (F.toX | F.scaled)) && !(isLoad && i.flags & F.signed && i.sz == 4);
+}
+
 /******************************* Allocation ******************************/
 
 /* The registers allocated, in order of preference: the caller saved first,
@@ -5374,6 +5510,38 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
         case LOp.brk:
             cdb.gen1(INSTR.brk(0));
             break;
+
+        case LOp.ldp:
+        case LOp.stp:
+        {
+            const isLoad = i.op == LOp.ldp;
+            const t1 = isLoad ? pr(i.d) : pr(i.a);
+            const t2 = pr(i.c);
+            if (isLoad)
+            {
+                def(t1);
+                def(t2);
+            }
+            const vr = t1 >= 32;
+            const opc = vr ? (i.sz == 4 ? 0 : 1) : (i.sz == 8 ? 2 : 0);
+            const imm7 = cast(uint)(i.imm / i.sz) & 0x7F;
+            cdb.gen1(INSTR.ldstpair_off(opc, vr, isLoad, imm7, cast(ubyte)(t2 & 31),
+                cast(ubyte)(pr(isLoad ? i.a : i.b) & 31), cast(ubyte)(t1 & 31)));
+            break;
+        }
+
+        case LOp.frameptr:
+        {
+            // resolved by assignaddrc(), as cdframeptr()'s is
+            const d = pr(i.d);
+            def(d);
+            code cs;
+            cs.Iop = PSOP.frameptr;
+            cs.Iflags = CF.zero;
+            cs.Irm = cast(ubyte)d;
+            cdb.gen(&cs);
+            break;
+        }
 
         case LOp.spsub:
         case LOp.spadd:
