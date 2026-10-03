@@ -101,6 +101,7 @@ enum F : ubyte
     condDef = 4,    // a definition that is made on only some paths through its block
     scaled  = 8,    // ld/st: the index register is shifted left by the log2 of the size
     toX     = 16,   // ld: a signed load extends to 64 bits rather than 32
+    shifted = 32,   // add/sub/and/orr/eor: b is shifted by imm, LSL, LSR or ASR as cond is 0, 1 or 2
 }
 
 /// An instruction of the intermediate representation
@@ -618,10 +619,24 @@ private void assignVariables()
                 varCses.push(Use(e, markBlock));
             if (OTassign(e.Eoper) && e.E1.Eoper == OPvar)
             {
-                const s = e.E1.Vsym;
+                // assigned whole
+                const e1 = e.E1;
+                const s = e1.Vsym;
                 const k = s.Ssymnum;
                 if (k < globsym.length && globsym[k] is s)
+                {
                     symAssigned[k] = true;
+                    if (e1.Voffset != 0 || tysize(e1.Ety) != tysize(s.Stype.Tty))
+                        partial[k] = true;
+                }
+                if (e1.Ecount)
+                    varCses.push(Use(e1, markBlock));
+                if (OTbinary(e.Eoper))
+                {
+                    e = e.E2;
+                    continue;
+                }
+                return;
             }
             if (e.Eoper == OPvar || e.Eoper == OPrelconst)
             {
@@ -629,8 +644,12 @@ private void assignVariables()
                 const k = s.Ssymnum;
                 if (k < globsym.length && globsym[k] is s)
                 {
-                    if (e.Eoper == OPrelconst || e.Voffset != 0 ||
-                        tysize(e.Ety) != tysize(s.Stype.Tty))
+                    // read whole, or the low part of an integer
+                    const sz = tysize(e.Ety);
+                    const ssz = tysize(s.Stype.Tty);
+                    const lowPart = sz < ssz && !tyfloating(e.Ety) && !tyfloating(s.Stype.Tty) &&
+                                    (sz == 1 || sz == 2 || sz == 4);
+                    if (e.Eoper == OPrelconst || e.Voffset != 0 || sz != ssz && !lowPart)
                         partial[k] = true;
                 }
                 return;
@@ -2335,6 +2354,17 @@ private Reg genx(elem* e)
 
         case OPcond:
         {
+            if (selectable(e))
+            {
+                // CSEL/FCSEL of both arms, evaluated after the comparison sets the flags
+                const c = compare(e.E1);
+                Reg a = gen(e.E2.E1);
+                Reg b = gen(e.E2.E2);
+                Reg d = newVreg(rc, sz);
+                auto i = emitIns(rc == RC.fp ? LOp.fcsel : LOp.csel, rc == RC.fp ? sz : (sz <= 4 ? 4 : 8), d, a, b);
+                i.cond = c;
+                return d;
+            }
             Reg d = newVreg(rc, sz);
             const lfalse = newLabel();
             const lend = newLabel();
@@ -2422,6 +2452,46 @@ private Reg genx(elem* e)
             fail("gen op");
             return newVreg(rc, sz);
     }
+}
+
+/* Whether the ?: e can be a select of both arms: its condition a comparison,
+ * and its arms cheap, without side effects, and unable to fault or set the flags
+ */
+@trusted
+private bool selectable(const(elem)* e)
+{
+    const c = e.E1;
+    if (c.Eoper < OPle || c.Eoper > OPne || el_sideeffect(cast(elem*)c))
+        return false;
+    if (!scalarType(c.E1.Ety) || pairType(c.E1.Ety))
+        return false;
+    int budget = 4;
+    bool cheap(const(elem)* x)
+    {
+        if (--budget < 0)
+            return false;
+        switch (x.Eoper)
+        {
+            case OPconst:
+                return true;
+            case OPvar:
+                return !(x.Vsym.ty() & mTYvolatile) && varSupported(x.Vsym);
+            case OPadd: case OPmin: case OPand: case OPor: case OPxor:
+            case OPmul:
+                return cheap(x.E1) && cheap(x.E2);
+            case OPshl: case OPshr: case OPashr:
+                return x.E2.Eoper == OPconst && cheap(x.E1);
+            case OPneg: case OPcom:
+            case OPs32_64: case OPu32_64: case OP64_32:
+            case OPs16_32: case OPu16_32: case OP32_16:
+            case OPs8_16: case OPu8_16: case OP16_8:
+                return cheap(x.E1);
+            default:
+                return false;
+        }
+    }
+    const ty = tybasic(e.Ety);
+    return scalarType(ty) && !pairType(ty) && cheap(e.E2.E1) && cheap(e.E2.E2);
 }
 
 /* The call e, returning the register of its result, or in pair a 16 byte result
@@ -2790,6 +2860,40 @@ private Reg genBinary(elem* e)
 
     if (op == OProl || op == OPror)
         return genRotate(e);
+
+    if ((op == OPadd || op == OPmin || op == OPand || op == OPor || op == OPxor) &&
+        !tyfloating(ty) && sz >= 4)
+    {
+        // a op (b shift #n), as one instruction
+        bool shiftable(elem* x)
+        {
+            return (x.Eoper == OPshl || x.Eoper == OPshr || x.Eoper == OPashr) && !x.Ecount &&
+                   tysize(x.Ety) == sz && x.E2.Eoper == OPconst &&
+                   el_tolong(x.E2) > 0 && el_tolong(x.E2) < sz * 8;
+        }
+        const second = shiftable(e2);
+        const first = !second && op != OPmin && shiftable(e.E1);
+        if (second || first)
+        {
+            elem* sh = second ? e2 : e.E1;
+            Reg a, b;
+            if (second)
+            {
+                a = gen(e.E1);
+                b = genKeep(sh.E1, a);
+            }
+            else
+            {
+                b = gen(sh.E1);
+                a = genKeep(e2, b);
+            }
+            Reg d = newVreg(RC.gp, sz);
+            auto i = emitIns(binop(op, ty), sz <= 4 ? 4 : 8, d, a, b, el_tolong(sh.E2));
+            i.flags |= F.shifted;
+            i.cond = sh.Eoper == OPshl ? 0 : sh.Eoper == OPshr ? 1 : 2;
+            return d;
+        }
+    }
 
     if (!tyfloating(ty) && e2.Eoper == OPconst)
     {
@@ -3747,7 +3851,9 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
         {
             const d = pr(i.d);
             def(d);
-            cdb.gen1(INSTR.addsub_shift(sf, i.op == LOp.sub, 0, 0, pr(i.b), 0, pr(i.a), d));
+            const shift = i.flags & F.shifted ? i.cond : 0;
+            const amount = i.flags & F.shifted ? cast(uint)i.imm : 0;
+            cdb.gen1(INSTR.addsub_shift(sf, i.op == LOp.sub, 0, shift, pr(i.b), amount, pr(i.a), d));
             break;
         }
 
@@ -3780,7 +3886,9 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
             const d = pr(i.d);
             def(d);
             const opc = i.op == LOp.and_ ? 0 : i.op == LOp.orr ? 1 : 2;
-            cdb.gen1(INSTR.log_shift(sf, opc, 0, 0, pr(i.b), 0, pr(i.a), d));
+            const shift = i.flags & F.shifted ? i.cond : 0;
+            const amount = i.flags & F.shifted ? cast(uint)i.imm : 0;
+            cdb.gen1(INSTR.log_shift(sf, opc, shift, 0, pr(i.b), amount, pr(i.a), d));
             break;
         }
 
