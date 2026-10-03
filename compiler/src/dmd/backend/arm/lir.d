@@ -366,11 +366,15 @@ private bool aggregateOp(const(elem)* e)
 {
     switch (e.Eoper)
     {
-        case OPvar: case OPind: case OPcomma: case OPstrpar:
+        case OPvar: case OPind:
+            return true;            // the type comes from what they are assigned to or from
+        case OPcomma: case OPstrpar:
         case OPeq: case OPstreq:
             break;
         case OPcall: case OPucall:
         {
+            if (e.Nflags & NFLhidden)
+                return true;
             const a = aarch64Aggregate(cast(type*)e.ET);
             return a.kind == AggregateABI.Kind.hfa || a.kind == AggregateABI.Kind.gpr;
         }
@@ -388,6 +392,7 @@ private bool pairOp(OPER op)
     {
         case OPvar: case OPind: case OPpair: case OPrpair: case OPconst:
         case OPcomma: case OPeq: case OPcall: case OPucall: case OPcond: case OPcolon:
+        case OPremquo:
             return true;
         default:
             return false;
@@ -427,7 +432,8 @@ private bool supportedElem(const(elem)* e)
         const op = e.Eoper;
         if (!(op == OPcolon) && !(op == OPcomma) && !(op == OPeq) && !(op == OPparam) &&
             !scalarType(e.Ety) && tybasic(e.Ety) != TYvoid && tybasic(e.Ety) != TYnoreturn &&
-            !(pairType(e.Ety) && pairOp(op)) && !(tyaggregate(e.Ety) && aggregateOp(e)))
+            !(pairType(e.Ety) && pairOp(op)) && !(tyaggregate(e.Ety) && aggregateOp(e)) &&
+            op != OPmemcpy && op != OPmemset)
         {
             whyNot = "type";
             if (getenv("DMD_NEWCG_WHY"))
@@ -502,6 +508,8 @@ private bool supportedElem(const(elem)* e)
             case OProl: case OPror:
             case OPpair: case OPrpair:
             case OPstreq:
+            case OPmemcpy: case OPmemset:
+            case OPremquo:
             case OPeq:
             case OPcomma:
             case OPandand: case OPoror:
@@ -1248,7 +1256,9 @@ private void genEffect(elem* e)
             }
             break;
     }
-    if (e.Eoper == OPstreq || tyaggregate(e.Ety) || hfaAsInteger(e) ||
+    if (e.Eoper == OPmemcpy || e.Eoper == OPmemset)
+        genMemOp(e);
+    else if (e.Eoper == OPstreq || tyaggregate(e.Ety) || hfaAsInteger(e) ||
         e.Eoper == OPeq && (hfaAsInteger(e.E1) || hfaAsInteger(e.E2)))
         genAgg(e);
     else if (pairType(e.Ety))
@@ -1727,6 +1737,13 @@ private Pair genPairx(elem* e)
         case OPeq:
             return genAssignPair(e);
 
+        case OPremquo:
+        {
+            Reg q, r;
+            divMod(e, q, r);
+            return Pair(q, r);
+        }
+
         case OPcall:
         case OPucall:
         {
@@ -1770,8 +1787,47 @@ private Pair genPairx(elem* e)
 @trusted
 private bool hfaAsInteger(const(elem)* e)
 {
+    // the whole of it, not an integer sized part
     return e.ET && !tyaggregate(e.Ety) && tyaggregate(e.ET.Tty) &&
+           tysize(e.Ety) >= type_size(cast(type*)e.ET) && (e.Eoper != OPvar || e.Voffset == 0) &&
            aarch64Aggregate(cast(type*)e.ET).kind == AggregateABI.Kind.hfa;
+}
+
+/* Whether e is an integer typed value of the HFA of ABI a, which splitHfa() handles
+ */
+private bool integerHfa(const(elem)* e, ref const AggregateABI a)
+{
+    return a.kind == AggregateABI.Kind.hfa && !tyfloating(e.Ety) && !tyaggregate(e.Ety) &&
+           (scalarType(e.Ety) && tysize(e.Ety) == 8 || pairType(e.Ety)) && a.size <= 16;
+}
+
+/* The elements of the HFA of ABI a held in the integer value e, in V registers
+ */
+@trusted
+private Reg[4] splitHfa(elem* e, ref const AggregateABI a)
+{
+    Reg[4] r;
+    Reg[2] words;
+    if (pairType(e.Ety))
+    {
+        Pair p = genPair(e);
+        words = [p.lo, p.hi];
+    }
+    else
+        words[0] = gen(e);
+    foreach (k; 0 .. a.nregs)
+    {
+        const bit = k * a.esz * 8;
+        Reg w = words[bit / 64];
+        if (bit % 64)
+        {
+            Reg t = newVreg(RC.gp, 8);
+            emitIns(LOp.lsri, 8, t, w, noReg, bit % 64);
+            w = t;
+        }
+        r[k] = asClass(w, RC.fp, a.esz);
+    }
+    return r;
 }
 
 /* Whether e is an aggregate in a variable or memory, after any commas
@@ -1815,6 +1871,15 @@ private AggVal genAgg(elem* e)
 
         case OPcall:
         case OPucall:
+            if (e.Nflags & NFLhidden)
+            {
+                // the aggregate is where the hidden argument points
+                Reg addr;
+                genCall(e, null, null, &addr);
+                v.kind = AggVal.Kind.mem;
+                v.m.base = addr;
+                return v;
+            }
             v.kind = AggVal.Kind.parts;
             genCall(e, null, &v.r);
             return v;
@@ -1937,7 +2002,8 @@ private AggVal genAggAssign(elem* e)
         genEffect(e1.E1);
         e1 = e1.E2;
     }
-    if (e1.Eoper != OPvar && e1.Eoper != OPind)
+    if (e1.Eoper != OPvar && e1.Eoper != OPind ||
+        !tyaggregate(e1.Ety) && tysize(e1.Ety) < type_size(t))
     {
         fail("aggregate assign target");
         return AggVal.init;
@@ -1990,6 +2056,125 @@ private void copyMem(Mem d, Mem s, uint size)
         store(t, md, chunkType(n));
         off += n;
     }
+}
+
+/* memcpy(d, s, n) as (d OPmemcpy (s OPparam n)), and memset(s, value, n) as
+ * (s OPmemset (n OPparam value)), for their side effects
+ */
+@trusted
+private void genMemOp(elem* e)
+{
+    import dmd.backend.rtlsym : RTLSYM, getRtlsym;
+    elem* p = e.E2;
+    if (e.Eoper == OPmemcpy)
+    {
+        // the order of evaluation of cdmemcpy()
+        Reg s = gen(p.E1);
+        if (p.E2.Eoper == OPconst && el_tolong(p.E2) >= 0 && el_tolong(p.E2) <= 64)
+        {
+            Reg d = gen(e.E1);
+            Mem md, ms;
+            md.base = d;
+            ms.base = s;
+            copyMem(md, ms, cast(uint)el_tolong(p.E2));
+            return;
+        }
+        Reg n = gen(p.E2);
+        Reg d = gen(e.E1);
+        Reg[3] args = [d, s, n];
+        emitLibCall(getRtlsym(RTLSYM.MEMCPY), args[]);
+        return;
+    }
+
+    elem* evalue = p.E2;
+    elem* enumbytes = p.E1;
+    if (tysize(evalue.Ety) != 1 && evalue.Eoper != OPstrpar)
+    {
+        fail("memset of elements");
+        return;
+    }
+    Reg s = gen(e.E1);
+    if (enumbytes.Eoper == OPconst && el_tolong(enumbytes) >= 0 && el_tolong(enumbytes) <= 128 &&
+        (evalue.Eoper == OPconst || evalue.Eoper == OPstrpar))
+    {
+        // stores of the value repeated in each byte
+        ulong v = evalue.Eoper == OPstrpar ? 0 : el_tolong(evalue) & 0xFF;
+        v |= v << 8;
+        v |= v << 16;
+        v |= v << 32;
+        Reg r = newVreg(RC.gp, 8);
+        emitIns(LOp.movi, 8, r, noReg, noReg, cast(long)v);
+        const size = cast(uint)el_tolong(enumbytes);
+        uint off = 0;
+        while (off < size)
+        {
+            const left = size - off;
+            const n = left >= 8 ? 8 : left >= 4 ? 4 : left >= 2 ? 2 : 1;
+            Mem m;
+            m.base = s;
+            m.offset = off;
+            store(r, m, chunkType(n));
+            off += n;
+        }
+        return;
+    }
+    Reg n = gen(enumbytes);
+    Reg value = evalue.Eoper == OPstrpar ? noReg : extendFrom(gen(evalue), 8, false, 4);
+    if (!value)
+    {
+        value = newVreg(RC.gp, 4);
+        emitIns(LOp.movi, 4, value, noReg, noReg, 0);
+    }
+    Reg[3] args = [s, value, n];
+    emitLibCall(getRtlsym(RTLSYM.MEMSET8), args[]);
+}
+
+/* A call of the C library function f with integer arguments args
+ */
+@trusted
+private void emitLibCall(Symbol* f, Reg[] args)
+{
+    regm_t argRegs;
+    foreach (k, a; args)
+    {
+        emitIns(LOp.copy, 8, phys(cast(uint)k), a);
+        hintCopy(a, phys(cast(uint)k));
+        argRegs |= mask(cast(reg_t)k);
+    }
+    auto c = emitIns(LOp.call, 0, noReg, noReg, noReg, cast(long)argRegs);
+    c.sym = f;
+}
+
+/* The quotient and remainder of OPremquo e
+ */
+@trusted
+private void divMod(elem* e, out Reg q, out Reg r)
+{
+    const ty1 = tybasic(e.E1.Ety);
+    const sz = tysize(ty1);
+    const uns = tyuns(ty1) || tyuns(e.E2.Ety);
+    Reg a, b;
+    if (ERTOL(e))
+    {
+        b = gen(e.E2);
+        a = gen(e.E1);
+    }
+    else
+    {
+        a = gen(e.E1);
+        b = genKeep(e.E2, a);
+    }
+    if (sz < 4)
+    {
+        a = extendFrom(a, sz * 8, !uns, 4);
+        b = extendFrom(b, sz * 8, !uns, 4);
+    }
+    const isz = sz <= 4 ? 4 : 8;
+    q = newVreg(RC.gp, isz);
+    emitIns(uns ? LOp.udiv : LOp.sdiv, isz, q, a, b);
+    r = newVreg(RC.gp, isz);
+    auto i = emitIns(LOp.msub, isz, r, q, b);
+    i.c = a;
 }
 
 /* One half of OPpair or OPrpair, in an integer register
@@ -2241,6 +2426,23 @@ private Reg genx(elem* e)
 
         case OP128_64:
             return genPair(e.E1).lo;
+
+        case OPremquo:
+        {
+            // 32 bit operands: the quotient in the low half and the remainder in the high
+            Reg q, r;
+            divMod(e, q, r);
+            Reg d = newVreg(RC.gp, 8);
+            auto i = emitIns(LOp.orr, 8, d, extendFrom(q, 32, false, 8), r, 32);
+            i.flags |= F.shifted;
+            i.cond = 0;
+            return d;
+        }
+
+        case OPmemcpy:
+        case OPmemset:
+            fail("memory operation value");
+            return newVreg(RC.gp, 8);
 
         case OPmsw:
         {
@@ -2497,7 +2699,7 @@ private bool selectable(const(elem)* e)
 /* The call e, returning the register of its result, or in pair a 16 byte result
  */
 @trusted
-private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null)
+private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden = null)
 {
     if (pair)
         *pair = Pair(newVreg(RC.gp, 8), newVreg(RC.gp, 8));     // also the result if this fails
@@ -2517,7 +2719,7 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null)
     const tyf = tybasic(e.E1.Ety);
     const np = e.Eoper == OPcall ? el_nparams(e.E2) : 0;
     Parameter[16] pbuf;
-    if (np > pbuf.length || e.Nflags & NFLhidden || e.numParams)
+    if (np > pbuf.length || e.numParams)
     {
         fail("call form");
         return newVreg(RC.gp, 8);
@@ -2528,18 +2730,46 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null)
         int n = 0;
         fillParameters(e.E2, params, n);
     }
+
+    /* An aggregate argument the optimizer replaced with a plain value gets its
+     * type back from the prototype, as cdfunc() does, as that decides how it is passed
+     */
+    if (e.E1.Eoper == OPvar && tyfunc(e.E1.Vsym.Stype.Tty) &&
+        e.E1.Vsym.Stype.Tparamtypes && !variadic(e.E1.Vsym.Stype))
+    {
+        foreach (i, ref pt; (*e.E1.Vsym.Stype.Tparamtypes)[])
+        {
+            if (i >= np)
+                break;
+            elem* ep = params[i].e;
+            type* t = pt.Ptype;
+            if (!ep.ET && t && tyaggregate(t.Tty) && !tyaggregate(ep.Ety) &&
+                tysize(ep.Ety) >= type_size(t))
+                ep.ET = t;
+        }
+    }
+
+    // an aggregate returned in memory has its address passed as the last argument, in x8
+    const hiddenIdx = e.Nflags & NFLhidden ? np - 1 : -1;
+
     // registers are allocated from the last argument to the first, as cdfunc() does
     FuncParamRegs fpr = FuncParamRegs_create(tyf);
     for (int i = np; --i >= 0;)
     {
         Parameter* p = &params[i];
         elem* ep = p.e;
+        if (i == hiddenIdx)
+        {
+            p.reg = 8;
+            p.reg2 = NOREG;
+            continue;
+        }
         const isPair = pairType(ep.Ety);
         if (holdsAggregate(ep.Ety, ep.ET))
         {
             // in consecutive registers from p.reg
             const a = aarch64Aggregate(ep.ET);
-            if (!tyaggregate(ep.Ety) && !aggregateLvalue(ep) ||
+            if (!tyaggregate(ep.Ety) && !aggregateLvalue(ep) && !integerHfa(ep, a) ||
                 a.kind != AggregateABI.Kind.hfa && a.kind != AggregateABI.Kind.gpr ||
                 !FuncParamRegs_alloc(*cgp, fpr, ep.ET, ep.Ety, p.reg, p.reg2) || p.reg == NOREG || p.reg == 8)
             {
@@ -2578,9 +2808,19 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null)
     Reg[4][16] aggArgs;
     foreach (i, ref p; params)
     {
+        if (i == hiddenIdx)
+        {
+            vals[i] = gen(p.e);
+            continue;
+        }
         if (holdsAggregate(p.e.Ety, p.e.ET))
         {
             const a = aarch64Aggregate(p.e.ET);
+            if (!tyaggregate(p.e.Ety) && !aggregateLvalue(p.e))
+            {
+                aggArgs[i] = splitHfa(p.e, a);
+                continue;
+            }
             AggVal v = genAgg(p.e);
             aggArgs[i] = aggParts(v, a);
             continue;
@@ -2601,6 +2841,14 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null)
     regm_t argRegs;
     foreach (i, ref p; params)
     {
+        if (i == hiddenIdx)
+        {
+            emitIns(LOp.copy, 8, phys(8), vals[i]);
+            argRegs |= mask(8);
+            if (hidden)
+                *hidden = vals[i];
+            continue;
+        }
         if (holdsAggregate(p.e.Ety, p.e.ET))
         {
             const a = aarch64Aggregate(p.e.ET);
@@ -2657,7 +2905,7 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null)
         hintCopy(pair.hi, phys(1));
         return pair.lo;
     }
-    if (tyr == TYvoid || tyr == TYnoreturn || pairType(tyr))
+    if (tyr == TYvoid || tyr == TYnoreturn || pairType(tyr) || tyaggregate(tyr))
         return newVreg(RC.gp, 8);
     const sz = tysize(tyr);
     if (tyfloating(tyr))
