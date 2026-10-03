@@ -72,6 +72,7 @@ enum LOp : ubyte
     zext,           // d = a zero extended from imm bits
     cmp,            // flags = a - b
     cmpi,           // flags = a - imm
+    tsti,           // flags = a & imm
     cset,           // d = cond
     csel,           // d = cond ? a : b
     fadd, fsub, fmul, fdiv,                                        // d = a op b
@@ -87,6 +88,7 @@ enum LOp : ubyte
     lea,            // d = &sym + imm
     br,             // jump to target
     bcond,          // jump to target if cond
+    cbz,            // jump to target if a is zero (cond eq) or nonzero (cond ne)
     brk,            // trap
     call,           // call sym, or the address in a; imm is the mask of argument registers
 }
@@ -1031,6 +1033,32 @@ private void genCond(elem* e, bool jumpIfTrue, uint l, block* t = null)
             genCond(e.E1, jumpIfTrue, l, t);
             return;
 
+        case OPand:
+        {
+            // TST a,#c
+            const sz = tysize(e.Ety);
+            if (e.E2.Eoper == OPconst && !tyfloating(e.Ety) &&
+                immForm(LOp.and_, el_tolong(e.E2), sz <= 4 ? 4 : 8) == LOp.andi)
+            {
+                Reg a = gen(e.E1);
+                long c = el_tolong(e.E2);
+                if (sz < 4)
+                    c &= sz == 1 ? 0xFF : 0xFFFF;
+                if (c && immForm(LOp.and_, c, sz <= 4 ? 4 : 8) == LOp.andi)
+                {
+                    emitIns(LOp.tsti, sz <= 4 ? 4 : 8, noReg, a, noReg, c);
+                    jump(jumpIfTrue ? COND.ne : COND.eq);
+                    return;
+                }
+                // c is 0 within the size: never true
+                if (!jumpIfTrue)
+                    jump(COND.al);
+                return;
+            }
+            valueCond(e, jumpIfTrue, &jump);
+            return;
+        }
+
         case OPandand:
         case OPoror:
         {
@@ -1074,16 +1102,38 @@ private void genCond(elem* e, bool jumpIfTrue, uint l, block* t = null)
 private void valueCond(elem* e, bool jumpIfTrue, scope void delegate(COND) nothrow jump)
 {
     Reg r = gen(e);
+    const cond = jumpIfTrue ? COND.ne : COND.eq;
     if (tyfloating(e.Ety))
-        emitIns(LOp.fcmpz, tysize(e.Ety), noReg, r);
-    else
     {
-        const sz = tysize(e.Ety);
-        if (sz < 4)
-            r = extend(r, e.Ety, 4);
-        emitIns(LOp.cmpi, sz <= 4 ? 4 : 8, noReg, r, noReg, 0);
+        emitIns(LOp.fcmpz, tysize(e.Ety), noReg, r);
+        jump(cond);
+        return;
     }
-    jump(jumpIfTrue ? COND.ne : COND.eq);
+    const sz = tysize(e.Ety);
+    if (sz < 4 && !isExtended(r, sz * 8))
+    {
+        // TST of the low bits
+        emitIns(LOp.tsti, 4, noReg, r, noReg, sz == 1 ? 0xFF : 0xFFFF);
+        jump(cond);
+        return;
+    }
+    jump(cond);
+    // CBZ/CBNZ
+    LIns* b = &ins[ins.length - 1];
+    b.op = LOp.cbz;
+    b.a = r;
+    b.sz = sz <= 4 ? 4 : 8;
+}
+
+/* Whether temporary r holds a value extended from bits
+ */
+@trusted
+private bool isExtended(Reg r, uint bits)
+{
+    if (isPhys(r))
+        return false;
+    auto v = vi(r);
+    return v.extBits && !v.sym && v.extBits <= bits;
 }
 
 /* Set the flags for the relational e, returning the condition for it being true
@@ -1115,6 +1165,13 @@ private COND compare(elem* e)
         if (i == 2)
         {
             const sz = tysize(ty);
+            if (e2.Eoper == OPconst && tysize(e2.Ety) == sz &&
+                (sz == 4 ? e2.Vfloat == 0 : e2.Vdouble == 0))
+            {
+                // FCMP a,#0.0
+                emitIns(LOp.fcmpz, sz, noReg, gen(e1));
+                return c;
+            }
             Reg a, b;
             if (ERTOL(e)) { b = gen(e2); a = gen(e1); }
             else { a = gen(e1); b = genKeep(e2, a); }
@@ -1772,12 +1829,14 @@ private Reg genx(elem* e)
             auto m = enterCond();
             Reg a = gen(e.E2.E1);
             copyOut(d, a, rc == RC.fp ? sz : 8);
+            hintCopy(d, a);
             leaveCond(m);
             jumpTo(lend);
             placeLabel(lfalse);
             m = enterCond();
             Reg b = gen(e.E2.E2);
             copyOut(d, b, rc == RC.fp ? sz : 8);
+            hintCopy(d, b);
             leaveCond(m);
             placeLabel(lend);
             return d;
@@ -1821,10 +1880,14 @@ private Reg genx(elem* e)
         case OPd_s32: case OPd_s64: case OPd_s16:
         case OPd_u32: case OPd_u64: case OPd_u16:
         {
-            Reg a = gen(e.E1);
+            // a float widened to double converts as the float, the widening being exact
+            elem* src = e.E1;
+            if (src.Eoper == OPf_d && !src.Ecount)
+                src = src.E1;
+            Reg a = gen(src);
             Reg d = newVreg(RC.gp, sz);
             const signed = op == OPd_s32 || op == OPd_s64 || op == OPd_s16;
-            emitIns(signed ? LOp.fcvtzs : LOp.fcvtzu, sz <= 4 ? 4 : 8, d, a, noReg, tysize(e.E1.Ety));
+            emitIns(signed ? LOp.fcvtzs : LOp.fcvtzu, sz <= 4 ? 4 : 8, d, a, noReg, tysize(src.Ety));
             return d;
         }
 
@@ -2327,8 +2390,14 @@ private void setFrom(Reg r, uint pos)
 private __gshared
 {
     Barray!Reg globalRegs;              // by globalId
-    Barray!ulong liveIn, liveOut;       // bit sets of globalIds by block
+    Barray!ulong liveIn, liveOut;       // bit sets of globalIds by segment
     size_t setWords;
+    Barray!uint segStart;               // first instruction of each segment, and the end
+    Barray!uint segBlock;               // the block of each segment
+    Barray!uint blockSeg;               // the first segment of each block
+    Barray!uint labelSeg;               // the segment each label starts
+    Barray!uint segSuccStart;           // start of each segment's successors in segSucc
+    Barray!uint segSucc;
 }
 
 @trusted
@@ -2363,11 +2432,86 @@ private void computeLiveness()
         fill.dtor();
     }
 
-    // registers used in more than one block are global
-    globalRegs.setLength(0);
+    /* The code of each block is split into segments at labels and after branches,
+     * so the control flow within blocks, as of ?: and &&, is known
+     */
+    segStart.setLength(0);
+    segBlock.setLength(0);
+    labelSeg.setLength(nlabels);
+    blockSeg.setLength(nb + 1);
     foreach (bi; 0 .. nb)
     {
-        foreach (ref i; ins[blockStart[bi] .. blockStart[bi + 1]])
+        blockSeg[bi] = cast(uint)segStart.length;
+        bool start = true;
+        foreach (n; blockStart[bi] .. blockStart[bi + 1])
+        {
+            const op = ins[n].op;
+            if (op == LOp.label)
+                start = true;
+            if (start)
+            {
+                segStart.push(cast(uint)n);
+                segBlock.push(cast(uint)bi);
+                start = false;
+            }
+            if (op == LOp.label)
+                labelSeg[ins[n].target] = cast(uint)(segStart.length - 1);
+            if (op == LOp.br || op == LOp.bcond || op == LOp.cbz)
+                start = true;
+        }
+        if (blockSeg[bi] == segStart.length)
+        {
+            // an empty block is an empty segment
+            segStart.push(blockStart[bi]);
+            segBlock.push(cast(uint)bi);
+        }
+    }
+    const ns = segStart.length;
+    blockSeg[nb] = cast(uint)ns;
+    segStart.push(cast(uint)ins.length);
+
+    uint segEnd(size_t si)
+    {
+        // the next segment's start, or the block's end
+        const bi = segBlock[si];
+        return si + 1 < ns && segBlock[si + 1] == bi ? segStart[si + 1] : blockStart[bi + 1];
+    }
+
+    // the successors of each segment
+    segSuccStart.setLength(ns + 1);
+    segSucc.setLength(0);
+    foreach (si; 0 .. ns)
+    {
+        segSuccStart[si] = cast(uint)segSucc.length;
+        const bi = segBlock[si];
+        const end = segEnd(si);
+        bool fallsThrough = true;
+        if (end > segStart[si])
+        {
+            const i = &ins[end - 1];
+            if (i.op == LOp.br || i.op == LOp.bcond || i.op == LOp.cbz)
+            {
+                segSucc.push(i.flags & F.toLabel ? labelSeg[i.target] : blockSeg[i.target]);
+                if (i.op == LOp.br)
+                    fallsThrough = false;
+            }
+        }
+        if (fallsThrough)
+        {
+            if (si + 1 < ns && segBlock[si + 1] == bi)
+                segSucc.push(cast(uint)(si + 1));
+            else
+                foreach (s; blocks[bi].Bsucc[])
+                    segSucc.push(blockSeg[s.Bdfoidx]);
+        }
+    }
+    segSuccStart[ns] = cast(uint)segSucc.length;
+
+    // registers used in more than one segment are global
+    globalRegs.setLength(0);
+    foreach (si; 0 .. ns)
+    {
+        foreach (ref i; ins[segStart[si] .. segEnd(si)])
         {
             void see(Reg r)
             {
@@ -2375,8 +2519,8 @@ private void computeLiveness()
                     return;
                 auto v = vi(r);
                 if (v.firstBlock == uint.max)
-                    v.firstBlock = cast(uint)bi;
-                else if (v.firstBlock != bi && v.globalId == uint.max)
+                    v.firstBlock = cast(uint)si;
+                else if (v.firstBlock != si && v.globalId == uint.max)
                 {
                     v.globalId = cast(uint)globalRegs.length;
                     globalRegs.push(r);
@@ -2398,22 +2542,22 @@ private void computeLiveness()
 
     setWords = (globalRegs.length + 63) / 64;
     Barray!ulong gen, kill;
-    gen.setLength(nb * setWords);
-    kill.setLength(nb * setWords);
-    liveIn.setLength(nb * setWords);
-    liveOut.setLength(nb * setWords);
+    gen.setLength(ns * setWords);
+    kill.setLength(ns * setWords);
+    liveIn.setLength(ns * setWords);
+    liveOut.setLength(ns * setWords);
     gen[][] = 0;
     kill[][] = 0;
     liveIn[][] = 0;
     liveOut[][] = 0;
 
-    ulong[] row(ref Barray!ulong a, size_t bi) { return a[bi * setWords .. (bi + 1) * setWords]; }
+    ulong[] row(ref Barray!ulong a, size_t si) { return a[si * setWords .. (si + 1) * setWords]; }
 
-    foreach (bi; 0 .. nb)
+    foreach (si; 0 .. ns)
     {
-        auto g = row(gen, bi);
-        auto k = row(kill, bi);
-        foreach (ref i; ins[blockStart[bi] .. blockStart[bi + 1]])
+        auto g = row(gen, si);
+        auto k = row(kill, si);
+        foreach (ref i; ins[segStart[si] .. segEnd(si)])
         {
             void use(Reg r)
             {
@@ -2423,7 +2567,7 @@ private void computeLiveness()
                     g[id / 64] |= 1UL << (id % 64);
             }
             forUses(i, &use);
-            if (i.d && !isPhys(i.d) && !(i.flags & F.condDef))
+            if (i.d && !isPhys(i.d))
             {
                 const id = vi(i.d).globalId;
                 if (id != uint.max)
@@ -2437,18 +2581,18 @@ private void computeLiveness()
     while (changed)
     {
         changed = false;
-        foreach_reverse (bi; 0 .. nb)
+        foreach_reverse (si; 0 .. ns)
         {
-            auto o = row(liveOut, bi);
-            foreach (s; blocks[bi].Bsucc[])
+            auto o = row(liveOut, si);
+            foreach (s; segSucc[segSuccStart[si] .. segSuccStart[si + 1]])
             {
-                auto si = row(liveIn, s.Bdfoidx);
+                auto sin = row(liveIn, s);
                 foreach (w; 0 .. setWords)
-                    o[w] |= si[w];
+                    o[w] |= sin[w];
             }
-            auto inn = row(liveIn, bi);
-            auto g = row(gen, bi);
-            auto k = row(kill, bi);
+            auto inn = row(liveIn, si);
+            auto g = row(gen, si);
+            auto k = row(kill, si);
             foreach (w; 0 .. setWords)
             {
                 const n = g[w] | (o[w] & ~k[w]);
@@ -2464,11 +2608,12 @@ private void computeLiveness()
     kill.dtor();
 
     // build the ranges backward
-    foreach_reverse (bi; 0 .. nb)
+    foreach_reverse (si; 0 .. ns)
     {
-        const bfrom = usePos(blockStart[bi]);
-        const bto = usePos(blockStart[bi + 1]);
-        auto o = row(liveOut, bi);
+        const end = segEnd(si);
+        const bfrom = usePos(segStart[si]);
+        const bto = usePos(end);
+        auto o = row(liveOut, si);
         foreach (w; 0 .. setWords)
         {
             ulong bits = o[w];
@@ -2480,16 +2625,14 @@ private void computeLiveness()
                 addRange(globalRegs[id], bfrom, bto);
             }
         }
-        const weight = blocks[bi].Bweight ? cast(float)blocks[bi].Bweight : 1;
-        foreach_reverse (n; blockStart[bi] .. blockStart[bi + 1])
+        const bw = blocks[segBlock[si]].Bweight;
+        const weight = bw ? cast(float)bw : 1;
+        foreach_reverse (n; segStart[si] .. end)
         {
             LIns* i = &ins[n];
             if (i.d && !isPhys(i.d))
             {
-                if (i.flags & F.condDef)
-                    addRange(i.d, defPos(n), defPos(n) + 1);    // may not be the value live before
-                else
-                    setFrom(i.d, defPos(n));
+                setFrom(i.d, defPos(n));
                 vi(i.d).cost += weight;
             }
             void use(Reg r)
@@ -2971,7 +3114,9 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
             import dmd.backend.arm.disasmarm : encodeHFD;
             ubyte imm8;
             const ft = INSTR.szToFtype(i.sz);
-            if (encodeHFD(v, imm8))
+            if (i.imm == 0)
+                cdb.gen1(INSTR.fmov_float_gen(i.sz == 8, ft, 0, 7, 31, d));     // FMOV d,xzr
+            else if (encodeHFD(v, imm8))
                 cdb.gen1(INSTR.fmov_float_imm(ft, imm8, d));
             else
             {
@@ -3302,6 +3447,39 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
             break;
         }
 
+        case LOp.cbz:
+        {
+            const uint op = i.cond == COND.ne;
+            const sf2 = i.sz == 8;
+            if (i.flags & F.toLabel)
+            {
+                code cs;
+                cs.Iop = INSTR.compbranch(sf2, op, 0, cast(ubyte)pr(i.a));
+                cs.Iflags = CF.zero;
+                cs.IFL1 = FL.code;
+                cs.IEV1.Vcode = cast(code*)cast(size_t)i.target;     // label number, resolved in emit()
+                cdb.gen(&cs);
+            }
+            else
+            {
+                code cs;
+                cs.Iop = INSTR.compbranch(sf2, op, 0, cast(ubyte)pr(i.a));
+                cs.IFL1 = FL.block;
+                cs.IEV1.Vblock = blocks[i.target];
+                cdb.gen(&cs);
+            }
+            break;
+        }
+
+        case LOp.tsti:
+        {
+            uint N, immr, imms;
+            const ulong u = sf ? cast(ulong)i.imm : cast(uint)i.imm;
+            encodeNImmrImms(sf ? u : (u | (u << 32)), N, immr, imms);
+            cdb.gen1(INSTR.log_imm(sf, 3, N, immr, imms, pr(i.a), 31));     // TST a,#imm
+            break;
+        }
+
         case LOp.br:
         case LOp.bcond:
         {
@@ -3390,7 +3568,7 @@ private void dump()
             dumpReg(i.c);
             if (i.imm) printf(" #%lld", i.imm);
             if (i.sym) printf(" %s", i.sym.Sident.ptr);
-            if (i.op == LOp.br || i.op == LOp.bcond || i.op == LOp.label)
+            if (i.op == LOp.br || i.op == LOp.bcond || i.op == LOp.cbz || i.op == LOp.label)
                 printf(" %s%d cond%d", i.flags & F.toLabel || i.op == LOp.label ? "L".ptr : "B".ptr, i.target, i.cond);
             printf("\n");
         }
