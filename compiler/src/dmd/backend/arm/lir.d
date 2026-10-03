@@ -21,6 +21,7 @@ import core.stdc.stdlib;
 import core.stdc.string;
 
 import dmd.backend.barray;
+import dmd.backend.mem : mem_malloc, mem_free;
 import dmd.backend.blockopt : bo;
 import dmd.backend.cc;
 import dmd.backend.cdef;
@@ -252,7 +253,14 @@ bool lirCodegen(ref CGstate cg)
     assignVariables();
     select();
     if (!failed)
+    {
         insertHoisted();
+        if (!getenv("DMD_NEWCG_NOLICM"))
+        {
+            hoistInvariants();
+            hoistInvariants();      // again, for what is invariant in an enclosing loop
+        }
+    }
     if (failed)
     {
         if (getenv("DMD_NEWCG_WHY"))
@@ -3636,80 +3644,8 @@ private void computeLiveness()
         fill.dtor();
     }
 
-    /* The code of each block is split into segments at labels and after branches,
-     * so the control flow within blocks, as of ?: and &&, is known
-     */
-    segStart.setLength(0);
-    segBlock.setLength(0);
-    labelSeg.setLength(nlabels);
-    blockSeg.setLength(nb + 1);
-    foreach (bi; 0 .. nb)
-    {
-        blockSeg[bi] = cast(uint)segStart.length;
-        bool start = true;
-        foreach (n; blockStart[bi] .. blockStart[bi + 1])
-        {
-            const op = ins[n].op;
-            if (op == LOp.label)
-                start = true;
-            if (start)
-            {
-                segStart.push(cast(uint)n);
-                segBlock.push(cast(uint)bi);
-                start = false;
-            }
-            if (op == LOp.label)
-                labelSeg[ins[n].target] = cast(uint)(segStart.length - 1);
-            if (op == LOp.br || op == LOp.bcond || op == LOp.cbz)
-                start = true;
-        }
-        if (blockSeg[bi] == segStart.length)
-        {
-            // an empty block is an empty segment
-            segStart.push(blockStart[bi]);
-            segBlock.push(cast(uint)bi);
-        }
-    }
-    const ns = segStart.length;
-    blockSeg[nb] = cast(uint)ns;
-    segStart.push(cast(uint)ins.length);
-
-    uint segEnd(size_t si)
-    {
-        // the next segment's start, or the block's end
-        const bi = segBlock[si];
-        return si + 1 < ns && segBlock[si + 1] == bi ? segStart[si + 1] : blockStart[bi + 1];
-    }
-
-    // the successors of each segment
-    segSuccStart.setLength(ns + 1);
-    segSucc.setLength(0);
-    foreach (si; 0 .. ns)
-    {
-        segSuccStart[si] = cast(uint)segSucc.length;
-        const bi = segBlock[si];
-        const end = segEnd(si);
-        bool fallsThrough = true;
-        if (end > segStart[si])
-        {
-            const i = &ins[end - 1];
-            if (i.op == LOp.br || i.op == LOp.bcond || i.op == LOp.cbz)
-            {
-                segSucc.push(i.flags & F.toLabel ? labelSeg[i.target] : blockSeg[i.target]);
-                if (i.op == LOp.br)
-                    fallsThrough = false;
-            }
-        }
-        if (fallsThrough)
-        {
-            if (si + 1 < ns && segBlock[si + 1] == bi)
-                segSucc.push(cast(uint)(si + 1));
-            else
-                foreach (s; blocks[bi].Bsucc[])
-                    segSucc.push(blockSeg[s.Bdfoidx]);
-        }
-    }
-    segSuccStart[ns] = cast(uint)segSucc.length;
+    buildSegments();
+    const ns = segStart.length - 1;
 
     // registers used in more than one segment are global
     globalRegs.setLength(0);
@@ -3853,6 +3789,456 @@ private void computeLiveness()
             forUses(*i, &use);
         }
     }
+}
+
+/* Split the code of each block into segments at labels and after branches, so the
+ * control flow within blocks, as of ?: and &&, is known, and find their successors
+ */
+@trusted
+private void buildSegments()
+{
+    const nb = blocks.length;
+    /* The code of each block is split into segments at labels and after branches,
+     * so the control flow within blocks, as of ?: and &&, is known
+     */
+    segStart.setLength(0);
+    segBlock.setLength(0);
+    labelSeg.setLength(nlabels);
+    blockSeg.setLength(nb + 1);
+    foreach (bi; 0 .. nb)
+    {
+        blockSeg[bi] = cast(uint)segStart.length;
+        bool start = true;
+        foreach (n; blockStart[bi] .. blockStart[bi + 1])
+        {
+            const op = ins[n].op;
+            if (op == LOp.label)
+                start = true;
+            if (start)
+            {
+                segStart.push(cast(uint)n);
+                segBlock.push(cast(uint)bi);
+                start = false;
+            }
+            if (op == LOp.label)
+                labelSeg[ins[n].target] = cast(uint)(segStart.length - 1);
+            if (op == LOp.br || op == LOp.bcond || op == LOp.cbz)
+                start = true;
+        }
+        if (blockSeg[bi] == segStart.length)
+        {
+            // an empty block is an empty segment
+            segStart.push(blockStart[bi]);
+            segBlock.push(cast(uint)bi);
+        }
+    }
+    const ns = segStart.length;
+    blockSeg[nb] = cast(uint)ns;
+    segStart.push(cast(uint)ins.length);
+
+    // the successors of each segment
+    segSuccStart.setLength(ns + 1);
+    segSucc.setLength(0);
+    foreach (si; 0 .. ns)
+    {
+        segSuccStart[si] = cast(uint)segSucc.length;
+        const bi = segBlock[si];
+        const end = segEnd(si);
+        bool fallsThrough = true;
+        if (end > segStart[si])
+        {
+            const i = &ins[end - 1];
+            if (i.op == LOp.br || i.op == LOp.bcond || i.op == LOp.cbz)
+            {
+                segSucc.push(i.flags & F.toLabel ? labelSeg[i.target] : blockSeg[i.target]);
+                if (i.op == LOp.br)
+                    fallsThrough = false;
+            }
+        }
+        if (fallsThrough)
+        {
+            if (si + 1 < ns && segBlock[si + 1] == bi)
+                segSucc.push(cast(uint)(si + 1));
+            else
+                foreach (s; blocks[bi].Bsucc[])
+                    segSucc.push(blockSeg[s.Bdfoidx]);
+        }
+    }
+    segSuccStart[ns] = cast(uint)segSucc.length;
+
+}
+
+/* The end of segment si: the next segment's start, or its block's end
+ */
+@trusted
+private uint segEnd(size_t si)
+{
+    const ns = segStart.length - 1;
+    const bi = segBlock[si];
+    return si + 1 < ns && segBlock[si + 1] == bi ? segStart[si + 1] : blockStart[bi + 1];
+}
+
+/******************************* Loop invariants ******************************/
+
+/* Whether the result of i depends only on its operands, and computing it
+ * where it was not computed before can do no harm
+ */
+private bool pureOp(ref const LIns i)
+{
+    switch (i.op)
+    {
+        case LOp.add: .. case LOp.rorv:
+        case LOp.addi: .. case LOp.rori:
+        case LOp.msub, LOp.neg, LOp.mvn, LOp.sext, LOp.zext:
+        case LOp.fadd, LOp.fsub, LOp.fmul, LOp.fdiv, LOp.fneg, LOp.fabs, LOp.fsqrt:
+        case LOp.scvtf, LOp.ucvtf, LOp.fcvtzs, LOp.fcvtzu, LOp.fcvt:
+        case LOp.lea:
+            return true;
+        case LOp.copy:
+            return !isPhys(i.a);
+        default:
+            return false;
+    }
+}
+
+/* Move the instructions computing the same value on every iteration of a loop
+ * to before the loop
+ */
+@trusted
+private void hoistInvariants()
+{
+    buildSegments();
+    const ns = segStart.length - 1;
+    if (ns < 2)
+        return;
+
+    // the predecessors of each segment
+    Barray!uint predStart, preds;
+    predStart.setLength(ns + 1);
+    predStart[][] = 0;
+    foreach (si; 0 .. ns)
+        foreach (t; segSucc[segSuccStart[si] .. segSuccStart[si + 1]])
+            ++predStart[t + 1];
+    foreach (k; 1 .. ns + 1)
+        predStart[k] += predStart[k - 1];
+    preds.setLength(predStart[ns]);
+    {
+        Barray!uint fill;
+        fill.setLength(ns);
+        fill[][] = 0;
+        foreach (si; 0 .. ns)
+            foreach (t; segSucc[segSuccStart[si] .. segSuccStart[si + 1]])
+                preds[predStart[t] + fill[t]++] = cast(uint)si;
+        fill.dtor();
+    }
+
+    // reverse postorder from the entry
+    Barray!uint rpo, order;
+    order.setLength(ns);
+    order[][] = uint.max;
+    {
+        Barray!uint stack, next;
+        Barray!bool seen;
+        seen.setLength(ns);
+        seen[][] = false;
+        next.setLength(ns);
+        next[][] = 0;
+        Barray!uint post;
+        stack.push(0);
+        seen[0] = true;
+        while (stack.length)
+        {
+            const v = stack[stack.length - 1];
+            const k = segSuccStart[v] + next[v];
+            if (k < segSuccStart[v + 1])
+            {
+                ++next[v];
+                const t = segSucc[k];
+                if (!seen[t])
+                {
+                    seen[t] = true;
+                    stack.push(t);
+                }
+            }
+            else
+            {
+                post.push(v);
+                stack.setLength(stack.length - 1);
+            }
+        }
+        foreach_reverse (v; post[])
+        {
+            order[v] = cast(uint)rpo.length;
+            rpo.push(v);
+        }
+        stack.dtor(); next.dtor(); seen.dtor(); post.dtor();
+    }
+
+    // immediate dominators (Cooper, Harvey, Kennedy)
+    Barray!uint idom;
+    idom.setLength(ns);
+    idom[][] = uint.max;
+    idom[0] = 0;
+    bool changed = true;
+    while (changed)
+    {
+        changed = false;
+        foreach (v; rpo[][1 .. rpo.length])
+        {
+            uint d = uint.max;
+            foreach (p; preds[predStart[v] .. predStart[v + 1]])
+            {
+                if (idom[p] == uint.max)
+                    continue;
+                if (d == uint.max)
+                {
+                    d = p;
+                    continue;
+                }
+                uint a = p, b = d;
+                while (a != b)
+                {
+                    while (order[a] > order[b]) a = idom[a];
+                    while (order[b] > order[a]) b = idom[b];
+                }
+                d = a;
+            }
+            if (d != uint.max && idom[v] != d)
+            {
+                idom[v] = d;
+                changed = true;
+            }
+        }
+    }
+    bool dominates(uint a, uint b)
+    {
+        if (order[b] == uint.max)
+            return false;
+        while (true)
+        {
+            if (a == b)
+                return true;
+            if (b == 0)
+                return false;
+            b = idom[b];
+        }
+    }
+
+    // the number of definitions of each register, and the segment of each instruction
+    Barray!uint ndefs;
+    ndefs.setLength(vinfo.length);
+    ndefs[][] = 0;
+    foreach (ref i; ins[])
+        if (i.d && !isPhys(i.d))
+            ++ndefs[i.d - firstVreg];
+    Barray!uint segOf;
+    segOf.setLength(ins.length);
+    foreach (si; 0 .. ns)
+        foreach (n; segStart[si] .. segEnd(si))
+            segOf[n] = cast(uint)si;
+
+    /* Where each instruction goes: uint.max to stay, else next to instruction
+     * moveTo[n] >> 1, after it if moveTo[n] & 1, else before it
+     */
+    Barray!uint moveTo;
+    moveTo.setLength(ins.length);
+    moveTo[][] = uint.max;
+
+    // the loops, from their back edges, smallest first
+    static struct Loop { uint header; uint size; uint[] body; }
+    Barray!Loop loops;
+    Barray!bool inLoop;
+    inLoop.setLength(ns);
+    foreach (s; 0 .. ns)
+        foreach (h; segSucc[segSuccStart[s] .. segSuccStart[s + 1]])
+        {
+            if (!dominates(h, cast(uint)s))
+                continue;
+            // the segments reaching s without passing through h
+            inLoop[][] = false;
+            inLoop[h] = true;
+            Barray!uint work;
+            Barray!uint body;
+            body.push(h);
+            if (!inLoop[s])
+            {
+                inLoop[s] = true;
+                work.push(cast(uint)s);
+                body.push(cast(uint)s);
+            }
+            while (work.length)
+            {
+                const v = work[work.length - 1];
+                work.setLength(work.length - 1);
+                foreach (p; preds[predStart[v] .. predStart[v + 1]])
+                    if (!inLoop[p])
+                    {
+                        inLoop[p] = true;
+                        work.push(p);
+                        body.push(p);
+                    }
+            }
+            Loop lp;
+            lp.header = h;
+            lp.size = cast(uint)body.length;
+            lp.body = (cast(uint*)mem_malloc(body.length * uint.sizeof))[0 .. body.length];
+            lp.body[] = body[];
+            loops.push(lp);
+            work.dtor();
+            body.dtor();
+        }
+    import core.stdc.stdlib : qsort;
+    extern (C) static int bySize(scope const void* p, scope const void* q) nothrow
+    {
+        const a = (cast(const Loop*)p).size, b = (cast(const Loop*)q).size;
+        return a < b ? -1 : a > b;
+    }
+    if (loops.length > 1)
+        qsort(loops[].ptr, loops.length, Loop.sizeof, &bySize);
+
+    Barray!bool defInLoop;
+    defInLoop.setLength(vinfo.length);
+    bool any;
+    foreach (ref lp; loops[])
+    {
+        inLoop[][] = false;
+        foreach (v; lp.body)
+            inLoop[v] = true;
+
+        // the preheader: the only predecessor from outside, whose only successor is the header
+        uint pre = uint.max;
+        bool bad;
+        foreach (p; preds[predStart[lp.header] .. predStart[lp.header + 1]])
+            if (!inLoop[p])
+            {
+                if (pre != uint.max)
+                    bad = true;
+                pre = p;
+            }
+        if (getenv("DMD_NEWCG_LICM"))
+            fprintf(stderr, "newcg-licm: %s loop header %d size %d pre %d bad %d\n", funcsym_p.Sident.ptr,
+                lp.header, lp.size, pre, bad);
+        if (bad || pre == uint.max)
+            continue;
+        /* After the preheader's last instruction, or before its branch, which may be
+         * the test skipping the loop: what is moved changes no flags and cannot fault
+         */
+        const pend = segEnd(pre);
+        if (pend <= segStart[pre])
+            continue;       // an empty preheader has no instruction to put them after
+        uint at;
+        const lastOp = ins[pend - 1].op;
+        if (lastOp == LOp.br || lastOp == LOp.bcond || lastOp == LOp.cbz)
+            at = (pend - 1) << 1;           // before the branch
+        else
+            at = ((pend - 1) << 1) | 1;     // after the last instruction
+
+        // the registers defined in the loop, not counting what is hoisted
+        defInLoop[][] = false;
+        foreach (v; lp.body)
+            foreach (n; segStart[v] .. segEnd(v))
+                if (moveTo[n] == uint.max && ins[n].d && !isPhys(ins[n].d))
+                    defInLoop[ins[n].d - firstVreg] = true;
+
+        bool progress = true;
+        while (progress)
+        {
+            progress = false;
+            foreach (v; lp.body)
+                foreach (n; segStart[v] .. segEnd(v))
+                {
+                    if (moveTo[n] != uint.max)
+                        continue;
+                    LIns* i = &ins[n];
+                    if (!pureOp(*i) || !i.d || isPhys(i.d) || ndefs[i.d - firstVreg] != 1)
+                        continue;
+                    bool inv = true;
+                    void check(Reg r)
+                    {
+                        if (isPhys(r) || defInLoop[r - firstVreg])
+                            inv = false;
+                    }
+                    forUses(*i, &check);
+                    if (!inv)
+                        continue;
+                    moveTo[n] = at;
+                    if (getenv("DMD_NEWCG_LICM"))
+                        fprintf(stderr, "newcg-licm:   hoist %d %s to %d\n", cast(int)n, lopName(i.op), at);
+                    defInLoop[i.d - firstVreg] = false;
+                    progress = true;
+                    any = true;
+                }
+        }
+    }
+
+    if (any)
+    {
+        // rebuild the instructions with those moved put next to their instruction
+        Barray!LIns old;
+        old.setLength(ins.length);
+        old[][] = ins[][];
+        Barray!uint newIndex;
+        newIndex.setLength(old.length);
+        // the instructions moved before (even) and after (odd) each instruction, in order
+        const nslots = old.length * 2;
+        Barray!uint afterStart, after;
+        afterStart.setLength(nslots + 1);
+        afterStart[][] = 0;
+        foreach (n; 0 .. old.length)
+            if (moveTo[n] != uint.max)
+                ++afterStart[moveTo[n] + 1];
+        foreach (k; 1 .. nslots + 1)
+            afterStart[k] += afterStart[k - 1];
+        after.setLength(afterStart[nslots]);
+        {
+            Barray!uint fill;
+            fill.setLength(nslots);
+            fill[][] = 0;
+            foreach (n; 0 .. old.length)
+                if (moveTo[n] != uint.max)
+                    after[afterStart[moveTo[n]] + fill[moveTo[n]]++] = cast(uint)n;
+            fill.dtor();
+        }
+        ins.setLength(0);
+        size_t bi = 0;
+        Barray!uint oldStart;
+        oldStart.setLength(blockStart.length);
+        oldStart[][] = blockStart[][];
+        foreach (b; 0 .. blocks.length)
+        {
+            blockStart[b] = cast(uint)ins.length;
+            void place(size_t slot)
+            {
+                foreach (m; after[afterStart[slot] .. afterStart[slot + 1]])
+                {
+                    newIndex[m] = cast(uint)ins.length;
+                    ins.push(old[m]);
+                    // what is moved next to a moved instruction goes with it
+                    place(m * 2);
+                    place(m * 2 + 1);
+                }
+            }
+            foreach (n; oldStart[b] .. oldStart[b + 1])
+            {
+                if (moveTo[n] != uint.max)
+                    continue;
+                place(n * 2);
+                newIndex[n] = cast(uint)ins.length;
+                ins.push(old[n]);
+                place(n * 2 + 1);
+            }
+        }
+        blockStart[blocks.length] = cast(uint)ins.length;
+        foreach (ref v; vinfo[])
+            if (v.loadIns != uint.max)
+                v.loadIns = newIndex[v.loadIns];
+        old.dtor(); newIndex.dtor(); afterStart.dtor(); after.dtor(); oldStart.dtor();
+    }
+
+    foreach (ref lp; loops[])
+        mem_free(lp.body.ptr);
+    loops.dtor(); inLoop.dtor(); defInLoop.dtor(); moveTo.dtor(); segOf.dtor(); ndefs.dtor();
+    idom.dtor(); rpo.dtor(); order.dtor(); preds.dtor(); predStart.dtor();
 }
 
 /******************************* Allocation ******************************/
