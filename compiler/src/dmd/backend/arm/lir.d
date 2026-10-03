@@ -1200,7 +1200,8 @@ private void select()
             case BC.retexp:
             {
                 elem* e = b.Belem;
-                const ty = tybasic(funcsym_p.Stype.Tnext.Tty);
+                // a result returned through the hidden pointer returns that pointer instead
+                const ty = tybasic(e.Ety);
                 if (pairType(ty))
                 {
                     Pair p = genPair(e);
