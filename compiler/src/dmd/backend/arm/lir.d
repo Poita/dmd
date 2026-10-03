@@ -63,8 +63,8 @@ enum LOp : ubyte
     copy,           // d = a
     movi,           // d = imm
     fmovi,          // d = the float or double whose bits are imm
-    add, sub, mul, sdiv, udiv, and_, orr, eor, lslv, lsrv, asrv,   // d = a op b
-    addi, subi, lsli, lsri, asri, andi, orri, eori,                // d = a op imm
+    add, sub, mul, sdiv, udiv, and_, orr, eor, lslv, lsrv, asrv, rorv, // d = a op b
+    addi, subi, lsli, lsri, asri, andi, orri, eori, rori,          // d = a op imm
     msub,           // d = c - a * b
     neg,            // d = -a
     mvn,            // d = ~a
@@ -421,6 +421,7 @@ private bool supportedElem(const(elem)* e)
             case OPadd: case OPmin: case OPmul: case OPdiv: case OPmod:
             case OPand: case OPor: case OPxor:
             case OPshl: case OPshr: case OPashr:
+            case OProl: case OPror:
             case OPeq:
             case OPcomma:
             case OPandand: case OPoror:
@@ -1246,7 +1247,7 @@ private Reg genx(elem* e)
 
         case OPadd: case OPmin: case OPmul: case OPdiv: case OPmod:
         case OPand: case OPor: case OPxor:
-        case OPshl: case OPshr: case OPashr:
+        case OPshl: case OPshr: case OPashr: case OProl: case OPror:
             return genBinary(e);
 
         case OPaddass: case OPminass: case OPmulass: case OPdivass: case OPmodass:
@@ -1659,6 +1660,9 @@ private Reg genBinary(elem* e)
     const sz = tysize(ty);
     elem* e2 = e.E2;
 
+    if (op == OProl || op == OPror)
+        return genRotate(e);
+
     if (!tyfloating(ty) && e2.Eoper == OPconst && !e2.Ecount)
     {
         const isz = sz <= 4 ? 4 : 8;
@@ -1694,6 +1698,40 @@ private Reg genBinary(elem* e)
         return newVreg(RC.fp, sz);
     }
     return arith(op, ty, a, e2, b);
+}
+
+/* e1 rol e2 or e1 ror e2, rotating left by n being rotating right by -n
+ */
+@trusted
+private Reg genRotate(elem* e)
+{
+    const ty = tybasic(e.Ety);
+    const sz = tysize(ty);
+    if (sz != 4 && sz != 8)
+    {
+        fail("narrow rotate");
+        return newVreg(RC.gp, sz);
+    }
+    const bits = sz * 8;
+    Reg a = gen(e.E1);
+    Reg d = newVreg(RC.gp, sz);
+    if (e.E2.Eoper == OPconst && !e.E2.Ecount)
+    {
+        long n = el_tolong(e.E2) & (bits - 1);
+        if (e.Eoper == OProl)
+            n = (bits - n) & (bits - 1);
+        emitIns(LOp.rori, sz, d, a, noReg, n);
+        return d;
+    }
+    Reg b = genKeep(e.E2, a);
+    if (e.Eoper == OProl)
+    {
+        Reg nb = newVreg(RC.gp, 4);
+        emitIns(LOp.neg, 4, nb, b);
+        b = nb;
+    }
+    emitIns(LOp.rorv, sz, d, a, b);
+    return d;
 }
 
 /* e1 op= e2, and e1++ and e1--
@@ -2443,11 +2481,11 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
             break;
         }
 
-        case LOp.lslv: case LOp.lsrv: case LOp.asrv:
+        case LOp.lslv: case LOp.lsrv: case LOp.asrv: case LOp.rorv:
         {
             const d = pr(i.d);
             def(d);
-            const opcode = i.op == LOp.lslv ? 8 : i.op == LOp.lsrv ? 9 : 10;
+            const opcode = i.op == LOp.lslv ? 8 : i.op == LOp.lsrv ? 9 : i.op == LOp.asrv ? 10 : 11;
             cdb.gen1(INSTR.dp_2src(sf, 0, pr(i.b), opcode, pr(i.a), d));
             break;
         }
@@ -2476,6 +2514,15 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
             def(d);
             const bits = sf ? 64 : 32;
             cdb.gen1(INSTR.ubfm(sf, sf, cast(uint)i.imm, bits - 1, pr(i.a), d));
+            break;
+        }
+
+        case LOp.rori:
+        {
+            const d = pr(i.d);
+            def(d);
+            const a = pr(i.a);
+            cdb.gen1(INSTR.extract(sf, 0, sf, 0, a, cast(uint)i.imm, a, d)); // ROR d,a,#imm
             break;
         }
 
