@@ -108,6 +108,7 @@ enum F : ubyte
     scaled  = 8,    // ld/st: the index register is shifted left by the log2 of the size
     toX     = 16,   // ld: a signed load extends to 64 bits rather than 32
     shifted = 32,   // add/sub/and/orr/eor: b is shifted by imm, LSL, LSR or ASR as cond is 0, 1 or 2
+    noreturn = 64,  // call: of a function that does not return, so it destroys nothing that matters
 }
 
 /// An instruction of the intermediate representation
@@ -3333,6 +3334,8 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
 
     auto c = emitIns(LOp.call, 0, noReg, target, noReg, cast(long)argRegs);
     c.sym = sf;
+    if (tybasic(e.Ety) == TYnoreturn)
+        c.flags |= F.noreturn;
     if (stackArgs)
         emitIns(LOp.spadd, 8, noReg, noReg, noReg, stackArgs);
     if (!sf || sf == funcsym_p || !sf.Sfunc || !(sf.Sfunc.Fflags & Fnothrow))
@@ -4704,7 +4707,7 @@ private void allocate()
                 lastDef[p] = uint.max;
             }
             forUses(*i, &use);
-            if (i.op == LOp.call)
+            if (i.op == LOp.call && !(i.flags & F.noreturn))
             {
                 foreach (p; 0 .. 64)
                     if (callClobbers & (1UL << p))
