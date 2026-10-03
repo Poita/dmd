@@ -98,6 +98,7 @@ enum F : ubyte
     toLabel = 2,    // target is a label rather than a block
     condDef = 4,    // a definition that is made on only some paths through its block
     scaled  = 8,    // ld/st: the index register is shifted left by the log2 of the size
+    toX     = 16,   // ld: a signed load extends to 64 bits rather than 32
 }
 
 /// An instruction of the intermediate representation
@@ -137,6 +138,10 @@ struct VInfo
     ubyte extBits;              // if not 0, the value is extended from this many bits
     ubyte extTo;                // to this many bytes
     bool extSigned;             // by sign extension
+    bool extRelied;             // an extension was omitted because of extBits
+    uint loadIns = uint.max;    // the load defining it, if any
+    Reg copyOf;                 // the register it is a copy of, when that copy is its only definition
+    uint ndefs;                 // number of definitions
 }
 
 private __gshared
@@ -146,6 +151,9 @@ private __gshared
     Barray!(block*) blocks;     // in layout order
     Barray!uint blockStart;     // first instruction of each block, then the end
     Barray!Reg symReg;          // by globsym index: the register of the variable, or noReg
+    Barray!bool symAssigned;    // by globsym index: the function assigns the variable
+    Barray!(const(elem)*) crossBlockVars;   // sorted: variable reads shared by more than one block
+    Barray!(const(Symbol)*) blockAssigned;  // the variables the current block assigns
     Barray!uint savedDfoidx;
     uint nlabels;
     Barray!uint labelPos;       // instruction index of each label
@@ -559,10 +567,24 @@ private void assignVariables()
     Barray!bool partial;
     partial.setLength(globsym.length);
     partial[][] = false;
+    symAssigned.setLength(globsym.length);
+    symAssigned[][] = false;
+    static struct Use { const(elem)* e; uint block; }
+    Barray!Use varCses;
+    uint markBlock;
     void mark(const(elem)* e)
     {
         while (1)
         {
+            if (e.Eoper == OPvar && e.Ecount)
+                varCses.push(Use(e, markBlock));
+            if (OTassign(e.Eoper) && e.E1.Eoper == OPvar)
+            {
+                const s = e.E1.Vsym;
+                const k = s.Ssymnum;
+                if (k < globsym.length && globsym[k] is s)
+                    symAssigned[k] = true;
+            }
             if (e.Eoper == OPvar || e.Eoper == OPrelconst)
             {
                 const s = e.Vsym;
@@ -587,8 +609,30 @@ private void assignVariables()
         }
     }
     for (block* b = bo.startblock; b; b = b.Bnext)
+    {
         if (b.Belem)
             mark(b.Belem);
+        ++markBlock;
+    }
+
+    // the variable reads that are CSEs used in more than one block
+    crossBlockVars.setLength(0);
+    if (varCses.length > 1)
+    {
+        import core.stdc.stdlib : qsort;
+        extern (C) static int cmpUse(scope const void* p, scope const void* q) nothrow
+        {
+            const a = cast(const Use*)p;
+            const b = cast(const Use*)q;
+            return a.e < b.e ? -1 : a.e > b.e ? 1 : (a.block < b.block ? -1 : a.block > b.block);
+        }
+        qsort(varCses[].ptr, varCses.length, Use.sizeof, &cmpUse);
+        foreach (k; 1 .. varCses.length)
+            if (varCses[k].e is varCses[k - 1].e && varCses[k].block != varCses[k - 1].block &&
+                (!crossBlockVars.length || crossBlockVars[crossBlockVars.length - 1] !is varCses[k].e))
+                crossBlockVars.push(varCses[k].e);
+    }
+    varCses.dtor();
 
     const logVars = getenv("DMD_NEWCG_VARS") !is null;
     foreach (k, s; globsym[])
@@ -749,6 +793,9 @@ private void select()
         curBlock = cast(uint)bi;
         if (bi)
             blockStart.push(cast(uint)ins.length);
+        blockAssigned.setLength(0);
+        if (b.Belem)
+            collectAssigned(b.Belem);
         block* next = bi + 1 < blocks.length ? blocks[bi + 1] : null;
         switch (b.bc)
         {
@@ -836,7 +883,19 @@ private Reg extendFrom(Reg r, uint bits, bool signed, uint toSize)
         auto v = vi(r);
         if (v.extBits && !v.sym && toSize <= v.extTo &&
             (v.extSigned == signed ? v.extBits <= bits : !v.extSigned && v.extBits < bits))
+        {
+            v.extRelied = true;
             return r;
+        }
+        // a load of exactly the bits sign extends to 64 bits itself
+        if (signed && toSize == 8 && v.loadIns != uint.max && !v.sym &&
+            (v.extSigned ? v.extBits <= bits : v.extBits == bits && !v.extRelied))
+        {
+            ins[v.loadIns].flags |= F.signed | F.toX;
+            knownExtended(r, bits, true, 8);
+            v.extRelied = true;
+            return r;
+        }
     }
     Reg d = newVreg(RC.gp, toSize);
     emitIns(signed ? LOp.sext : LOp.zext, toSize, d, r, noReg, bits);
@@ -966,6 +1025,10 @@ private void genCond(elem* e, bool jumpIfTrue, uint l, block* t = null)
 
         case OPnot:
             genCond(e.E1, !jumpIfTrue, l, t);
+            return;
+
+        case OPbool:
+            genCond(e.E1, jumpIfTrue, l, t);
             return;
 
         case OPandand:
@@ -1179,11 +1242,13 @@ private Reg gen(elem* e)
     Reg r = genx(e);
     if (e.Ecount && r)
     {
-        // a CSE of a register variable is a copy, as the variable may change
-        if (vi(r).sym)
+        // a CSE of a register variable is a copy if the variable may change while it is used
+        if (vi(r).sym && symAssigned[vi(r).sym.Ssymnum] &&
+            (assignedInBlock(vi(r).sym) || isCrossBlockVar(e)))
         {
             Reg t = newVreg(vi(r).rc, vi(r).sz);
             emitIns(LOp.copy, vi(r).sz, t, r);
+            hintCopy(t, r);
             r = t;
         }
         cseElems.push(e);
@@ -1191,6 +1256,58 @@ private Reg gen(elem* e)
         cseHis.push(noReg);
     }
     return r;
+}
+
+/* Record in blockAssigned the variables e assigns
+ */
+@trusted
+private void collectAssigned(const(elem)* e)
+{
+    while (1)
+    {
+        if (OTassign(e.Eoper) && e.E1.Eoper == OPvar)
+        {
+            const s = e.E1.Vsym;
+            if (!assignedInBlock(s))
+                blockAssigned.push(s);
+        }
+        if (OTbinary(e.Eoper))
+        {
+            collectAssigned(e.E2);
+            e = e.E1;
+        }
+        else if (OTunary(e.Eoper))
+            e = e.E1;
+        else
+            return;
+    }
+}
+
+@trusted
+private bool assignedInBlock(const Symbol* s)
+{
+    foreach (x; blockAssigned[])
+        if (x is s)
+            return true;
+    return false;
+}
+
+@trusted
+private bool isCrossBlockVar(const(elem)* e)
+{
+    size_t lo = 0, hi = crossBlockVars.length;
+    while (lo < hi)
+    {
+        const mid = (lo + hi) / 2;
+        const x = crossBlockVars[mid];
+        if (x is e)
+            return true;
+        if (x < e)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return false;
 }
 
 /* A 16 byte value held in two integer registers, lo the bytes 0..7 and hi 8..15
@@ -1448,6 +1565,7 @@ private void load(Reg d, Mem m, tym_t ty)
     const sz = tysize(ty);
     if (!tyfloating(ty) && sz < 8 && !isPhys(d) && !vi(d).sym)
     {
+        vi(d).loadIns = cast(uint)(ins.length - 1);
         // LDRSB/LDRSH sign extend into a W register; the other loads zero extend to 64 bits
         if (i.flags & F.signed && sz < 4)
             knownExtended(d, sz * 8, true, 4);
@@ -2218,6 +2336,33 @@ private void computeLiveness()
 {
     const nb = blocks.length;
 
+    // the definitions of each register, and the registers that are a copy of another
+    defStart.setLength(vinfo.length + 1);
+    defStart[][] = 0;
+    foreach (ref i; ins[])
+        if (i.d && !isPhys(i.d))
+        {
+            auto v = vi(i.d);
+            ++v.ndefs;
+            v.copyOf = i.op == LOp.copy && !isPhys(i.a) && !(i.flags & F.condDef) ? i.a : noReg;
+            ++defStart[i.d - firstVreg + 1];
+        }
+    foreach (k; 1 .. defStart.length)
+        defStart[k] += defStart[k - 1];
+    defList.setLength(defStart[vinfo.length]);
+    {
+        Barray!uint fill;
+        fill.setLength(vinfo.length);
+        fill[][] = 0;
+        foreach (n, ref i; ins[])
+            if (i.d && !isPhys(i.d))
+            {
+                const k = i.d - firstVreg;
+                defList[defStart[k] + fill[k]++] = defPos(n);
+            }
+        fill.dtor();
+    }
+
     // registers used in more than one block are global
     globalRegs.setLength(0);
     foreach (bi; 0 .. nb)
@@ -2374,6 +2519,8 @@ private immutable ubyte[3] gpScratch = [14, 15, 17];
 private immutable ubyte[3] fpScratch = [32+29, 32+30, 32+31];
 
 private __gshared Barray!Range[64] occupied;   // sorted ranges allocated to each register
+private __gshared Barray!uint defStart;         // by register - firstVreg: start of its definitions in defList
+private __gshared Barray!uint defList;          // definition positions
 
 @trusted
 private bool overlaps(ref Barray!Range occ, ref Barray!Range rs)
@@ -2503,7 +2650,7 @@ private void allocate()
             else if (!vi(h).spilled && vi(h).preg != uint.max)
                 p = vi(h).preg;
             if (p != uint.max && (p >= 32) == (v.rc == RC.fp) && allocatable(p, v.rc) &&
-                !overlaps(occupied[p], v.ranges))
+                (!overlaps(occupied[p], v.ranges) || !isPhys(h) && canShare(r, h, p)))
                 chosen = p;
         }
         if (chosen == uint.max)
@@ -2524,6 +2671,65 @@ private void allocate()
         occupy(occupied[chosen], v.ranges);
     }
     order.dtor();
+}
+
+/* Whether r can share register p with h, the copy one is of the other: the
+ * overlap of r with p's occupants is h's, and neither is redefined while the
+ * other is live
+ */
+@trusted
+private bool canShare(Reg r, Reg h, uint p)
+{
+    Reg copy, orig;
+    if (vi(r).copyOf == h)
+    {
+        copy = r;
+        orig = h;
+    }
+    else if (vi(h).copyOf == r)
+    {
+        copy = h;
+        orig = r;
+    }
+    else
+        return false;
+    auto vc = vi(copy);
+    auto vo = vi(orig);
+    if (vc.ndefs != 1)
+        return false;
+    // the overlap is within h's ranges
+    auto hr = &vi(h).ranges;
+    foreach (a; vi(r).ranges[])
+        foreach (b; occupied[p][])
+        {
+            const from = a.from > b.from ? a.from : b.from;
+            const to = a.to < b.to ? a.to : b.to;
+            if (from < to && !covers(*hr, from, to))
+                return false;
+        }
+    // the original is not redefined while the copy is live
+    const k = orig - firstVreg;
+    foreach (pos; defList[defStart[k] .. defStart[k + 1]])
+        if (covers(vc.ranges, pos, pos + 1))
+            return false;
+    return true;
+}
+
+/* Whether the sorted disjoint ranges rs cover [from, to)
+ */
+private bool covers(ref Barray!Range rs, uint from, uint to)
+{
+    foreach (x; rs[])
+    {
+        if (x.to <= from)
+            continue;
+        if (x.from > from)
+            return false;
+        if (x.to >= to)
+            return true;
+        from = x.to;
+    }
+    return false;
 }
 
 private bool allocatable(uint p, RC rc)
@@ -3027,13 +3233,13 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
                 symEA(cs, i.sym, i.imm);
             else
                 baseEA(cs, pr(i.a));
-            if (d < 32 && i.flags & F.signed)
+            if (d < 32 && i.flags & F.signed && (i.sz < 4 || i.flags & F.toX))
                 cs.Sextend = cast(ubyte)(i.sz == 1 ? Extend.SXTB : i.sz == 2 ? Extend.SXTH :
                                          i.sz == 4 ? Extend.SXTW : Extend.LSL);
             else if (d < 32)
                 cs.Sextend = cast(ubyte)(i.sz == 1 ? Extend.UXTB : i.sz == 2 ? Extend.UXTH :
                                          i.sz == 4 ? Extend.UXTW : Extend.LSL);
-            loadFromEA(cs, cast(reg_t)d, i.sz == 8 ? 8 : 4, i.sz);
+            loadFromEA(cs, cast(reg_t)d, i.sz == 8 || i.flags & F.toX ? 8 : 4, i.sz);
             if (!i.sym)
                 setBaseOffset(cdb, cs, i.imm);
             cdb.gen(&cs);
@@ -3333,6 +3539,8 @@ private uint indexedLoadStore(bool isLoad, ref const LIns i, uint t, uint base, 
     }
     else if (!isLoad)
         opc = 0;
+    else if (i.flags & F.toX)
+        opc = 2;                    // LDRSB/LDRSH/LDRSW into an X register
     else if (i.flags & F.signed && sz < 4)
         opc = 3;                    // LDRSB/LDRSH into a W register
     else
