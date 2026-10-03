@@ -91,6 +91,8 @@ enum LOp : ubyte
     bcond,          // jump to target if cond
     cbz,            // jump to target if a is zero (cond eq) or nonzero (cond ne)
     brk,            // trap
+    spsub,          // SP -= imm
+    spadd,          // SP += imm
     call,           // call sym, or the address in a; imm is the mask of argument registers
 }
 
@@ -158,6 +160,7 @@ private __gshared
     Barray!bool symAssigned;    // by globsym index: the function assigns the variable
     Barray!int symAgg;          // by globsym index: the index in aggs of an aggregate held in registers, or -1
     Barray!HoistedConst hoisted;    // constants used in loops, made once on entry
+    Barray!(block*) switchBlocks;   // switches done as comparisons
     uint paramEnd;              // the instruction after the parameter copies
     Barray!AggVar aggs;
     Barray!(const(elem)*) crossBlockVars;   // sorted: variable reads shared by more than one block
@@ -236,6 +239,7 @@ bool lirCodegen(ref CGstate cg)
     cseElems.setLength(0);
     cseRegs.setLength(0);
     cseHis.setLength(0);
+    switchBlocks.setLength(0);
     usesFrame = false;
     condDepth = 0;
 
@@ -281,6 +285,8 @@ bool lirCodegen(ref CGstate cg)
     rewriteSpills();
     emit(cg);
     finishVariables();
+    foreach (b; switchBlocks[])
+        b.bc = BC.ifthen;           // done as comparisons, no jump table
     if (getenv("DMD_NEWCG_LOG"))
         fprintf(stderr, "newcg: %s\n", funcsym_p.Sident.ptr);
     return true;
@@ -355,6 +361,11 @@ private bool supported(ref CGstate cg)
             case BC.retexp:
                 whyNot = "retexp";
                 if (!b.Belem)
+                    return false;
+                break;
+            case BC.switch_:
+                whyNot = "switch";
+                if (!b.Belem || !scalarType(b.Belem.Ety) || tyfloating(b.Belem.Ety))
                     return false;
                 break;
             default:
@@ -447,7 +458,7 @@ private bool supportedElem(const(elem)* e)
         if (!(op == OPcolon) && !(op == OPcomma) && !(op == OPeq) && !(op == OPparam) &&
             !scalarType(e.Ety) && tybasic(e.Ety) != TYvoid && tybasic(e.Ety) != TYnoreturn &&
             !(pairType(e.Ety) && pairOp(op)) && !(tyaggregate(e.Ety) && aggregateOp(e)) &&
-            op != OPmemcpy && op != OPmemset)
+            op != OPmemcpy && op != OPmemset && op != OPstreq)
         {
             whyNot = "type";
             if (getenv("DMD_NEWCG_WHY"))
@@ -1162,6 +1173,10 @@ private void select()
                     genEffect(b.Belem);
                 break;
 
+            case BC.switch_:
+                genSwitch(b);
+                break;
+
             case BC.retexp:
             {
                 elem* e = b.Belem;
@@ -1340,6 +1355,71 @@ private void genEffect(elem* e)
         genPair(e);
     else
         gen(e);
+}
+
+/* The switch block b, as a binary search of its cases, as the old code generator does
+ */
+@trusted
+private void genSwitch(block* b)
+{
+    elem* e = b.Belem;
+    const ty = tybasic(e.Ety);
+    const sz = tysize(ty);
+    const uns = tyuns(ty) != 0;
+    Reg v = gen(e);
+    if (sz < 4)
+        v = extend(v, ty, 4);
+    const isz = sz <= 4 ? 4 : 8;
+
+    static struct Case { long val; block* target; }
+    Barray!Case cases;
+    foreach (n, val; b.Bswitch)
+        cases.push(Case(val, b.Bsucc[1 + n]));
+    import core.stdc.stdlib : qsort;
+    extern (C) static int cmpCase(scope const void* p, scope const void* q) nothrow
+    {
+        const a = (cast(const Case*)p).val, c = (cast(const Case*)q).val;
+        return a < c ? -1 : a > c;
+    }
+    if (cases.length > 1)
+        qsort(cases[].ptr, cases.length, Case.sizeof, &cmpCase);
+    block* bdefault = b.Bsucc[0];
+
+    void compareWith(long val)
+    {
+        if (val >= 0 && val < 4096)
+            emitIns(LOp.cmpi, isz, noReg, v, noReg, val);
+        else
+        {
+            Reg c = newVreg(RC.gp, isz);
+            emitIns(LOp.movi, isz, c, noReg, noReg, val);
+            emitIns(LOp.cmp, isz, noReg, v, c);
+        }
+    }
+    void search(size_t lo, size_t hi)
+    {
+        if (hi - lo <= 3)
+        {
+            foreach (k; lo .. hi)
+            {
+                compareWith(cases[k].val);
+                jumpToBlock(cases[k].target, COND.eq);
+            }
+            jumpToBlock(bdefault);
+            return;
+        }
+        const mid = (lo + hi) / 2;
+        compareWith(cases[mid].val);
+        jumpToBlock(cases[mid].target, COND.eq);
+        const lless = newLabel();
+        jumpTo(lless, uns ? COND.cc : COND.lt);
+        search(mid + 1, hi);
+        placeLabel(lless);
+        search(lo, mid);
+    }
+    search(0, cases.length);
+    cases.dtor();
+    switchBlocks.push(b);
 }
 
 /* Jump to block t if e is true (or false if !jumpIfTrue)
@@ -3068,13 +3148,52 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
             p.reg2 = NOREG;
             continue;
         }
-        if (!isPair && !scalarType(ep.Ety) ||
-            !FuncParamRegs_alloc(*cgp, fpr, ep.ET, ep.Ety, p.reg, p.reg2) ||
-            (p.reg2 != NOREG) != isPair || (isPair && (p.reg >= 32 || p.reg2 >= 32)))
+        if (!isPair && !scalarType(ep.Ety))
         {
             fail("call arg");
             return newVreg(RC.gp, 8);
         }
+        if (!FuncParamRegs_alloc(*cgp, fpr, ep.ET, ep.Ety, p.reg, p.reg2))
+        {
+            // on the stack
+            p.reg = NOREG;
+            p.reg2 = NOREG;
+            continue;
+        }
+        if ((p.reg2 != NOREG) != isPair || (isPair && (p.reg >= 32 || p.reg2 >= 32)))
+        {
+            fail("call arg");
+            return newVreg(RC.gp, 8);
+        }
+    }
+
+    /* The offsets of the arguments on the stack, as cdfunc() has them: aligned
+     * as struct fields on OSX
+     */
+    import dmd.backend.x86.cod1 : paramsize;
+    uint numpara = 0;
+    foreach_reverse (i; 0 .. np)
+    {
+        Parameter* p = &params[i];
+        if (p.reg != NOREG)
+            continue;
+        uint sz = cast(uint)paramsize(p.e, tyf);
+        p.size = sz;
+        if (sz == 0)
+            sz = 1;
+        uint alignsize = el_alignsize(p.e);
+        if (alignsize > 16)
+            alignsize = 16;
+        numpara = (numpara + (alignsize - 1)) & ~(alignsize - 1);
+        p.offset = numpara;
+        numpara += sz;
+    }
+    numpara = (numpara + 7) & ~7;
+    const stackArgs = numpara ? (numpara + 15) & ~15 : 0;
+    if (stackArgs >= 4096)
+    {
+        fail("call stack args");
+        return newVreg(RC.gp, 8);
     }
 
     // the function called
@@ -3112,7 +3231,7 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
             aggArgs[i] = aggParts(v, a);
             continue;
         }
-        if (p.reg2 != NOREG)
+        if (p.reg2 != NOREG || p.reg == NOREG && pairType(p.e.Ety))
         {
             Pair v = genPair(p.e);
             vals[i] = v.lo;
@@ -3125,9 +3244,34 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
             r = extend(r, ty, 4);   // the callee expects narrow integers extended to 32 bits
         vals[i] = r;
     }
+    // the stack arguments, in an area below SP for the call
+    if (stackArgs)
+    {
+        emitIns(LOp.spsub, 8, noReg, noReg, noReg, stackArgs);
+        foreach (i, ref p; params)
+        {
+            if (p.reg != NOREG || i == hiddenIdx)
+                continue;
+            Mem m;
+            m.base = phys(31);
+            m.offset = p.offset;
+            const ty = tybasic(p.e.Ety);
+            if (pairType(ty))
+            {
+                store(vals[i], m, TYullong);
+                m.offset += 8;
+                store(his[i], m, TYullong);
+            }
+            else
+                store(vals[i], m, ty);
+        }
+    }
+
     regm_t argRegs;
     foreach (i, ref p; params)
     {
+        if (p.reg == NOREG)
+            continue;
         if (i == hiddenIdx)
         {
             emitIns(LOp.copy, 8, phys(8), vals[i]);
@@ -3163,6 +3307,8 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
 
     auto c = emitIns(LOp.call, 0, noReg, target, noReg, cast(long)argRegs);
     c.sym = sf;
+    if (stackArgs)
+        emitIns(LOp.spadd, 8, noReg, noReg, noReg, stackArgs);
     if (!sf || sf == funcsym_p || !sf.Sfunc || !(sf.Sfunc.Fflags & Fnothrow))
         funcsym_p.Sfunc.Fflags &= ~Fnothrow;        // the call may throw
 
@@ -5227,6 +5373,11 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
 
         case LOp.brk:
             cdb.gen1(INSTR.brk(0));
+            break;
+
+        case LOp.spsub:
+        case LOp.spadd:
+            cdb.gen1(INSTR.addsub_imm(1, i.op == LOp.spsub, 0, 0, cast(uint)i.imm, 31, 31));   // SUB/ADD SP,SP,#imm
             break;
 
         case LOp.call:
