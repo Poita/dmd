@@ -34,7 +34,7 @@ import dmd.backend.ty;
 import dmd.backend.type;
 import dmd.backend.x86.code_x86;
 import dmd.backend.arm.cod1 : loadFromEA, storeToEA;
-import dmd.backend.arm.cod3 : COND, genBranch, movregconstant, loadFloatRegConst;
+import dmd.backend.arm.cod3 : COND, genBranch, movregconstant;
 import dmd.backend.arm.instr;
 
 nothrow:
@@ -94,6 +94,7 @@ enum F : ubyte
 {
     signed  = 1,    // ld sign extends
     toLabel = 2,    // target is a label rather than a block
+    condDef = 4,    // a definition that is made on only some paths through its block
 }
 
 /// An instruction of the intermediate representation
@@ -147,6 +148,7 @@ private __gshared
     Barray!(elem*) cseElems;    // CSEs evaluated, with their registers in cseRegs
     Barray!Reg cseRegs;
     uint curBlock;
+    uint condDepth;             // number of conditionally evaluated regions being selected
     bool usesFrame;             // the code refers to locals or parameters in memory
 }
 
@@ -165,7 +167,17 @@ private bool enabledFor(const(char)* name)
     }
     if (!enabled)
         return false;
-    return !filter || strstr(name, filter) !is null;
+    if (filter && !strstr(name, filter))
+        return false;
+    // DMD_NEWCG_MAX limits it to that many functions, for bisecting
+    __gshared long limit = -2;
+    __gshared long count;
+    if (limit == -2)
+    {
+        auto p = getenv("DMD_NEWCG_MAX");
+        limit = p ? atoll(p) : -1;
+    }
+    return limit < 0 || count++ < limit;
 }
 
 /***************************************
@@ -194,6 +206,7 @@ bool lirCodegen(ref CGstate cg)
     cseElems.setLength(0);
     cseRegs.setLength(0);
     usesFrame = false;
+    condDepth = 0;
 
     for (block* b = bo.startblock; b; b = b.Bnext)
         blocks.push(b);
@@ -679,10 +692,14 @@ private void genEffect(elem* e)
             const lfalse = newLabel();
             const lend = newLabel();
             genCond(e.E1, false, lfalse);
+            auto m = enterCond();
             genEffect(e.E2.E1);
+            leaveCond(m);
             jumpTo(lend);
             placeLabel(lfalse);
+            m = enterCond();
             genEffect(e.E2.E2);
+            leaveCond(m);
             placeLabel(lend);
             return;
         }
@@ -692,7 +709,9 @@ private void genEffect(elem* e)
         {
             const lend = newLabel();
             genCond(e.E1, e.Eoper == OPoror, lend);
+            const m = enterCond();
             genEffect(e.E2);
+            leaveCond(m);
             placeLabel(lend);
             return;
         }
@@ -750,13 +769,17 @@ private void genCond(elem* e, bool jumpIfTrue, uint l, block* t = null)
                 // a && b true: both true; a || b false: both false
                 const lskip = newLabel();
                 genCond(e.E1, !jumpIfTrue, lskip);
+                const m = enterCond();
                 genCond(e.E2, jumpIfTrue, l, t);
+                leaveCond(m);
                 placeLabel(lskip);
             }
             else
             {
                 genCond(e.E1, jumpIfTrue, l, t);
+                const m = enterCond();
                 genCond(e.E2, jumpIfTrue, l, t);
+                leaveCond(m);
             }
             return;
         }
@@ -862,6 +885,55 @@ private Reg genKeep(elem* e, ref Reg r)
         r = t;
     }
     return gen(e);
+}
+
+/* Start and end the selection of code that runs on only some paths through
+ * its block. The CSEs evaluated by it are forgotten when it is left, and the
+ * variables it assigns are not dead before it
+ */
+@trusted
+private size_t enterCond()
+{
+    ++condDepth;
+    return cseElems.length;
+}
+
+@trusted
+private void leaveCond(size_t mark)
+{
+    --condDepth;
+    cseForget(mark);
+}
+
+/* Copy a into d, which outlives the code being selected
+ */
+@trusted
+private void copyOut(Reg d, Reg a, uint sz)
+{
+    auto i = emitIns(LOp.copy, sz, d, a);
+    if (condDepth)
+        i.flags |= F.condDef;
+}
+
+/* Mark where d, assigned only conditionally below, starts being live
+ */
+@trusted
+private void defineHere(Reg d)
+{
+    emitIns(LOp.nop, 0, d);
+}
+
+/* The CSEs evaluated so far, to forget those evaluated by code that may not
+ * run once it is left
+ */
+@trusted
+private size_t cseMark() { return cseElems.length; }
+
+@trusted
+private void cseForget(size_t mark)
+{
+    cseElems.setLength(mark);
+    cseRegs.setLength(mark);
 }
 
 @trusted
@@ -1092,11 +1164,12 @@ private Reg genx(elem* e)
             Reg d = newVreg(RC.gp, sz);
             const lfalse = newLabel();
             const lend = newLabel();
+            defineHere(d);
             genCond(e, false, lfalse);
-            emitIns(LOp.movi, 4, d, noReg, noReg, 1);
+            emitIns(LOp.movi, 4, d, noReg, noReg, 1).flags |= F.condDef;
             jumpTo(lend);
             placeLabel(lfalse);
-            emitIns(LOp.movi, 4, d, noReg, noReg, 0);
+            emitIns(LOp.movi, 4, d, noReg, noReg, 0).flags |= F.condDef;
             placeLabel(lend);
             return d;
         }
@@ -1106,13 +1179,18 @@ private Reg genx(elem* e)
             Reg d = newVreg(rc, sz);
             const lfalse = newLabel();
             const lend = newLabel();
+            defineHere(d);
             genCond(e.E1, false, lfalse);
+            auto m = enterCond();
             Reg a = gen(e.E2.E1);
-            emitIns(LOp.copy, rc == RC.fp ? sz : 8, d, a);
+            copyOut(d, a, rc == RC.fp ? sz : 8);
+            leaveCond(m);
             jumpTo(lend);
             placeLabel(lfalse);
+            m = enterCond();
             Reg b = gen(e.E2.E2);
-            emitIns(LOp.copy, rc == RC.fp ? sz : 8, d, b);
+            copyOut(d, b, rc == RC.fp ? sz : 8);
+            leaveCond(m);
             placeLabel(lend);
             return d;
         }
@@ -1194,7 +1272,7 @@ private Reg genAssign(elem* e)
         if (Reg r = varReg(e1.Vsym))
         {
             Reg v = gen(e.E2);
-            emitIns(LOp.copy, rcOf(r) == RC.fp ? tysize(ty) : 8, r, v);
+            copyOut(r, v, rcOf(r) == RC.fp ? tysize(ty) : 8);
             hintCopy(r, v);
             return r;
         }
@@ -1392,7 +1470,7 @@ private Reg genOpAssign(elem* e)
                 emitIns(LOp.copy, fp ? sz : 8, old, r);
             }
             Reg d = arith(op, ty, r, e.E2, b);
-            emitIns(LOp.copy, fp ? sz : 8, r, d);
+            copyOut(r, d, fp ? sz : 8);
             hintCopy(r, d);
             return post ? old : r;
         }
@@ -1554,7 +1632,7 @@ private void computeLiveness()
                     g[id / 64] |= 1UL << (id % 64);
             }
             forUses(i, &use);
-            if (i.d && !isPhys(i.d))
+            if (i.d && !isPhys(i.d) && !(i.flags & F.condDef))
             {
                 const id = vi(i.d).globalId;
                 if (id != uint.max)
@@ -1617,7 +1695,10 @@ private void computeLiveness()
             LIns* i = &ins[n];
             if (i.d && !isPhys(i.d))
             {
-                setFrom(i.d, defPos(n));
+                if (i.flags & F.condDef)
+                    addRange(i.d, defPos(n), defPos(n) + 1);    // may not be the value live before
+                else
+                    setFrom(i.d, defPos(n));
                 vi(i.d).cost += weight;
             }
             void use(Reg r)
@@ -1810,6 +1891,8 @@ private void rewriteSpills()
         foreach (n; oldStart[bi] .. oldStart[bi + 1])
         {
             LIns i = old[n];
+            if (i.op == LOp.nop)
+                continue;
             uint gpUsed, fpUsed;
             Reg scratch(RC rc)
             {
@@ -1827,7 +1910,7 @@ private void rewriteSpills()
             }
             void reload(ref Reg r)
             {
-                if (isPhys(r) || !vi(r).spilled)
+                if (!r || isPhys(r) || !vi(r).spilled)
                     return;
                 auto v = vi(r);
                 Reg s = scratch(v.rc);
@@ -2009,7 +2092,17 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
                 long bits = i.imm;
                 v = *cast(double*)&bits;
             }
-            loadFloatRegConst(cdb, cast(reg_t)d, v, i.sz);
+            import dmd.backend.arm.disasmarm : encodeHFD;
+            ubyte imm8;
+            const ft = INSTR.szToFtype(i.sz);
+            if (encodeHFD(v, imm8))
+                cdb.gen1(INSTR.fmov_float_imm(ft, imm8, d));
+            else
+            {
+                // the bits are put together in x16, which holds nothing allocated
+                movregconstant(cdb, 16, i.sz == 8 ? cast(ulong)i.imm : cast(uint)i.imm, i.sz == 8);
+                cdb.gen1(INSTR.fmov_float_gen(i.sz == 8, ft, 0, 7, 16, d));
+            }
             break;
         }
 
