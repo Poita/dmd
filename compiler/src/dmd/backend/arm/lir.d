@@ -153,6 +153,7 @@ struct VInfo
     uint loadIns = uint.max;    // the load defining it, if any
     Reg copyOf;                 // the register it is a copy of, when that copy is its only definition
     uint ndefs;                 // number of definitions
+    Reg extSrc;                 // the temporary it is extended from 32 bits, which an address may extend instead
     uint rematIns = uint.max;   // its only definition, a one instruction constant, made again at each use when spilled
     bool callSaved;             // in a caller saved register, stored before and loaded after the calls it is live across
 }
@@ -287,6 +288,7 @@ bool lirCodegen(ref CGstate cg)
                 hoistInvariants();      // again, for what is invariant in an enclosing loop
         }
         foldAddresses();
+        removeDead();
     }
     if (failed)
     {
@@ -1305,6 +1307,8 @@ private Reg extendFrom(Reg r, uint bits, bool signed, uint toSize)
     Reg d = newVreg(RC.gp, toSize);
     emitIns(signed ? LOp.sext : LOp.zext, toSize, d, r, noReg, bits);
     knownExtended(d, bits, signed, signed ? toSize : 8);    // UXTB/UXTH Wd zero the upper half
+    if (bits == 32 && toSize == 8 && !isPhys(r) && !vi(r).sym)
+        vi(d).extSrc = r;
     return d;
 }
 
@@ -2655,10 +2659,25 @@ private Mem memOf(elem* e, bool allowIndex = true)
                 m.scaled = true;
                 x = x.E1;
             }
-            if ((x.Eoper == OPu32_64 || x.Eoper == OPs32_64) && !x.Ecount)
+            if (x.Eoper == OPu32_64 || x.Eoper == OPs32_64)
             {
-                m.ext = x.Eoper == OPu32_64 ? Extend.UXTW : Extend.SXTW;
-                x = x.E1;
+                const ext = cast(ubyte)(x.Eoper == OPu32_64 ? Extend.UXTW : Extend.SXTW);
+                if (!x.Ecount)
+                {
+                    m.ext = ext;
+                    x = x.E1;
+                }
+                else
+                {
+                    // the extension shared with other uses is done by the address
+                    Reg r = gen(x);
+                    if (!isPhys(r) && vi(r).extSrc)
+                    {
+                        m.ext = ext;
+                        return vi(r).extSrc;
+                    }
+                    return r;
+                }
             }
             return gen(x);
         }
@@ -4247,6 +4266,36 @@ private uint segEnd(size_t si)
 }
 
 /******************************* Addresses ******************************/
+
+/* Remove the instructions without side effects whose results are not used
+ */
+@trusted
+private void removeDead()
+{
+    Barray!uint uses;
+    uses.setLength(vinfo.length);
+    uses[][] = 0;
+    foreach (ref i; ins[])
+    {
+        void use(Reg r) { if (!isPhys(r)) ++uses[r - firstVreg]; }
+        forUses(i, &use);
+    }
+    bool changed = true;
+    while (changed)
+    {
+        changed = false;
+        foreach_reverse (ref i; ins[])
+        {
+            if (i.op == LOp.nop || !i.d || isPhys(i.d) || uses[i.d - firstVreg] || !pureOp(i))
+                continue;
+            void unuse(Reg r) { if (!isPhys(r)) --uses[r - firstVreg]; }
+            forUses(i, &unuse);
+            i.op = LOp.nop;
+            changed = true;
+        }
+    }
+    uses.dtor();
+}
 
 /* A load or store through a register used only by it, the sum of two registers
  * computed just before (one of them maybe shifted by the log2 of the size), uses
