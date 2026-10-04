@@ -1185,7 +1185,8 @@ public:
                 return vd;
             }
             enum maxCallerLines = 150;
-            const smallCaller = parent.endloc.linnum >= parent.loc.linnum &&
+            const smallCaller = registersToSpare() ||
+                                parent.endloc.linnum >= parent.loc.linnum &&
                                 parent.endloc.linnum - parent.loc.linnum <= maxCallerLines;
             if (auto de = exp.isDeclarationExp())
             {
@@ -1741,7 +1742,7 @@ public:
                 /* what is too costly outside loops is inlined into loops up to a
                  * budget, as each inlined function is optimized again in the caller
                  */
-                enum loopBudget = 700;
+                const loopBudget = registersToSpare() ? 1200 : 700;
                 if (!tooCostlyOutsideLoops(cost))
                     return true;
                 const c = expressionCost(cost);
@@ -2746,6 +2747,15 @@ private bool onlyOneAssign(VarDeclaration v, FuncDeclaration fd) @trusted
     if (!v.type.isMutable())
         return true;            // currently the only case handled atm
     return (v in unchangedCopies) !is null;
+}
+
+/// Whether the code generator keeps enough variables in registers for the functions
+/// inlined into a caller of any size, and for more of them into loops
+private bool registersToSpare()
+{
+    import dmd.backend.arm.lir : newCodegenEnabled;
+    import dmd.target : target;
+    return target.isAArch64 && newCodegenEnabled();
 }
 
 /// Whether call `e` is given a function literal as an argument
