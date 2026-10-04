@@ -3026,8 +3026,9 @@ private Reg genx(elem* e)
 @trusted
 private bool selectable(const(elem)* e)
 {
+    // the comparison, side effects and all, is done before the arms
     const c = e.E1;
-    if (c.Eoper < OPle || c.Eoper > OPne || el_sideeffect(cast(elem*)c))
+    if (c.Eoper < OPle || c.Eoper > OPne)
         return false;
     if (!scalarType(c.E1.Ety) || pairType(c.E1.Ety))
         return false;
@@ -5028,24 +5029,35 @@ private void allocate()
         }
         if (chosen == uint.max)
         {
-            // the register of the original or of another copy of it
-            const orig = v.copyOf ? v.copyOf : r;
+            // the register of the original, of another copy of it, or of a copy of r
             int steps = 16;
-            for (Reg m = orig; m && steps--; m = m == orig ? copyHead[orig - firstVreg] : copyNext[m - firstVreg])
+            bool tryShare(Reg m)
             {
                 if (m == r)
-                    continue;
+                    return false;
                 auto vm = vi(m);
                 if (vm.spilled || vm.preg == uint.max)
-                    continue;
+                    return false;
                 const p = vm.preg;
                 if ((p >= 32) == (v.rc == RC.fp) && allocatable(p, v.rc) &&
                     (!overlaps(occupied[p], v.ranges) || canShare(r, m, p)))
                 {
                     chosen = p;
-                    break;
+                    return true;
                 }
+                return false;
             }
+            if (Reg orig = v.copyOf)
+            {
+                if (!tryShare(orig))
+                    for (Reg m = copyHead[orig - firstVreg]; m && steps--; m = copyNext[m - firstVreg])
+                        if (tryShare(m))
+                            break;
+            }
+            if (chosen == uint.max)
+                for (Reg m = copyHead[r - firstVreg]; m && steps-- > 0; m = copyNext[m - firstVreg])
+                    if (tryShare(m))
+                        break;
         }
         if (chosen == uint.max)
         {
