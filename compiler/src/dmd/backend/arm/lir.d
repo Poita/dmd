@@ -109,6 +109,7 @@ enum F : ubyte
     toX     = 16,   // ld: a signed load extends to 64 bits rather than 32
     shifted = 32,   // add/sub/and/orr/eor: b is shifted by imm, LSL, LSR or ASR as cond is 0, 1 or 2
     noreturn = 64,  // call: of a function that does not return, so it destroys nothing that matters
+    volatile_ = 128, // ld: of memory that may change by itself, so not merged with another
 }
 
 /// An instruction of the intermediate representation
@@ -287,6 +288,7 @@ bool lirCodegen(ref CGstate cg)
                 hoistInvariants();      // again, for what is invariant in an enclosing loop
         }
         foldAddresses();
+        numberValues();
         removeDead();
     }
     if (failed)
@@ -3126,10 +3128,12 @@ private Mem memOf(elem* e, bool allowIndex = true)
 }
 
 @trusted
-private void load(Reg d, Mem m, tym_t ty)
+private void load(Reg d, Mem m, tym_t ty, bool vol = false)
 {
     auto i = emitIns(LOp.ld, tysize(ty), d, m.base, m.index, m.offset);
     i.sym = m.sym;
+    if (vol || m.sym && m.sym.ty() & (mTYvolatile | mTYshared))
+        i.flags |= F.volatile_;
     i.cond = m.ext;
     if (m.scaled)
         i.flags |= F.scaled;
@@ -3213,7 +3217,7 @@ private Reg genx(elem* e)
             if (Reg r = varRegOf(e))
                 return asClass(r, rc, sz);
             Reg d = newVreg(rc, sz);
-            load(d, memOf(e), ty);
+            load(d, memOf(e), ty, (e.Ety & (mTYvolatile | mTYshared)) != 0);
             return d;
         }
 
@@ -3272,7 +3276,7 @@ private Reg genx(elem* e)
         case OPind:
         {
             Reg d = newVreg(rc, sz);
-            load(d, memOf(e), ty);
+            load(d, memOf(e), ty, (e.Ety & (mTYvolatile | mTYshared)) != 0);
             return d;
         }
 
@@ -4703,6 +4707,122 @@ private uint segEnd(size_t si)
 }
 
 /******************************* Addresses ******************************/
+
+/* Within each segment, an instruction without side effects, or a load with no store
+ * since, computing what an earlier one did into a register defined only there
+ * is removed, and its result taken from the earlier one
+ */
+@trusted
+private void numberValues()
+{
+    buildSegments();
+    const ns = segStart.length - 1;
+    Barray!uint ndefs;
+    ndefs.setLength(vinfo.length);
+    ndefs[][] = 0;
+    foreach (ref i; ins[])
+        if (i.d && !isPhys(i.d))
+            ++ndefs[i.d - firstVreg];
+    // the register each removed one's uses take instead
+    Barray!Reg subst;
+    subst.setLength(vinfo.length);
+    subst[][] = noReg;
+    Reg value(Reg r)
+    {
+        while (r && !isPhys(r) && subst[r - firstVreg])
+            r = subst[r - firstVreg];
+        return r;
+    }
+    // the versions of the registers, so a key is not matched after an operand changes
+    Barray!uint ver;
+    ver.setLength(vinfo.length);
+    ver[][] = 0;
+    uint verOf(Reg r) { return r && !isPhys(r) ? ver[r - firstVreg] : 0; }
+
+    /* A hash table of the instructions seen in the segment: an entry is current while
+     * its generation is the segment's, and a load's while its memory epoch is current
+     */
+    static struct Entry { uint gen; uint epoch; uint n; uint va, vb, vc; }
+    enum tableSize = 512;
+    Entry[tableSize] table;
+    uint gen = 0, epoch = 0;
+    static size_t hashOf(ref const LIns i)
+    {
+        size_t h = i.op * 31 + i.sz;
+        h = h * 131 + i.a;
+        h = h * 131 + i.b;
+        h = h * 131 + i.c;
+        h = h * 131 + cast(size_t)i.imm;
+        h = h * 131 + cast(size_t)cast(void*)i.sym;
+        h = h * 131 + i.flags * 7 + i.cond;
+        return h ^ (h >> 17);
+    }
+    bool any;
+    foreach (si; 0 .. ns)
+    {
+        ++gen;
+        uint count;
+        foreach (n; segStart[si] .. segEnd(si))
+        {
+            LIns* i = &ins[n];
+            i.a = value(i.a);
+            i.b = value(i.b);
+            i.c = value(i.c);
+            if (i.op == LOp.st || i.op == LOp.stp || i.op == LOp.call || i.op == LOp.spsub || i.op == LOp.spadd)
+                ++epoch;        // what memory held may have changed
+            const candidate = i.d && !isPhys(i.d) && ndefs[i.d - firstVreg] == 1 &&
+                !(i.flags & F.condDef) && (pureOp(*i) || i.op == LOp.ld && !(i.flags & F.volatile_)) &&
+                !(i.a && isPhys(i.a)) && !(i.b && isPhys(i.b)) && !(i.c && isPhys(i.c));
+            if (candidate)
+            {
+                const isLoad = i.op == LOp.ld;
+                size_t h = hashOf(*i) & (tableSize - 1);
+                bool found;
+                foreach (probe; 0 .. 8)
+                {
+                    auto x = &table[(h + probe) & (tableSize - 1)];
+                    if (x.gen != gen)
+                    {
+                        // a free slot: remember this one, unless the table is getting full
+                        if (count < tableSize / 2)
+                        {
+                            *x = Entry(gen, epoch, cast(uint)n, verOf(i.a), verOf(i.b), verOf(i.c));
+                            ++count;
+                        }
+                        break;
+                    }
+                    const k = &ins[x.n];
+                    if (k.op == i.op && k.sz == i.sz && k.cond == i.cond && k.flags == i.flags &&
+                        k.a == i.a && k.b == i.b && k.c == i.c && k.imm == i.imm && k.sym == i.sym &&
+                        x.va == verOf(i.a) && x.vb == verOf(i.b) && x.vc == verOf(i.c) &&
+                        rcOf(k.d) == rcOf(i.d) && (!isLoad || x.epoch == epoch))
+                    {
+                        subst[i.d - firstVreg] = k.d;
+                        i.op = LOp.nop;
+                        i.d = noReg;
+                        found = true;
+                        any = true;
+                        break;
+                    }
+                }
+                if (found)
+                    continue;
+            }
+            if (i.d && !isPhys(i.d))
+                ++ver[i.d - firstVreg];
+        }
+    }
+    if (any)
+        foreach (ref i; ins[])
+        {
+            i.a = value(i.a);
+            i.b = value(i.b);
+            i.c = value(i.c);
+        }
+    ndefs.dtor();
+    subst.dtor();
+    ver.dtor();
+}
 
 /* Remove the instructions without side effects whose results are not used
  */
