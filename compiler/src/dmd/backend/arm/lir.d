@@ -303,6 +303,7 @@ bool lirCodegen(ref CGstate cg)
         {
             if (hoistInvariants() && !env!"DMD_NEWCG_LICM1")
                 hoistInvariants();      // again, for what is invariant in an enclosing loop
+            hoistInvariantTests();
         }
         foldAddresses();
         numberValues();
@@ -5536,6 +5537,307 @@ private void fuseSignTests()
             c.a = noReg;
         }
     }
+}
+
+/* In a loop, a run of tests branching to the same place, as of a || chain, with
+ * nothing between them but what computes their operands, may have tests of what
+ * the loop does not change: they are done once before the loop, giving a register
+ * that is not 0 if any of them holds, and one test of it takes their place
+ */
+@trusted
+private void hoistInvariantTests()
+{
+    buildSegments();
+    const ns = segStart.length - 1;
+    if (ns < 2)
+        return;
+    Barray!uint predStart, preds;
+    Barray!Loop loops;
+    findLoops(predStart, preds, loops);
+    scope (exit)
+    {
+        predStart.dtor();
+        preds.dtor();
+        loops.dtor();
+    }
+    if (!loops.length)
+        return;
+
+    static bool setsFlags(LOp op)
+    {
+        return op == LOp.cmp || op == LOp.cmpi || op == LOp.tsti || op == LOp.fcmp ||
+            op == LOp.fcmpz || op == LOp.call;
+    }
+    static bool readsFlags(LOp op)
+    {
+        return op == LOp.csel || op == LOp.cset || op == LOp.fcsel || op == LOp.bcond;
+    }
+    // the first instruction of segment si that is not a label
+    uint first(size_t si)
+    {
+        uint n = segStart[si];
+        while (n < segEnd(si) && ins[n].op == LOp.label)
+            ++n;
+        return n;
+    }
+    /* the instruction of the test segment si setting the flags (or the CBZ) and its
+     * branch, if all the segment does is the test
+     */
+    bool test(size_t si, out uint setter, out uint branch)
+    {
+        const n = first(si);
+        const end = segEnd(si);
+        if (n + 1 == end && ins[n].op == LOp.cbz)
+        {
+            setter = branch = n;
+            return true;
+        }
+        if (n + 2 == end && ins[n + 1].op == LOp.bcond && ins[n].op != LOp.call && setsFlags(ins[n].op))
+        {
+            setter = n;
+            branch = n + 1;
+            return true;
+        }
+        return false;
+    }
+
+    Barray!uint segOf;
+    segOf.setLength(ins.length);
+    foreach (si; 0 .. ns)
+        foreach (n; segStart[si] .. segEnd(si))
+            segOf[n] = cast(uint)si;
+    Barray!bool inLoop, defInLoop;
+    inLoop.setLength(ns);
+    defInLoop.setLength(vinfo.length);
+    const nregs = vinfo.length;     // the registers made here are each defined in a preheader
+    scope (exit)
+    {
+        segOf.dtor();
+        inLoop.dtor();
+        defInLoop.dtor();
+    }
+
+    // what is put before each instruction
+    static struct Insert { uint at; LIns i; }
+    Barray!Insert inserts;
+    scope (exit) inserts.dtor();
+    Barray!uint chosen;
+    scope (exit) chosen.dtor();
+
+    foreach (ref lp; loops[])
+    {
+        inLoop[][] = false;
+        foreach (v; lp.body)
+            inLoop[v] = true;
+        uint pre = uint.max;
+        bool bad;
+        foreach (p; preds[predStart[lp.header] .. predStart[lp.header + 1]])
+            if (!inLoop[p])
+            {
+                if (pre != uint.max)
+                    bad = true;
+                pre = p;
+            }
+        if (bad || pre == uint.max || segEnd(pre) <= segStart[pre])
+            continue;
+        defInLoop[][] = false;
+        foreach (v; lp.body)
+            foreach (n; segStart[v] .. segEnd(v))
+                if (ins[n].d && !isPhys(ins[n].d))
+                    defInLoop[ins[n].d - firstVreg] = true;
+        bool unchanged(ref LIns i)
+        {
+            bool inv = true;
+            void check(Reg r)
+            {
+                if (isPhys(r) || r - firstVreg >= nregs || defInLoop[r - firstVreg])
+                    inv = false;
+            }
+            forUses(i, &check);
+            return inv;
+        }
+        /* where the preheader computes the tests: before what sets the flags its branch
+         * reads, which must come after the definitions of what the tests read
+         */
+        const pend = segEnd(pre);
+        uint at = pend;
+        const lastOp = ins[pend - 1].op;
+        if (lastOp == LOp.br || lastOp == LOp.cbz)
+            at = pend - 1;
+        else if (lastOp == LOp.bcond)
+        {
+            at = uint.max;
+            foreach_reverse (n; segStart[pre] .. pend - 1)
+                if (setsFlags(ins[n].op))
+                {
+                    at = n;
+                    break;
+                }
+            if (at == uint.max || ins[at].op == LOp.call)
+                continue;
+        }
+
+        // the runs of tests in the loop, in the order of the segments
+        foreach (v; lp.body)
+        {
+            uint s0, b0;
+            if (!test(v, s0, b0))
+                continue;
+            // the start of a run: not continuing one from the segment before
+            if (v > 0 && inLoop[v - 1])
+            {
+                uint sp, bp;
+                if (test(v - 1, sp, bp) && ins[bp].target == ins[b0].target &&
+                    (ins[bp].flags & F.toLabel) == (ins[b0].flags & F.toLabel))
+                    continue;
+            }
+            const target = ins[b0].target;
+            const toLabel = ins[b0].flags & F.toLabel;
+            // the segments of the run: each falls through to the next, its only way in
+            uint last = v;
+            for (uint w = v + 1; w < ns && inLoop[w]; ++w)
+            {
+                uint sw, bw;
+                if (!test(w, sw, bw) || ins[bw].target != target || (ins[bw].flags & F.toLabel) != toLabel)
+                    break;
+                if (predStart[w + 1] - predStart[w] != 1 || preds[predStart[w]] != w - 1)
+                    break;
+                last = w;
+            }
+            // the invariant tests of the run, whose flags nothing else reads
+            chosen.setLength(0);
+            foreach (w; v .. last + 1)
+            {
+                uint sw, bw;
+                test(w, sw, bw);
+                if (!unchanged(ins[sw]))
+                    continue;
+                if (ins[sw].op != LOp.cbz && w + 1 < ns)
+                {
+                    const nf = first(w + 1);
+                    if (nf < segEnd(w + 1) && readsFlags(ins[nf].op))
+                        continue;
+                }
+                // what the tests read is defined before where they go in the preheader
+                bool early = true;
+                void check(Reg r)
+                {
+                    foreach (n; at .. pend)
+                        if (ins[n].d == r)
+                            early = false;
+                }
+                forUses(ins[sw], &check);
+                if (early)
+                    chosen.push(w);
+            }
+            if (chosen.length < 2)
+                continue;
+
+            // in the preheader: each test as 0 or 1, ored together
+            Reg any;
+            foreach (w; chosen[])
+            {
+                uint sw, bw;
+                test(w, sw, bw);
+                LIns t = ins[sw];
+                COND c = cast(COND)ins[bw].cond;
+                if (t.op == LOp.cbz)
+                {
+                    // CBZ/CBNZ, or TBZ/TBNZ
+                    c = t.cond == COND.ne ? COND.ne : COND.eq;
+                    LIns cmp;
+                    cmp.op = t.imm ? LOp.tsti : LOp.cmpi;
+                    cmp.sz = t.sz;
+                    cmp.a = t.a;
+                    cmp.imm = t.imm ? 1L << (t.imm - 1) : 0;
+                    t = cmp;
+                }
+                inserts.push(Insert(at, t));
+                Reg r = newVreg(RC.gp, 4);
+                LIns set;
+                set.op = LOp.cset;
+                set.sz = 4;
+                set.d = r;
+                set.cond = c;
+                inserts.push(Insert(at, set));
+                if (any)
+                {
+                    Reg o = newVreg(RC.gp, 4);
+                    LIns orr;
+                    orr.op = LOp.orr;
+                    orr.sz = 4;
+                    orr.d = o;
+                    orr.a = any;
+                    orr.b = r;
+                    inserts.push(Insert(at, orr));
+                    any = o;
+                }
+                else
+                    any = r;
+            }
+            // in the loop: the first of them tests the register, the others go
+            foreach (k, w; chosen[])
+            {
+                uint sw, bw;
+                test(w, sw, bw);
+                if (k == 0)
+                {
+                    LIns* b = &ins[bw];
+                    b.op = LOp.cbz;
+                    b.cond = COND.ne;
+                    b.a = any;
+                    b.sz = 4;
+                    b.imm = 0;
+                    if (sw != bw)
+                    {
+                        ins[sw].op = LOp.nop;
+                        ins[sw].a = ins[sw].b = noReg;
+                    }
+                }
+                else
+                {
+                    ins[sw].op = LOp.nop;
+                    ins[sw].a = ins[sw].b = noReg;
+                    ins[bw].op = LOp.nop;
+                    ins[bw].a = noReg;
+                }
+            }
+        }
+    }
+    if (!inserts.length)
+        return;
+    // in the order of their places, those for one place in the order made
+    foreach (a; 1 .. inserts.length)
+        for (size_t b = a; b > 0 && inserts[b - 1].at > inserts[b].at; --b)
+        {
+            Insert t = inserts[b];
+            inserts[b] = inserts[b - 1];
+            inserts[b - 1] = t;
+        }
+
+    // the instructions with those inserted before their places
+    Barray!LIns old;
+    scope (exit) old.dtor();
+    old.setLength(ins.length);
+    old[][] = ins[][];
+    Barray!uint newIndex;
+    scope (exit) newIndex.dtor();
+    newIndex.setLength(old.length + 1);
+    ins.setLength(0);
+    size_t k = 0;
+    foreach (n; 0 .. old.length + 1)
+    {
+        while (k < inserts.length && inserts[k].at == n)
+            ins.push(inserts[k++].i);
+        newIndex[n] = cast(uint)ins.length;
+        if (n < old.length)
+            ins.push(old[n]);
+    }
+    foreach (ref b; blockStart[])
+        b = newIndex[b];
+    foreach (ref v; vinfo[])
+        if (v.loadIns != uint.max)
+            v.loadIns = newIndex[v.loadIns];
 }
 
 /* A load or store through a register used only by it, the sum of two registers
