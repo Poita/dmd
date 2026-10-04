@@ -171,6 +171,7 @@ struct elem
 }
 
 pure
+pragma(inline, true)
 void elem_debug(const elem* e)
 {
     debug assert(e.id == e.IDelem);

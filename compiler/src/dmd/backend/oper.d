@@ -320,6 +320,9 @@ enum
     _OTboolnop      = 1,
 }
 
+// called for nearly every elem visited, so always inlined
+pragma(inline, true)
+{
 ubyte OTbinary(OPER op)    { return optab1[op] & _OTbinary; }
 ubyte OTunary(OPER op)     { return optab1[op] & _OTunary; }
 bool  OTleaf(OPER op)      { return !(optab1[op] & (_OTunary|_OTbinary)); }
@@ -344,6 +347,7 @@ ubyte OTdef(OPER op)       { return optab2[op] & _OTdef; }
 ubyte OTae(OPER op)        { return optab2[op] & _OTae; }
 ubyte OTboolnop(OPER op)   { return optab3[op] & _OTboolnop; }
 bool  OTcalldef(OPER op)   { return OTcall(op) || op == OPstrcpy || op == OPstrcat || op == OPmemcpy; }
+}
 
 /* Convert op= to op    */
 OPER opeqtoop(OPER opx)   { return opx - OPaddass + OPadd; }
