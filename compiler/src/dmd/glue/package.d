@@ -1971,10 +1971,10 @@ private void findUnusedNested(FuncDeclaration fd)
     import dmd.visitor.foreachvar : foreachExpAndVar;
     import dmd.visitor.postorder : walkPostorder;
     import dmd.visitor : StoppableVisitor;
-    import dmd.funcsem : needsClosure;
     import dmd.dsymbolsem : toAlias;
 
-    if (!fd.fbody || fd.hasInlineAsm || fd.needsClosure())
+    // needsClosure() is not asked, as buildClosure() diagnoses what it changes
+    if (!fd.fbody || fd.hasInlineAsm)
         return;
     bool simple = true;
     FuncDeclarations declared;
