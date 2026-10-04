@@ -83,6 +83,7 @@ enum LOp : ubyte
     fcsel,          // d = cond ? a : b
     scvtf, ucvtf,   // d = float a, sz is the float size, imm the int size
     fcvtzs, fcvtzu, // d = int a, sz is the int size, imm the float size
+    fcvtms,         // d = int a rounded toward minus infinity, sz is the int size, imm the float size
     fcvt,           // d = a converted to size sz from size imm
     ld,             // d = memory at [a + imm] or sym + imm, sz bytes, flags F.signed
     st,             // memory at [b + imm] or sym + imm = a, sz bytes
@@ -296,6 +297,7 @@ bool lirCodegen(ref CGstate cg)
     if (!failed)
     {
         insertHoisted();
+        fuseFloorConverts();
         if (!env!"DMD_NEWCG_NOLICM")
         {
             if (hoistInvariants() && !env!"DMD_NEWCG_LICM1")
@@ -5260,6 +5262,137 @@ private void removeDead()
     uses.dtor();
 }
 
+/* The truncation of x to an integer fixed up to round toward minus infinity,
+ *      t = fcvtzs x; f = scvtf t; fcmp f, x; s = t - 1; d = csel gt, s, t
+ * (or the fcmp the other way around, or the csel inverted), as d = fcvtms x.
+ * They are the same for every x the integer can hold, and for NaN. The values
+ * are followed through copies of registers defined once.
+ */
+@trusted
+private void fuseFloorConverts()
+{
+    Barray!uint ndefs, defAt;
+    ndefs.setLength(vinfo.length);
+    defAt.setLength(vinfo.length);
+    ndefs[][] = 0;
+    bool any;
+    foreach (n, ref i; ins[])
+    {
+        if (i.d && !isPhys(i.d))
+        {
+            ++ndefs[i.d - firstVreg];
+            defAt[i.d - firstVreg] = cast(uint)n;
+        }
+        any |= i.op == LOp.fcvtzs;
+    }
+    scope (exit)
+    {
+        ndefs.dtor();
+        defAt.dtor();
+    }
+    if (!any)
+        return;
+    // the instruction defining r, the only one to, or null
+    LIns* def(Reg r)
+    {
+        return r && !isPhys(r) && ndefs[r - firstVreg] == 1 ? &ins[defAt[r - firstVreg]] : null;
+    }
+    // r through the copies of registers defined once to the one they copy
+    Reg root(Reg r)
+    {
+        foreach (_; 0 .. 8)
+        {
+            auto d = def(r);
+            if (!d || d.op != LOp.copy || !def(d.a))
+                break;
+            r = d.a;
+        }
+        return r;
+    }
+    static bool setsFlags(LOp op)
+    {
+        return op == LOp.cmp || op == LOp.cmpi || op == LOp.tsti || op == LOp.fcmp ||
+            op == LOp.fcmpz || op == LOp.call;
+    }
+    static bool readsFlags(LOp op)
+    {
+        return op == LOp.csel || op == LOp.cset || op == LOp.fcsel || op == LOp.bcond;
+    }
+
+    buildSegments();
+    foreach (si; 0 .. segStart.length - 1)
+    {
+        const start = segStart[si];
+        foreach (n; start .. segEnd(si))
+        {
+            LIns* c = &ins[n];
+            if (c.op != LOp.csel)
+                continue;
+            uint fi = uint.max;
+            foreach_reverse (k; start .. n)
+                if (setsFlags(ins[k].op))
+                {
+                    fi = k;
+                    break;
+                }
+            if (fi == uint.max || ins[fi].op != LOp.fcmp)
+                continue;
+            const LIns cmp = ins[fi];
+            // which csel operand is t - 1, and which fcmp operand is scvtf t
+            Reg sv, tv, fv, x;
+            switch (c.cond)
+            {
+                case COND.gt: sv = c.a; tv = c.b; fv = cmp.a; x = cmp.b; break;
+                case COND.le: sv = c.b; tv = c.a; fv = cmp.a; x = cmp.b; break;
+                case COND.mi: sv = c.a; tv = c.b; fv = cmp.b; x = cmp.a; break;
+                case COND.pl: sv = c.b; tv = c.a; fv = cmp.b; x = cmp.a; break;
+                default: continue;
+            }
+            const xr = root(x);
+            const tr = root(tv);
+            auto t = def(tr);
+            if (!t || t.op != LOp.fcvtzs || t.sz != c.sz || t.imm != cmp.sz || root(t.a) != xr ||
+                !def(xr))
+                continue;
+            auto f = def(fv);
+            if (!f || f.op != LOp.scvtf || f.imm != c.sz || f.sz != cmp.sz || root(f.a) != tr)
+                continue;
+            auto sub = def(sv);
+            if (!sub || !(sub.op == LOp.subi && sub.imm == 1 || sub.op == LOp.addi && sub.imm == -1) ||
+                sub.sz != c.sz || root(sub.a) != tr)
+                continue;
+            c.op = LOp.fcvtms;
+            c.a = xr;
+            c.b = noReg;
+            c.cond = 0;
+            c.imm = cmp.sz;
+            /* the fcmp goes too, if nothing else reads its flags: the code after it in
+             * its block, which control flow within the block only goes forward through,
+             * up to where the flags are set again, as they do not live from block to block
+             */
+            bool read;
+            foreach (k; fi + 1 .. n)
+                read |= readsFlags(ins[k].op);
+            foreach (k; n + 1 .. blockStart[segBlock[si] + 1])
+            {
+                if (readsFlags(ins[k].op))
+                {
+                    read = true;
+                    break;
+                }
+                if (setsFlags(ins[k].op))
+                    break;
+            }
+            if (!read)
+            {
+                ins[fi].op = LOp.nop;
+                ins[fi].a = noReg;
+                ins[fi].b = noReg;
+            }
+        }
+    }
+}
+
 /* A load or store through a register used only by it, the sum of two registers
  * computed just before (one of them maybe shifted by the log2 of the size), uses
  * them as base and index instead
@@ -5378,7 +5511,7 @@ private bool pureOp(ref const LIns i)
         case LOp.addi: .. case LOp.rori:
         case LOp.msub, LOp.neg, LOp.mvn, LOp.sext, LOp.zext:
         case LOp.fadd, LOp.fsub, LOp.fmul, LOp.fdiv, LOp.fneg, LOp.fabs, LOp.fsqrt:
-        case LOp.scvtf, LOp.ucvtf, LOp.fcvtzs, LOp.fcvtzu, LOp.fcvt:
+        case LOp.scvtf, LOp.ucvtf, LOp.fcvtzs, LOp.fcvtzu, LOp.fcvtms, LOp.fcvt:
         case LOp.lea:
             return true;
         case LOp.copy:
@@ -7064,6 +7197,14 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
             break;
         }
 
+        case LOp.fcvtms:
+        {
+            const d = pr(i.d);
+            def(d);
+            cdb.gen1(INSTR.fcvtms(sf, INSTR.szToFtype(cast(uint)i.imm), pr(i.a), d));
+            break;
+        }
+
         case LOp.fcvt:
         {
             const d = pr(i.d);
@@ -7369,7 +7510,7 @@ private void verify()
             case LOp.scvtf, LOp.ucvtf:
                 want(i.d, RC.fp, "d"); want(i.a, RC.gp, "a");
                 break;
-            case LOp.fcvtzs, LOp.fcvtzu:
+            case LOp.fcvtzs, LOp.fcvtzu, LOp.fcvtms:
                 want(i.d, RC.gp, "d"); want(i.a, RC.fp, "a");
                 break;
             case LOp.ld:

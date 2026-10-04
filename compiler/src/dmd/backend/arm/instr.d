@@ -931,6 +931,10 @@ struct INSTR
      */
     static uint fcvtzs(uint sf, uint ftype, reg_t Vn, reg_t Rd) { return float2int(sf, 0, ftype, 3, 0, Vn & 31, Rd); }
 
+    /* FCVTMS (scalar) https://www.scs.stanford.edu/~zyedidia/arm64/fcvtms_float.html
+     */
+    static uint fcvtms(uint sf, uint ftype, reg_t Vn, reg_t Rd) { return float2int(sf, 0, ftype, 2, 0, Vn & 31, Rd); }
+
     /* FCVTZU (scalar, integer) https://www.scs.stanford.edu/~zyedidia/arm64/fcvtzu_float_int.html
      */
     static uint fcvtzu(uint sf, uint ftype, reg_t Vn, reg_t Rd) { return float2int(sf, 0, ftype, 3, 1, Vn & 31, Rd); }
