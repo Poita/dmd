@@ -998,15 +998,21 @@ Classsym* fake_classsym(Identifier id)
     return t.Ttag;
 }
 
-/// The nested functions nothing refers to once the function they are in is inlined into,
-/// which are not compiled, and do not keep the variables they refer to in memory
+/// The nested functions nothing refers to once the calls of them are inlined, which are
+/// not compiled
 __gshared bool[void*] unusedNestedFuncs;
+
+/// The functions findUnusedNested() found all the nested functions of, and the
+/// variables of theirs that the nested functions used after inlining refer to
+__gshared bool[void*] nestedAnalyzed;
+/// ditto
+__gshared bool[void*] nestedReadVars;
 
 /// Whether a nested function that is compiled refers to v
 bool referencedFromNested(VarDeclaration v)
 {
-    foreach (f; v.nestedrefs)
-        if (!(cast(void*)f in unusedNestedFuncs))
-            return true;
-    return false;
+    if (auto p = v.toParent2())
+        if (cast(void*)p in nestedAnalyzed)
+            return (cast(void*)v in nestedReadVars) !is null;
+    return v.nestedrefs.length != 0;
 }

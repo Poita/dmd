@@ -1982,10 +1982,28 @@ private void findUnusedNested(FuncDeclaration fd)
     bool[void*] referred;
     void refer(FuncDeclaration f)
     {
-        if (f && !(cast(void*)f in referred))
+        if (!f)
+            return;
+        if (!(cast(void*)f in referred))
         {
             referred[cast(void*)f] = true;
             work.push(f);
+        }
+        // the functions given to a template instance it is in, which its code refers to
+        for (auto ti = f.isInstantiated(); ti; ti = ti.tinst)
+        {
+            if (!ti.tiargs)
+                continue;
+            foreach (o; *ti.tiargs)
+            {
+                auto sym = isDsymbol(o);
+                if (!sym)
+                    continue;
+                if (auto af = sym.toAlias().isFuncDeclaration())
+                    refer(af);
+                else if (sym.toParent2() == fd)
+                    simple = false;
+            }
         }
     }
 
@@ -1996,10 +2014,12 @@ private void findUnusedNested(FuncDeclaration fd)
         extern (D) void delegate(FuncDeclaration) dgDeclare;
         extern (D) void delegate(Expression) dgInit;
         extern (D) void delegate() dgComplex;
+        extern (D) void delegate(Declaration) dgRead;
         extern (D) this() scope {}
         override void visit(Expression e) {}
-        override void visit(VarExp e) { dgRefer(e.var.isFuncDeclaration()); }
-        override void visit(SymOffExp e) { dgRefer(e.var.isFuncDeclaration()); }
+        override void visit(VarExp e) { dgRefer(e.var.isFuncDeclaration()); dgRead(e.var); }
+        override void visit(SymOffExp e) { dgRefer(e.var.isFuncDeclaration()); dgRead(e.var); }
+        override void visit(ThisExp e) { dgRead(e.var); }
         override void visit(DotVarExp e) { dgRefer(e.var.isFuncDeclaration()); }
         override void visit(DelegateExp e) { dgRefer(e.func); }
         override void visit(FuncExp e) { dgRefer(e.fd); }
@@ -2016,7 +2036,8 @@ private void findUnusedNested(FuncDeclaration fd)
             }
             else if (auto f = e.declaration.isFuncDeclaration())
             {
-                if (!f.isFuncLiteralDeclaration())
+                // only one using the frame of the function makes variables live in memory
+                if (!f.isFuncLiteralDeclaration() && f.isNested())
                     dgDeclare(f);
             }
             else
@@ -2033,6 +2054,16 @@ private void findUnusedNested(FuncDeclaration fd)
     refs.dgDeclare = (FuncDeclaration f) { declared.push(f); };
     refs.dgInit = &walk;
     refs.dgComplex = () { simple = false; };
+    // the variables the nested functions being scanned use
+    FuncDeclaration scanning;   // the nested function being scanned
+    bool[void*] reads;
+    refs.dgRead = (Declaration d) {
+        if (!scanning || !d)
+            return;
+        if (auto v = d.isVarDeclaration())
+            if (v.toParent2() != scanning)
+                reads[cast(void*)v] = true;
+    };
     void scan(Statement s)
     {
         foreachExpAndVar(s, &walk, (VarDeclaration v) {
@@ -2043,14 +2074,26 @@ private void findUnusedNested(FuncDeclaration fd)
     }
 
     scan(fd.fbody);
+    // the nested functions given to templates, which their code may call
+    foreach (f; declared)
+        if (cast(void*)f in templateArgFuncs())
+            refer(f);
     // what the functions nested in fd that are referred to refer to
     while (work.length)
     {
         auto f = work.pop();
-        if (f.fbody && f != fd && f.toParent2() == fd)
+        bool inside;
+        for (Dsymbol p = f.toParent2(); p; p = p.toParent2())
+            if (p == fd)
+            {
+                inside = true;
+                break;
+            }
+        if (f.fbody && inside)
         {
             if (f.hasInlineAsm)
                 return;
+            scanning = f;
             scan(f.fbody);
         }
     }
@@ -2059,4 +2102,39 @@ private void findUnusedNested(FuncDeclaration fd)
     foreach (f; declared)
         if (!(cast(void*)f in referred) && f.toParent2() == fd)
             unusedNestedFuncs[cast(void*)f] = true;
+    nestedAnalyzed[cast(void*)fd] = true;
+    foreach (v, _; reads)
+        nestedReadVars[v] = true;
+}
+
+/* The functions given as arguments to the template instances of the root modules,
+ * which the code of the instances may refer to
+ */
+private bool[void*] templateArgFuncs()
+{
+    import dmd.dsymbolsem : toAlias;
+    __gshared bool[void*] funcs;
+    __gshared bool found;
+    if (found)
+        return funcs;
+    found = true;
+    void add(Dsymbol s)
+    {
+        auto ti = s.isTemplateInstance();
+        if (!ti)
+            return;
+        if (ti.tiargs)
+            foreach (o; *ti.tiargs)
+                if (auto sym = isDsymbol(o))
+                    if (auto f = sym.toAlias().isFuncDeclaration())
+                        funcs[cast(void*)f] = true;
+        if (ti.members)
+            foreach (m; *ti.members)
+                add(m);
+    }
+    foreach (m; Module.amodules)
+        if (m.isRoot() && m.members)
+            foreach (s; *m.members)
+                add(s);
+    return funcs;
 }

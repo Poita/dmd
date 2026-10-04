@@ -51,3 +51,47 @@ void main()
     if (lambda(2) != 12)
         assert(0);
 }
+
+int applyT(alias f)(int x) { return f(x); }
+
+int viaTemplate(int n)
+{
+    int k = n;
+    int g(int x) { return x + k; }
+    static int h(int x) { return x * 2; }
+    return applyT!g(n) + applyT!h(n);
+}
+
+shared static this()
+{
+    if (viaTemplate(3) != 6 + 6)
+        assert(0);
+}
+
+struct Each
+{
+    int opApply(scope int delegate(int) dg)
+    {
+        foreach (i; 0 .. 3)
+            if (auto r = dg(i))
+                return r;
+        return 0;
+    }
+}
+
+pragma(inline, false) void call(scope void delegate(int) dg, int x) { dg(x); }
+
+int viaForeachBody(int n)
+{
+    int total = n;
+    void add(int x) { total += x; }
+    foreach (i; Each())
+        call((int x) { add(x); }, i);
+    return total;
+}
+
+shared static this()
+{
+    if (viaForeachBody(10) != 13)
+        assert(0);
+}
