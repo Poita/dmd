@@ -1124,7 +1124,7 @@ Lnodep:
  *      false  elem evaluates left-to-right
  */
 
-@trusted
+@trusted pragma(inline, true)
 bool ERTOL(const elem* e)
 {
     elem_debug(e);

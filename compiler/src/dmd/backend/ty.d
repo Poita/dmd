@@ -228,6 +228,9 @@ enum
     TYFLxmmreg      = 0x10000,    // can be put in XMM register
 }
 
+// called throughout the optimizer and code generators, so always inlined
+pragma(inline, true)
+{
 // Give size of type
 @trusted
 byte tysize(tym_t ty)      { return _tysize[ty & 0xFF]; }
@@ -313,6 +316,8 @@ uint tyrevfunc(tym_t ty) { return tytab[ty & 0xFF] & TYFLrevparam; }
 /* Detect uint types */
 @trusted
 uint tyuns(tym_t ty) { return tytab[ty & 0xFF] & (TYFLuns | TYFLptr); }
+
+}
 
 /* Target dependent info        */
 alias TYoffset = TYuint;         // offset to an address
