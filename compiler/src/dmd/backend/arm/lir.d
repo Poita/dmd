@@ -188,6 +188,20 @@ private __gshared
     bool usesFrame;             // the code refers to locals or parameters in memory
 }
 
+/// The value of the environment variable `name`, looked up once
+@trusted
+private const(char)* env(string name)()
+{
+    __gshared bool looked;
+    __gshared const(char)* value;
+    if (!looked)
+    {
+        value = getenv(name.ptr);
+        looked = true;
+    }
+    return value;
+}
+
 /// Whether the new code generator is enabled, from DMD_NEWCG
 @trusted
 bool newCodegenEnabled()
@@ -210,7 +224,7 @@ private bool enabledFor(const(char)* name)
     __gshared bool filterRead;
     if (!filterRead)
     {
-        filter = getenv("DMD_NEWCG_NAME");
+        filter = env!"DMD_NEWCG_NAME";
         filterRead = true;
     }
     if (!newCodegenEnabled())
@@ -223,7 +237,7 @@ private bool enabledFor(const(char)* name)
     __gshared long count;
     if (limit == -2)
     {
-        auto p = getenv("DMD_NEWCG_MAX");
+        auto p = env!"DMD_NEWCG_MAX";
         limit = p ? atoll(p) : -1;
     }
     return limit < 0 || count++ < limit;
@@ -241,9 +255,9 @@ bool lirCodegen(ref CGstate cg)
         return false;
     if (!supported(cg))
     {
-        if (getenv("DMD_NEWCG_WHY"))
+        if (env!"DMD_NEWCG_WHY")
             fprintf(stderr, "newcg-why: %s %s\n", whyNot, funcsym_p.Sident.ptr);
-        if (getenv("DMD_NEWCG_DUMP"))
+        if (env!"DMD_NEWCG_DUMP")
             dumpTrees();
         return false;
     }
@@ -282,9 +296,9 @@ bool lirCodegen(ref CGstate cg)
     if (!failed)
     {
         insertHoisted();
-        if (!getenv("DMD_NEWCG_NOLICM"))
+        if (!env!"DMD_NEWCG_NOLICM")
         {
-            if (hoistInvariants() && !getenv("DMD_NEWCG_LICM1"))
+            if (hoistInvariants() && !env!"DMD_NEWCG_LICM1")
                 hoistInvariants();      // again, for what is invariant in an enclosing loop
         }
         foldAddresses();
@@ -296,18 +310,18 @@ bool lirCodegen(ref CGstate cg)
     }
     if (failed)
     {
-        if (getenv("DMD_NEWCG_WHY"))
+        if (env!"DMD_NEWCG_WHY")
             fprintf(stderr, "newcg-why: select:%s %s\n", whyNot, funcsym_p.Sident.ptr);
-        if (getenv("DMD_NEWCG_DUMP"))
+        if (env!"DMD_NEWCG_DUMP")
             dumpTrees();
         undoVariables();
         return false;
     }
-    if (getenv("DMD_NEWCG_VERIFY"))
+    if (env!"DMD_NEWCG_VERIFY")
         verify();
     computeLiveness();
     allocate();
-    if (getenv("DMD_NEWCG_DUMP"))
+    if (env!"DMD_NEWCG_DUMP")
         dump();
     splitSpilled();
     rewriteSpills();
@@ -316,7 +330,7 @@ bool lirCodegen(ref CGstate cg)
     finishVariables();
     foreach (b; switchBlocks[])
         b.bc = BC.ifthen;           // done as comparisons, no jump table
-    if (getenv("DMD_NEWCG_LOG"))
+    if (env!"DMD_NEWCG_LOG")
         fprintf(stderr, "newcg: %s\n", funcsym_p.Sident.ptr);
     return true;
 }
@@ -365,7 +379,7 @@ private bool supported(ref CGstate cg)
         retAgg != AggregateABI.Kind.hfa && retAgg != AggregateABI.Kind.gpr &&
         !(tyaggregate(tyr) && hiddenResult()))
     {
-        if (getenv("DMD_NEWCG_WHY"))
+        if (env!"DMD_NEWCG_WHY")
             fprintf(stderr, "newcg-rettype: %s\n", tym_str(tyr));
         return false;
     }
@@ -382,7 +396,7 @@ private bool supported(ref CGstate cg)
             case SC.fastpar:
                 break;
             default:
-                if (getenv("DMD_NEWCG_WHY"))
+                if (env!"DMD_NEWCG_WHY")
                     fprintf(stderr, "newcg-symclass: %s %d\n", s.Sident.ptr, s.Sclass);
                 whyNot = "symbol class";
                 return false;
@@ -501,7 +515,7 @@ private bool supportedElem(const(elem)* e)
             op != OPmemcpy && op != OPmemset && op != OPstreq)
         {
             whyNot = "type";
-            if (getenv("DMD_NEWCG_WHY"))
+            if (env!"DMD_NEWCG_WHY")
             {
                 import dmd.backend.debugprint : oper_str;
                 fprintf(stderr, "newcg-type: %s %s %d\n", oper_str(op), tym_str(e.Ety), cast(int)tysize(e.Ety));
@@ -524,7 +538,7 @@ private bool supportedElem(const(elem)* e)
             {
                 if (!supportedCallee(e.E1))
                 {
-                    if (getenv("DMD_NEWCG_WHY"))
+                    if (env!"DMD_NEWCG_WHY")
                     {
                         import dmd.backend.debugprint : WReqn;
                         fprintf(stderr, "newcg-callee: ");
@@ -597,7 +611,7 @@ private bool supportedElem(const(elem)* e)
                     !(tyaggregate(e.E1.Ety) && aggregateOp(e)))
                 {
                     whyNot = "aggregate assign";
-                    if (getenv("DMD_NEWCG_WHY"))
+                    if (env!"DMD_NEWCG_WHY")
                     {
                         import dmd.backend.debugprint : oper_str;
                         fprintf(stderr, "newcg-agg: %s %d %s %s\n", tym_str(e.Ety), cast(int)tysize(e.Ety),
@@ -775,7 +789,7 @@ private void assignVariables()
     }
     varCses.dtor();
 
-    const logVars = getenv("DMD_NEWCG_VARS") !is null;
+    const logVars = env!"DMD_NEWCG_VARS" !is null;
     foreach (k, s; globsym[])
     {
         if (logVars)
@@ -940,7 +954,7 @@ private void assignAggregates()
                     if (!good)
                     {
                         ok[k] = false;
-                        if (getenv("DMD_NEWCG_VARS"))
+                        if (env!"DMD_NEWCG_VARS")
                             fprintf(stderr, "newcg-aggvar: %s rejected by %s off %d ty %s\n", s.Sident.ptr,
                                 e.Eoper == OPvar ? "var".ptr : "relconst".ptr, cast(int)e.Voffset, tym_str(e.Ety));
                     }
@@ -2231,7 +2245,7 @@ private Pair genPairx(elem* e)
 {
     if (hfaAsInteger(e))
     {
-        if (getenv("DMD_NEWCG_WHY"))
+        if (env!"DMD_NEWCG_WHY")
         {
             import dmd.backend.debugprint : WReqn;
             fprintf(stderr, "newcg-hfapair: ");
@@ -2500,7 +2514,7 @@ private AggVal genAgg(elem* e)
         }
 
         default:
-            if (getenv("DMD_NEWCG_WHY"))
+            if (env!"DMD_NEWCG_WHY")
             {
                 import dmd.backend.debugprint : oper_str;
                 fprintf(stderr, "newcg-aggop: %s %d\n", oper_str(e.Eoper), e.Eoper);
@@ -3184,7 +3198,7 @@ private Reg genx(elem* e)
     if (pairType(ty) || hfaAsInteger(e))
     {
         import dmd.backend.debugprint : oper_str;
-        if (getenv("DMD_NEWCG_WHY"))
+        if (env!"DMD_NEWCG_WHY")
             fprintf(stderr, "newcg-pairscalar: %s %s\n", oper_str(op), funcsym_p.Sident.ptr);
         fail("pair as scalar");
         return newVreg(RC.gp, 8);
@@ -3616,7 +3630,7 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
     if (agg)
     {
         resAbi = aarch64Aggregate(e.ET);
-        if (getenv("DMD_NEWCG_WHY"))
+        if (env!"DMD_NEWCG_WHY")
             fprintf(stderr, "newcg-aggres: %s ET %s kind %d n %d size %d\n", tym_str(e.Ety),
                 e.ET ? tym_str(e.ET.Tty) : "null".ptr, resAbi.kind, resAbi.nregs, resAbi.size);
         foreach (k; 0 .. 4)
@@ -3682,7 +3696,7 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
                 a.kind != AggregateABI.Kind.hfa && a.kind != AggregateABI.Kind.gpr ||
                 !FuncParamRegs_alloc(*cgp, fpr, ep.ET, ep.Ety, p.reg, p.reg2) || p.reg == NOREG || p.reg == 8)
             {
-                if (getenv("DMD_NEWCG_WHY"))
+                if (env!"DMD_NEWCG_WHY")
                     fprintf(stderr, "newcg-aggarg: %s kind %d reg %d\n", tym_str(ep.Ety), a.kind, p.reg);
                 fail("call aggregate arg");
                 return newVreg(RC.gp, 8);
@@ -5368,7 +5382,7 @@ private bool pureOp(ref const LIns i)
         case LOp.lea:
             return true;
         case LOp.copy:
-            return !isPhys(i.a) && !getenv("DMD_NEWCG_LICMNOCOPY");
+            return !isPhys(i.a) && !env!"DMD_NEWCG_LICMNOCOPY";
         default:
             return false;
     }
@@ -5621,7 +5635,7 @@ private bool hoistInvariants()
                     bad = true;
                 pre = p;
             }
-        if (getenv("DMD_NEWCG_LICM"))
+        if (env!"DMD_NEWCG_LICM")
             fprintf(stderr, "newcg-licm: %s loop header %d size %d pre %d bad %d\n", funcsym_p.Sident.ptr,
                 lp.header, lp.size, pre, bad);
         if (bad || pre == uint.max)
@@ -5707,7 +5721,7 @@ private bool hoistInvariants()
                     if (!inv)
                         continue;
                     moveTo[n] = at;
-                    if (getenv("DMD_NEWCG_LICM"))
+                    if (env!"DMD_NEWCG_LICM")
                     {
                         fprintf(stderr, "newcg-licm:   hoist %d %s %%%d <- %%%d to %d; body", cast(int)n, lopName(i.op),
                             i.d - firstVreg, i.a ? i.a - firstVreg : -1, at);
@@ -6353,7 +6367,7 @@ private void splitSpilled()
                     bad = true;
                 pre = p;
             }
-        if (getenv("DMD_NEWCG_SPLIT"))
+        if (env!"DMD_NEWCG_SPLIT")
             fprintf(stderr, "split: %s header %d size %d calls %d pre %d bad %d empty %d\n", funcsym_p.Sident.ptr, lp.header, lp.size, calls, pre, bad, pre != uint.max && segEnd(pre) <= segStart[pre]);
         if (calls)
             continue;
