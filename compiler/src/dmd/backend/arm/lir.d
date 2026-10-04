@@ -353,8 +353,17 @@ private bool supported(ref CGstate cg)
     whyNot = "return type";
     const tyr = tybasic(funcsym_p.Stype.Tnext.Tty);
     const retAgg = tyaggregate(tyr) ? aarch64Aggregate(funcsym_p.Stype.Tnext).kind : AggregateABI.Kind.none;
+    // a result returned in memory is through the hidden pointer passed in x8
+    bool hiddenResult()
+    {
+        foreach (s; globsym[])
+            if (s.Sclass == SC.fastpar && s.Spreg == 8)
+                return true;
+        return false;
+    }
     if (tyr != TYvoid && !scalarType(tyr) && !pairType(tyr) &&
-        retAgg != AggregateABI.Kind.hfa && retAgg != AggregateABI.Kind.gpr)
+        retAgg != AggregateABI.Kind.hfa && retAgg != AggregateABI.Kind.gpr &&
+        !(tyaggregate(tyr) && hiddenResult()))
     {
         if (getenv("DMD_NEWCG_WHY"))
             fprintf(stderr, "newcg-rettype: %s\n", tym_str(tyr));
