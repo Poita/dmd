@@ -128,6 +128,7 @@ struct LIns
 struct Range
 {
     uint from, to;
+    Reg owner;          // in the ranges allocated to a register: the virtual register they are of
 }
 
 /// What is known about a virtual register
@@ -153,6 +154,7 @@ struct VInfo
     Reg copyOf;                 // the register it is a copy of, when that copy is its only definition
     uint ndefs;                 // number of definitions
     uint rematIns = uint.max;   // its only definition, a one instruction constant, made again at each use when spilled
+    bool callSaved;             // in a caller saved register, stored before and loaded after the calls it is live across
 }
 
 private __gshared
@@ -4838,6 +4840,9 @@ private immutable ubyte[3] gpScratch = [14, 15, 17];
 private immutable ubyte[3] fpScratch = [32+29, 32+30, 32+31];
 
 private __gshared Barray!Range[64] occupied;   // sorted ranges allocated to each register
+private enum Reg clobberOwner = uint.max;       // the owner of where a call destroys a register
+private __gshared Barray!uint calls;            // the instructions that are calls that return
+private __gshared Barray!float callWeights;     // the weights of their blocks
 private __gshared Barray!uint defStart;         // by register - firstVreg: start of its definitions in defList
 private __gshared Barray!uint defList;          // definition positions
 
@@ -4858,11 +4863,30 @@ private bool overlaps(ref Barray!Range occ, ref Barray!Range rs)
     return false;
 }
 
+/* Whether occ, apart from where calls destroy the register, and rs overlap
+ */
 @trusted
-private void occupy(ref Barray!Range occ, ref Barray!Range rs)
+private bool overlapsAcrossCalls(ref Barray!Range occ, ref Barray!Range rs)
+{
+    size_t i, j;
+    while (i < occ.length && j < rs.length)
+    {
+        if (occ[i].to <= rs[j].from || occ[i].owner == clobberOwner)
+            ++i;
+        else if (rs[j].to <= occ[i].from)
+            ++j;
+        else
+            return true;
+    }
+    return false;
+}
+
+@trusted
+private void occupy(ref Barray!Range occ, ref Barray!Range rs, Reg owner)
 {
     foreach (r; rs[])
     {
+        r.owner = owner;
         // insert in order
         size_t k = occ.length;
         occ.push(r);
@@ -4905,7 +4929,7 @@ private void allocate()
                 foreach (p; 0 .. 64)
                     if (callClobbers & (1UL << p))
                     {
-                        occupied[p].push(Range(defPos(n), defPos(n) + 1));
+                        occupied[p].push(Range(defPos(n), defPos(n) + 1, clobberOwner));
                         lastDef[p] = uint.max;
                     }
                 // the result registers
@@ -4938,6 +4962,20 @@ private void allocate()
             }
     }
 
+    // the calls that return, in order, and the weights of their blocks
+    calls.setLength(0);
+    callWeights.setLength(0);
+    foreach (bi; 0 .. blocks.length)
+    {
+        const bw = blocks[bi].Bweight;
+        foreach (n; blockStart[bi] .. blockStart[bi + 1])
+            if (ins[n].op == LOp.call && !(ins[n].flags & F.noreturn))
+            {
+                calls.push(cast(uint)n);
+                callWeights.push(bw ? cast(float)bw : 1);
+            }
+    }
+
     // allocate the most costly first
     Barray!Reg order;
     foreach (k; 0 .. vinfo.length)
@@ -4954,6 +4992,22 @@ private void allocate()
     }
     if (order.length > 1)
         qsort(order[].ptr, order.length, Reg.sizeof, &cmp);
+
+    /* The registers that are a copy of each register, linked from it, so a copy and
+     * its original are tried in the register of either, whichever is allocated first
+     */
+    Barray!Reg copyHead, copyNext;
+    copyHead.setLength(vinfo.length);
+    copyHead[][] = noReg;
+    copyNext.setLength(vinfo.length);
+    foreach (k; 0 .. vinfo.length)
+        if (Reg o = vinfo[k].copyOf)
+        {
+            if (o == firstVreg + k)
+                continue;
+            copyNext[k] = copyHead[o - firstVreg];
+            copyHead[o - firstVreg] = cast(Reg)(firstVreg + k);
+        }
 
     foreach (r; order[])
     {
@@ -4974,6 +5028,27 @@ private void allocate()
         }
         if (chosen == uint.max)
         {
+            // the register of the original or of another copy of it
+            const orig = v.copyOf ? v.copyOf : r;
+            int steps = 16;
+            for (Reg m = orig; m && steps--; m = m == orig ? copyHead[orig - firstVreg] : copyNext[m - firstVreg])
+            {
+                if (m == r)
+                    continue;
+                auto vm = vi(m);
+                if (vm.spilled || vm.preg == uint.max)
+                    continue;
+                const p = vm.preg;
+                if ((p >= 32) == (v.rc == RC.fp) && allocatable(p, v.rc) &&
+                    (!overlaps(occupied[p], v.ranges) || canShare(r, m, p)))
+                {
+                    chosen = p;
+                    break;
+                }
+            }
+        }
+        if (chosen == uint.max)
+        {
             foreach (p; prefs)
                 if (!overlaps(occupied[p], v.ranges))
                 {
@@ -4981,56 +5056,86 @@ private void allocate()
                     break;
                 }
         }
+        if (chosen == uint.max && v.cost > 0)
+        {
+            /* a caller saved register, saved around the calls the register is live
+             * across, when that costs less than keeping it in memory
+             */
+            float saveCost = 0;
+            size_t c = 0;
+            foreach (rg; v.ranges[])
+            {
+                while (c < calls.length && defPos(calls[c]) < rg.from)
+                    ++c;
+                for (size_t k = c; k < calls.length && defPos(calls[k]) < rg.to; ++k)
+                    saveCost += 2 * callWeights[k];
+            }
+            if (saveCost < v.cost)
+                foreach (p; prefs)
+                    if (callClobbers & (1UL << p) && !overlapsAcrossCalls(occupied[p], v.ranges))
+                    {
+                        chosen = p;
+                        v.callSaved = true;
+                        break;
+                    }
+        }
         if (chosen == uint.max)
         {
             v.spilled = true;
             continue;
         }
         v.preg = chosen;
-        occupy(occupied[chosen], v.ranges);
+        occupy(occupied[chosen], v.ranges, r);
     }
     order.dtor();
+    copyHead.dtor();
+    copyNext.dtor();
 }
 
-/* Whether r can share register p with h, the copy one is of the other: the
- * overlap of r with p's occupants is h's, and neither is redefined while the
- * other is live
+/* Whether r can share register p with h, as one is a copy of the other or both are
+ * copies of one register: wherever r overlaps what p holds, both hold that value
  */
 @trusted
 private bool canShare(Reg r, Reg h, uint p)
 {
-    Reg copy, orig;
+    Reg orig;
     if (vi(r).copyOf == h)
-    {
-        copy = r;
         orig = h;
-    }
     else if (vi(h).copyOf == r)
-    {
-        copy = h;
         orig = r;
-    }
+    else if (vi(r).copyOf && vi(r).copyOf == vi(h).copyOf)
+        orig = vi(r).copyOf;
     else
         return false;
-    auto vc = vi(copy);
-    auto vo = vi(orig);
-    if (vc.ndefs != 1)
+    // o holds the value of orig wherever o is live
+    bool sameValue(Reg o)
+    {
+        if (o == orig)
+            return true;
+        auto v = vi(o);
+        if (v.copyOf != orig || v.ndefs != 1)
+            return false;
+        // the original is not redefined while the copy is live
+        const k = orig - firstVreg;
+        foreach (pos; defList[defStart[k] .. defStart[k + 1]])
+            if (covers(v.ranges, pos, pos + 1))
+                return false;
+        return true;
+    }
+    if (!sameValue(r))
         return false;
-    // the overlap is within h's ranges
-    auto hr = &vi(h).ranges;
+    Reg checked = noReg;        // the last occupant found to hold the value
     foreach (a; vi(r).ranges[])
         foreach (b; occupied[p][])
         {
             const from = a.from > b.from ? a.from : b.from;
             const to = a.to < b.to ? a.to : b.to;
-            if (from < to && !covers(*hr, from, to))
+            if (from >= to || b.owner == checked && checked)
+                continue;
+            if (!b.owner || b.owner == clobberOwner || !sameValue(b.owner))
                 return false;
+            checked = b.owner;
         }
-    // the original is not redefined while the copy is live
-    const k = orig - firstVreg;
-    foreach (pos; defList[defStart[k] .. defStart[k + 1]])
-        if (covers(vc.ranges, pos, pos + 1))
-            return false;
     return true;
 }
 
@@ -5066,10 +5171,15 @@ private bool allocatable(uint p, RC rc)
 private void rewriteSpills()
 {
     bool any;
-    foreach (ref v; vinfo[])
+    Barray!Reg saved;           // the registers saved around calls
+    foreach (k, ref v; vinfo[])
+    {
         if (v.spilled)
             any = true;
-    if (!any)
+        if (v.callSaved)
+            saved.push(cast(Reg)(firstVreg + k));
+    }
+    if (!any && !saved.length)
         return;
 
     Barray!LIns old;
@@ -5156,6 +5266,38 @@ private void rewriteSpills()
                 ins.push(m);
                 continue;
             }
+            // the caller saved registers live across a call are stored before it and loaded after
+            Barray!Reg across;
+            if (i.op == LOp.call && saved.length && !(i.flags & F.noreturn))
+            {
+                const at = defPos(n);
+                foreach (r; saved[])
+                    if (covers(vi(r).ranges, at, at + 1))
+                    {
+                        across.push(r);
+                        auto v = vi(r);
+                        LIns m;
+                        m.op = LOp.st;
+                        m.sz = v.rc == RC.fp ? v.sz : 8;
+                        m.a = r;
+                        m.sym = slotOf(v);
+                        ins.push(m);
+                    }
+            }
+            scope (exit)
+            {
+                foreach (r; across[])
+                {
+                    auto v = vi(r);
+                    LIns m;
+                    m.op = LOp.ld;
+                    m.sz = v.rc == RC.fp ? v.sz : 8;
+                    m.d = r;
+                    m.sym = slotOf(v);
+                    ins.push(m);
+                }
+                across.dtor();
+            }
             // a register both used and defined is reloaded into the same scratch
             Reg defOrig = i.d;
             reload(i.a);
@@ -5184,6 +5326,7 @@ private void rewriteSpills()
     blockStart[blocks.length] = cast(uint)ins.length;
     old.dtor();
     oldStart.dtor();
+    saved.dtor();
     usesFrame = true;
 }
 
