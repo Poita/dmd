@@ -90,7 +90,8 @@ enum LOp : ubyte
     lea,            // d = &sym + imm
     br,             // jump to target
     bcond,          // jump to target if cond
-    cbz,            // jump to target if a is zero (cond eq) or nonzero (cond ne)
+    cbz,            // jump to target if a is zero (cond eq) or nonzero (cond ne), or with imm, if bit imm - 1 of a is
+                    // clear (cond eq) or set (cond ne)
     brk,            // trap
     spsub,          // SP -= imm
     spadd,          // SP += imm
@@ -309,6 +310,7 @@ bool lirCodegen(ref CGstate cg)
         removeBoundsChecks();
         removeUnreachable();
         removeDead();
+        fuseSignTests();
     }
     if (failed)
     {
@@ -5118,7 +5120,7 @@ private void removeBoundsChecks()
             continue;
         const LIns* g = &ins[pend - 1];
         bool entered;
-        if (g.op == LOp.cbz && g.cond == COND.eq && g.a == L && pre + 1 == lp.header)
+        if (g.op == LOp.cbz && !g.imm && g.cond == COND.eq && g.a == L && pre + 1 == lp.header)
         {
             // L != 0, and every definition of V outside the loop is 0
             entered = true;
@@ -5442,6 +5444,81 @@ private void estimateFrequencies()
             if (savedDfoidx[s.Bdfoidx] <= k)
                 continue;               // a back edge
             chance[s.Bdfoidx] += s.Bweight >= b.Bweight && stay ? c / stay : c;
+        }
+    }
+}
+
+/* A comparison of an integer with 0 for nothing but a branch on its sign, as a test
+ * of its top bit: CMP x,#0 and B.LT as TBNZ x,#31 (or #63), and B.GE as TBZ
+ */
+@trusted
+private void fuseSignTests()
+{
+    static bool setsFlags(LOp op)
+    {
+        return op == LOp.cmp || op == LOp.cmpi || op == LOp.tsti || op == LOp.fcmp ||
+            op == LOp.fcmpz || op == LOp.call;
+    }
+    static bool readsFlags(LOp op)
+    {
+        return op == LOp.csel || op == LOp.cset || op == LOp.fcsel || op == LOp.bcond;
+    }
+    foreach (bi; 0 .. blocks.length)
+    {
+        const start = blockStart[bi];
+        const end = blockStart[bi + 1];
+        /* whether the flags are read from instruction k on before they are set again:
+         * control flow within a block only goes forward, and the flags do not live from
+         * block to block
+         */
+        bool readFrom(uint k)
+        {
+            foreach (j; k .. end)
+            {
+                if (readsFlags(ins[j].op))
+                    return true;
+                if (setsFlags(ins[j].op))
+                    return false;
+            }
+            return false;
+        }
+        foreach (n; start .. end)
+        {
+            LIns* c = &ins[n];
+            if (c.op != LOp.cmpi || c.imm != 0 || (c.sz != 4 && c.sz != 8))
+                continue;
+            uint k = n + 1;
+            while (k < end && ins[k].op == LOp.nop)
+                ++k;
+            if (k >= end || ins[k].op != LOp.bcond)
+                continue;
+            LIns* b = &ins[k];
+            bool negative;
+            switch (b.cond)
+            {
+                case COND.lt, COND.mi: negative = true; break;
+                case COND.ge, COND.pl: negative = false; break;
+                default: continue;
+            }
+            if (readFrom(k + 1))
+                continue;
+            if (b.flags & F.toLabel)
+            {
+                // where the branch goes, in the block
+                uint at = uint.max;
+                foreach (j; start .. end)
+                    if (ins[j].op == LOp.label && ins[j].target == b.target)
+                        at = j;
+                if (at == uint.max || readFrom(at + 1))
+                    continue;
+            }
+            b.op = LOp.cbz;
+            b.cond = negative ? COND.ne : COND.eq;
+            b.a = c.a;
+            b.sz = c.sz;
+            b.imm = c.sz * 8;           // the top bit, plus 1
+            c.op = LOp.nop;
+            c.a = noReg;
         }
     }
 }
@@ -6909,6 +6986,8 @@ private void emit(ref CGstate cg)
     }
 
     regm_t used;
+    // TBZ reaches 32KB, which code of fewer instructions than this keeps within
+    farBranches = ins.length > 4000;
     foreach (bi, b; blocks[])
     {
         CodeBuilder cdb;
@@ -6941,6 +7020,8 @@ private void emit(ref CGstate cg)
     // the callee saved registers used are saved by the prolog
     cg.mfuncreg &= ~used;
 }
+
+private __gshared bool farBranches;     // the function's branches may reach further than TBZ can
 
 @trusted
 private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCode, ref regm_t used)
@@ -7354,7 +7435,25 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
         {
             const uint op = i.cond == COND.ne;
             const sf2 = i.sz == 8;
-            const uint w = INSTR.compbranch(sf2, op, 0, cast(ubyte)pr(i.a));        // CBZ/CBNZ
+            if (i.imm && farBranches)
+            {
+                // TST of the bit, and B.EQ or B.NE
+                LIns t;
+                t.op = LOp.tsti;
+                t.sz = i.sz;
+                t.a = i.a;
+                t.imm = 1L << (i.imm - 1);
+                emitOne(cdb, t, labelCode, used);
+                LIns b = i;
+                b.op = LOp.bcond;
+                b.imm = 0;
+                b.a = noReg;
+                emitOne(cdb, b, labelCode, used);
+                break;
+            }
+            const uint bit = cast(uint)i.imm - 1;
+            const uint w = i.imm ? INSTR.testbranch(bit >> 5, op, bit & 31, 0, cast(ubyte)pr(i.a))  // TBZ/TBNZ
+                                 : INSTR.compbranch(sf2, op, 0, cast(ubyte)pr(i.a));             // CBZ/CBNZ
             if (i.flags & F.toLabel)
             {
                 code cs;

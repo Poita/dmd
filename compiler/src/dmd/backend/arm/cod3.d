@@ -243,7 +243,10 @@ regm_t regmask(tym_t tym, tym_t tyf)
 // https://www.scs.stanford.edu/~zyedidia/arm64/b_cond.html
 // https://www.scs.stanford.edu/~zyedidia/arm64/bc_cond.html
 bool isBranch(uint ins) { return ((ins & 0xFF00_0000) == 0x5400_0000) ||
-                                 ((ins & 0x7E00_0000) == 0x3400_0000); }
+                                 ((ins & 0x7E00_0000) == 0x3400_0000) || isTestBranch(ins); }
+
+/// Whether ins is TBZ or TBNZ, whose offset is 14 bits rather than 19
+bool isTestBranch(uint ins) { return (ins & 0x7E00_0000) == 0x3600_0000; }
 
 enum MARS = true;
 
@@ -2271,15 +2274,18 @@ void jmpaddr(code* c)
             const from = positions.find(c);
             const to = positions.find(c.IEV1.Vcode);
             assert(to);
+            const bits = isTestBranch(op) ? 14 : 19;
             if (to.index > from.index)          // forward branch
             {
                 const ad = to.offset - from.offset;
+                assert((ad >> 2) < (1 << (bits - 1)));
                 c.Iop |= (ad >> 2) << 5;
             }
             else                                // backward branch
             {
                 const ad = from.offset - to.offset;
-                c.Iop |= (-(ad >> 2) & ((1 << 19) - 1)) << 5;    // set the signed imm19 field
+                assert((ad >> 2) <= (1 << (bits - 1)));
+                c.Iop |= (-(ad >> 2) & ((1 << bits) - 1)) << 5;    // set the signed offset field
             }
             c.IFL1 = FL.unde;
         }
@@ -2472,7 +2478,13 @@ uint codout(int seg, code* c, Barray!ubyte* disasmBuf, ref targ_size_t framehand
         {
             ggen.flush();
             int ad = cast(int)(c.IEV1.Vblock.Boffset - ggen.offset);
-            op |= ((ad >> 2) & 0x7FFFF) << 5; // imm19 in opcode
+            if (isTestBranch(op))
+            {
+                assert(ad >= -(1 << 15) && ad < (1 << 15));
+                op |= ((ad >> 2) & 0x3FFF) << 5;    // imm14 in opcode
+            }
+            else
+                op |= ((ad >> 2) & 0x7FFFF) << 5; // imm19 in opcode
             ggen.gen32(op);
         }
         else if (INSTR.isBRANCHY26(op) && c.IFL1 == FL.block)   // B or BL to a block
