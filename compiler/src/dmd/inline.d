@@ -2304,10 +2304,11 @@ private bool canInline(FuncDeclaration fd, bool hasThis, bool statementsToo, PAS
             }
         }
 
+        // whether copying or destroying a t takes more than its bits
         static bool hasDtor(Type t)
         {
             auto ts = t.baseElemOf().isTypeStruct();
-            return ts && ts.sym.dtor;
+            return ts && !ts.sym.isPOD();
         }
 
         /* Don't inline a function that returns non-void, but has
