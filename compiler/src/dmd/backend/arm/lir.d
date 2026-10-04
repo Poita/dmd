@@ -5449,7 +5449,8 @@ private void estimateFrequencies()
 }
 
 /* A comparison of an integer with 0 for nothing but a branch on its sign, as a test
- * of its top bit: CMP x,#0 and B.LT as TBNZ x,#31 (or #63), and B.GE as TBZ
+ * of its top bit: CMP x,#0 and B.LT as TBNZ x,#31 (or #63), and B.GE as TBZ; and a
+ * test of one bit for nothing but a branch, TST x,#bit and B.NE as TBNZ, B.EQ as TBZ
  */
 @trusted
 private void fuseSignTests()
@@ -5485,7 +5486,19 @@ private void fuseSignTests()
         foreach (n; start .. end)
         {
             LIns* c = &ins[n];
-            if (c.op != LOp.cmpi || c.imm != 0 || (c.sz != 4 && c.sz != 8))
+            if (c.sz != 4 && c.sz != 8)
+                continue;
+            // the bit tested
+            uint bit;
+            const ulong mask = c.sz == 8 ? c.imm : cast(uint)c.imm;
+            if (c.op == LOp.cmpi && c.imm == 0)
+                bit = c.sz * 8 - 1;
+            else if (c.op == LOp.tsti && mask && !(mask & (mask - 1)))
+            {
+                import core.bitop : bsf;
+                bit = bsf(mask);
+            }
+            else
                 continue;
             uint k = n + 1;
             while (k < end && ins[k].op == LOp.nop)
@@ -5493,11 +5506,13 @@ private void fuseSignTests()
             if (k >= end || ins[k].op != LOp.bcond)
                 continue;
             LIns* b = &ins[k];
-            bool negative;
-            switch (b.cond)
+            bool set;           // whether the branch is taken when the bit is set
+            switch (c.op == LOp.cmpi ? b.cond : b.cond + 100)
             {
-                case COND.lt, COND.mi: negative = true; break;
-                case COND.ge, COND.pl: negative = false; break;
+                case COND.lt, COND.mi: set = true; break;
+                case COND.ge, COND.pl: set = false; break;
+                case COND.ne + 100: set = true; break;
+                case COND.eq + 100: set = false; break;
                 default: continue;
             }
             if (readFrom(k + 1))
@@ -5513,10 +5528,10 @@ private void fuseSignTests()
                     continue;
             }
             b.op = LOp.cbz;
-            b.cond = negative ? COND.ne : COND.eq;
+            b.cond = set ? COND.ne : COND.eq;
             b.a = c.a;
             b.sz = c.sz;
-            b.imm = c.sz * 8;           // the top bit, plus 1
+            b.imm = bit + 1;
             c.op = LOp.nop;
             c.a = noReg;
         }

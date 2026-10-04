@@ -21,6 +21,21 @@ pragma(inline, false) int sumNeighbors(const int[] g, int n, int x, int y)
     return s;
 }
 
+// branches on one bit
+pragma(inline, false) int bits(uint x, ulong y)
+{
+    int r;
+    if (x & 4)
+        r += 1;
+    if (!(x & 0x8000_0000))
+        r += 2;
+    if (y & (1UL << 40))
+        r += 4;
+    if (!(y & 1))
+        r += 8;
+    return r;
+}
+
 // the flags of the comparison with 0 used again after the branch
 pragma(inline, false) int reuse(int x, int y)
 {
@@ -68,6 +83,9 @@ void main()
         if (reuse(x, 3) != (x < 0 ? 1 + 10 + 3 : 20 + 3)) assert(0);
     }
     if (classifyLong(long.min) != -1 || classifyLong(long.max) != 1) assert(0);
+    if (bits(4, 1UL << 40) != 1 + 2 + 4 + 8) assert(0);
+    if (bits(0x8000_0000, 1) != 0) assert(0);
+    if (bits(3, (1UL << 40) | 1) != 2 + 4) assert(0);
 
     int[9] g = [1, 2, 3, 4, 5, 6, 7, 8, 9];
     if (sumNeighbors(g, 3, 0, 0) != 2 + 4) assert(0);
