@@ -289,6 +289,7 @@ bool lirCodegen(ref CGstate cg)
         }
         foldAddresses();
         numberValues();
+        reuseInvariantLoads();
         removeDead();
     }
     if (failed)
@@ -3852,8 +3853,8 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
 
     auto c = emitIns(LOp.call, 0, noReg, target, noReg, cast(long)argRegs);
     c.sym = sf;
-    if (tybasic(e.Ety) == TYnoreturn)
-        c.flags |= F.noreturn;
+    if (tybasic(e.Ety) == TYnoreturn || sf && sf.Sflags & SFLexit)
+        c.flags |= F.noreturn;      // as the runtime's array bounds errors
     if (stackArgs)
         emitIns(LOp.spadd, 8, noReg, noReg, noReg, stackArgs);
     if (!sf || sf == funcsym_p || !sf.Sfunc || !(sf.Sfunc.Fflags & Fnothrow))
@@ -4824,6 +4825,139 @@ private void numberValues()
     ver.dtor();
 }
 
+/* Whether i may change memory: a call that does not return changes nothing that is read after it
+ */
+private bool writesMemory(ref const LIns i)
+{
+    return i.op == LOp.st || i.op == LOp.stp || i.op == LOp.call && !(i.flags & F.noreturn) ||
+           i.op == LOp.spsub || i.op == LOp.spadd;
+}
+
+/* In a loop without stores or calls, a load of what a load at the end of its
+ * preheader read, through registers the loop does not change, takes that load's value
+ */
+@trusted
+private void reuseInvariantLoads()
+{
+    buildSegments();
+    const ns = segStart.length - 1;
+    if (ns < 2)
+        return;
+    Barray!uint predStart, preds;
+    Barray!Loop loops;
+    findLoops(predStart, preds, loops);
+    if (!loops.length)
+    {
+        preds.dtor(); predStart.dtor(); loops.dtor();
+        return;
+    }
+    Barray!uint ndefs;
+    ndefs.setLength(vinfo.length);
+    ndefs[][] = 0;
+    foreach (ref i; ins[])
+        if (i.d && !isPhys(i.d))
+            ++ndefs[i.d - firstVreg];
+    Barray!Reg subst;
+    subst.setLength(vinfo.length);
+    subst[][] = noReg;
+    Barray!bool inLoop, defInLoop;
+    inLoop.setLength(ns);
+    defInLoop.setLength(vinfo.length);
+    Barray!uint preLoads;
+    bool any;
+    alias writes = writesMemory;
+    bool loadable(ref const LIns i)
+    {
+        return i.op == LOp.ld && !(i.flags & (F.volatile_ | F.condDef)) && i.d && !isPhys(i.d) &&
+               ndefs[i.d - firstVreg] == 1 && !(i.a && isPhys(i.a)) && !(i.b && isPhys(i.b));
+    }
+    foreach (ref lp; loops[])
+    {
+        inLoop[][] = false;
+        foreach (v; lp.body)
+            inLoop[v] = true;
+        bool w;
+        foreach (v; lp.body)
+            foreach (n; segStart[v] .. segEnd(v))
+                w |= writes(ins[n]);
+        if (w)
+            continue;
+        uint pre = uint.max;
+        bool bad;
+        foreach (p; preds[predStart[lp.header] .. predStart[lp.header + 1]])
+            if (!inLoop[p])
+            {
+                if (pre != uint.max)
+                    bad = true;
+                pre = p;
+            }
+        if (bad || pre == uint.max)
+            continue;
+        // the loads at the end of the preheader, after what it writes, with their operands unchanged since
+        preLoads.setLength(0);
+        foreach (n; segStart[pre] .. segEnd(pre))
+        {
+            LIns* i = &ins[n];
+            if (writes(*i))
+                preLoads.setLength(0);
+            if (i.d)
+            {
+                size_t k = 0;
+                foreach (m; preLoads[])
+                    if (ins[m].a != i.d && ins[m].b != i.d)
+                        preLoads[k++] = m;
+                preLoads.setLength(k);
+            }
+            if (loadable(*i))
+                preLoads.push(cast(uint)n);
+        }
+        if (!preLoads.length)
+            continue;
+        defInLoop[][] = false;
+        foreach (v; lp.body)
+            foreach (n; segStart[v] .. segEnd(v))
+                if (ins[n].d && !isPhys(ins[n].d))
+                    defInLoop[ins[n].d - firstVreg] = true;
+        foreach (v; lp.body)
+            foreach (n; segStart[v] .. segEnd(v))
+            {
+                LIns* i = &ins[n];
+                if (!loadable(*i) || i.a && defInLoop[i.a - firstVreg] || i.b && defInLoop[i.b - firstVreg])
+                    continue;
+                foreach (m; preLoads[])
+                {
+                    const k = &ins[m];
+                    if (k.sz == i.sz && k.flags == i.flags && k.cond == i.cond && k.a == i.a && k.b == i.b &&
+                        k.imm == i.imm && k.sym == i.sym && rcOf(k.d) == rcOf(i.d))
+                    {
+                        subst[i.d - firstVreg] = k.d;
+                        i.op = LOp.nop;
+                        i.d = noReg;
+                        any = true;
+                        break;
+                    }
+                }
+            }
+    }
+    if (any)
+        foreach (ref i; ins[])
+        {
+            Reg value(Reg r)
+            {
+                while (r && !isPhys(r) && subst[r - firstVreg])
+                    r = subst[r - firstVreg];
+                return r;
+            }
+            i.a = value(i.a);
+            i.b = value(i.b);
+            i.c = value(i.c);
+        }
+    foreach (ref lp; loops[])
+        mem_free(lp.body.ptr);
+    loops.dtor(); preds.dtor(); predStart.dtor(); ndefs.dtor(); subst.dtor();
+    inLoop.dtor(); defInLoop.dtor(); preLoads.dtor();
+}
+
 /* Remove the instructions without side effects whose results are not used
  */
 @trusted
@@ -5211,6 +5345,7 @@ private bool hoistInvariants()
 
     Barray!bool defInLoop;
     defInLoop.setLength(vinfo.length);
+    Barray!Reg witnessed;       // the base registers the preheader loads through
     bool any;
     foreach (ref lp; loops[])
     {
@@ -5257,6 +5392,41 @@ private bool hoistInvariants()
                 defInLoop[i.d - firstVreg] = true;
         }
 
+        /* A load can be moved if the loop writes no memory, and the preheader loads
+         * through the same base register, so the memory is there: what it reads is
+         * a field of what is already read
+         */
+        bool loopWrites;
+        foreach (v; lp.body)
+            foreach (n; segStart[v] .. segEnd(v))
+                loopWrites |= writesMemory(ins[n]);
+        witnessed.setLength(0);
+        if (!loopWrites)
+            foreach (n; segStart[pre] .. pend)
+            {
+                LIns* i = &ins[n];
+                if (i.d && !isPhys(i.d))
+                {
+                    // a base redefined after its load is not the one loaded through
+                    size_t k = 0;
+                    foreach (r; witnessed[])
+                        if (r != i.d)
+                            witnessed[k++] = r;
+                    witnessed.setLength(k);
+                }
+                if (i.op == LOp.ld && i.a && !isPhys(i.a) && !i.b && !i.sym)
+                    witnessed.push(i.a);
+            }
+        bool movableLoad(ref const LIns i)
+        {
+            if (i.op != LOp.ld || loopWrites || i.flags & (F.volatile_ | F.condDef) || i.b || i.sym || !i.a)
+                return false;
+            foreach (r; witnessed[])
+                if (r == i.a)
+                    return true;
+            return false;
+        }
+
         bool progress = true;
         while (progress)
         {
@@ -5267,7 +5437,7 @@ private bool hoistInvariants()
                     if (moveTo[n] != uint.max)
                         continue;
                     LIns* i = &ins[n];
-                    if (!pureOp(*i) || !i.d || isPhys(i.d) || ndefs[i.d - firstVreg] != 1)
+                    if (!(pureOp(*i) || movableLoad(*i)) || !i.d || isPhys(i.d) || ndefs[i.d - firstVreg] != 1)
                         continue;
                     bool inv = true;
                     void check(Reg r)
@@ -5366,7 +5536,7 @@ private bool hoistInvariants()
     foreach (ref lp; loops[])
         mem_free(lp.body.ptr);
     loops.dtor(); inLoop.dtor(); defInLoop.dtor(); moveTo.dtor(); segOf.dtor(); ndefs.dtor();
-    preds.dtor(); predStart.dtor(); inAnyLoop.dtor();
+    preds.dtor(); predStart.dtor(); inAnyLoop.dtor(); witnessed.dtor();
     return again;
 }
 
