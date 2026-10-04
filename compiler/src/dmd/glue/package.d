@@ -2040,8 +2040,8 @@ private void findUnusedNested(FuncDeclaration fd)
                 if (!f.isFuncLiteralDeclaration() && f.isNested())
                     dgDeclare(f);
             }
-            else
-                dgComplex();
+            else if (!e.declaration.isAliasDeclaration() && !e.declaration.isEnumDeclaration())
+                dgComplex();        // aliases and enums have no code that could refer to anything
         }
     }
     scope Refs refs = new Refs();
