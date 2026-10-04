@@ -303,6 +303,7 @@ bool lirCodegen(ref CGstate cg)
     allocate();
     if (getenv("DMD_NEWCG_DUMP"))
         dump();
+    splitSpilled();
     rewriteSpills();
     pairMemoryOps();
     emit(cg);
@@ -5213,6 +5214,185 @@ private bool allocatable(uint p, RC rc)
     return false;
 }
 
+/// A spilled register held in a physical register through a loop
+struct Split
+{
+    Reg r;
+    uint preg;
+    uint at;            // where it is loaded: next to instruction at >> 1, after it if at & 1
+    bool[] inLoop;      // by segment
+}
+
+private __gshared Barray!Split splits;
+
+/* For the spilled registers that a loop without calls uses but does not define, a
+ * physical register free through the loop, loaded before it
+ */
+@trusted
+private void splitSpilled()
+{
+    foreach (ref sp; splits[])
+        mem_free(sp.inLoop.ptr);
+    splits.setLength(0);
+    bool any;
+    foreach (ref v; vinfo[])
+        if (v.spilled && v.rematIns == uint.max)
+            any = true;
+    if (!any)
+        return;
+    const ns = segStart.length - 1;
+    if (ns < 2)
+        return;
+    Barray!uint predStart, preds;
+    Barray!Loop loops;
+    findLoops(predStart, preds, loops);
+
+    Barray!bool hasCall;
+    hasCall.setLength(ns);
+    foreach (si; 0 .. ns)
+    {
+        hasCall[si] = false;
+        foreach (n; segStart[si] .. segEnd(si))
+            if (ins[n].op == LOp.call && !(ins[n].flags & F.noreturn))
+                hasCall[si] = true;
+    }
+
+    Barray!bool inLoop;
+    inLoop.setLength(ns);
+    Barray!float uses;
+    uses.setLength(vinfo.length);
+    Barray!bool defined;
+    defined.setLength(vinfo.length);
+    Barray!Reg cands;
+    Barray!Range lr;
+    // the outermost loops first, so the loops in them need no load of their own
+    foreach_reverse (ref lp; loops[])
+    {
+        inLoop[][] = false;
+        bool calls;
+        foreach (v; lp.body)
+        {
+            inLoop[v] = true;
+            calls |= hasCall[v];
+        }
+        uint pre = uint.max;
+        bool bad;
+        foreach (p; preds[predStart[lp.header] .. predStart[lp.header + 1]])
+            if (!inLoop[p])
+            {
+                if (pre != uint.max)
+                    bad = true;
+                pre = p;
+            }
+        if (getenv("DMD_NEWCG_SPLIT"))
+            fprintf(stderr, "split: %s header %d size %d calls %d pre %d bad %d empty %d\n", funcsym_p.Sident.ptr, lp.header, lp.size, calls, pre, bad, pre != uint.max && segEnd(pre) <= segStart[pre]);
+        if (calls)
+            continue;
+        if (bad || pre == uint.max)
+            continue;
+        const pend = segEnd(pre);
+        if (pend <= segStart[pre])
+            continue;
+        uint at;
+        const lastOp = ins[pend - 1].op;
+        if (lastOp == LOp.br || lastOp == LOp.bcond || lastOp == LOp.cbz)
+            at = (pend - 1) << 1;
+        else
+            at = ((pend - 1) << 1) | 1;
+
+        // the spilled registers the loop uses and does not define
+        uses[][] = 0;
+        defined[][] = false;
+        cands.setLength(0);
+        foreach (v; lp.body)
+        {
+            const w = blocks[segBlock[v]].Bweight ? cast(float)blocks[segBlock[v]].Bweight : 1;
+            foreach (n; segStart[v] .. segEnd(v))
+            {
+                LIns* i = &ins[n];
+                if (i.d && !isPhys(i.d))
+                    defined[i.d - firstVreg] = true;
+                void use(Reg r)
+                {
+                    if (isPhys(r))
+                        return;
+                    auto vr = vi(r);
+                    if (!vr.spilled || vr.rematIns != uint.max)
+                        return;
+                    if (uses[r - firstVreg] == 0)
+                        cands.push(r);
+                    uses[r - firstVreg] += w;
+                }
+                forUses(*i, &use);
+            }
+        }
+        if (!cands.length)
+            continue;
+
+        // the positions of the loop, and of the end of the preheader
+        lr.setLength(0);
+        foreach (v; lp.body)
+            lr.push(Range(usePos(segStart[v]), usePos(segEnd(v))));
+        lr.push(Range(usePos(at >> 1), usePos(pend)));
+        foreach (a; 1 .. lr.length)
+            for (size_t k = a; k > 0 && lr[k - 1].from > lr[k].from; --k)
+            {
+                Range t = lr[k]; lr[k] = lr[k - 1]; lr[k - 1] = t;
+            }
+
+        // the most used first
+        foreach (a; 1 .. cands.length)
+            for (size_t k = a; k > 0 && uses[cands[k - 1] - firstVreg] < uses[cands[k] - firstVreg]; --k)
+            {
+                Reg t = cands[k]; cands[k] = cands[k - 1]; cands[k - 1] = t;
+            }
+        foreach (r; cands[])
+        {
+            if (defined[r - firstVreg])
+                continue;
+            // held through an enclosing loop already
+            bool held;
+            foreach (ref sp; splits[])
+                if (sp.r == r && sp.inLoop[lp.header])
+                    held = true;
+            if (held)
+                continue;
+            auto v = vi(r);
+            foreach (p; v.rc == RC.fp ? fpOrder : gpOrder)
+                if (!overlaps(occupied[p], lr))
+                {
+                    occupy(occupied[p], lr, r);
+                    Split sp;
+                    sp.r = r;
+                    sp.preg = p;
+                    sp.at = at;
+                    sp.inLoop = (cast(bool*)mem_malloc(ns * bool.sizeof))[0 .. ns];
+                    sp.inLoop[] = inLoop[];
+                    splits.push(sp);
+                    break;
+                }
+        }
+    }
+    foreach (ref lp; loops[])
+        mem_free(lp.body.ptr);
+    loops.dtor(); preds.dtor(); predStart.dtor(); hasCall.dtor(); inLoop.dtor();
+    uses.dtor(); defined.dtor(); cands.dtor(); lr.dtor();
+}
+
+/* The stack slot of a register kept in memory
+ */
+@trusted
+private Symbol* slotOf(VInfo* v)
+{
+    if (!v.slot)
+    {
+        tym_t ty = v.rc == RC.fp ? (v.sz == 4 ? TYfloat : TYdouble) : TYllong;
+        v.slot = symbol_genauto(ty);
+        v.slot.Sfl = FL.auto_;
+    }
+    return v.slot;
+}
+
 /* Replace the spilled registers by scratch registers loaded from and stored
  * to their stack slots
  */
@@ -5239,12 +5419,56 @@ private void rewriteSpills()
     oldStart[][] = blockStart[][];
     ins.setLength(0);
 
+    // the segment of each instruction, for the spilled registers held through loops
+    Barray!uint segOfIns;
+    if (splits.length)
+    {
+        segOfIns.setLength(old.length);
+        foreach (si; 0 .. segStart.length - 1)
+            foreach (n; segStart[si] .. segEnd(si))
+                segOfIns[n] = cast(uint)si;
+    }
+    // the physical register r is held in through a loop at instruction n, or noReg
+    Reg heldIn(Reg r, size_t n)
+    {
+        if (!r || isPhys(r))
+            return noReg;
+        foreach (ref sp; splits[])
+            if (sp.r == r && sp.inLoop[segOfIns[n]])
+                return phys(sp.preg);
+        return noReg;
+    }
+
     foreach (bi; 0 .. blocks.length)
     {
         blockStart[bi] = cast(uint)ins.length;
         foreach (n; oldStart[bi] .. oldStart[bi + 1])
         {
+            // the loads of the registers held through a loop, before or after this instruction
+            void loadHeld(uint at)
+            {
+                foreach (ref sp; splits[])
+                    if (sp.at == at)
+                    {
+                        auto v = vi(sp.r);
+                        LIns m;
+                        m.op = LOp.ld;
+                        m.sz = v.rc == RC.fp ? v.sz : 8;
+                        m.d = phys(sp.preg);
+                        m.sym = slotOf(v);
+                        ins.push(m);
+                    }
+            }
+            loadHeld(cast(uint)(n << 1));
+            scope (exit)
+                loadHeld(cast(uint)((n << 1) | 1));
             LIns i = old[n];
+            if (splits.length)
+            {
+                if (Reg h = heldIn(i.a, n)) i.a = h;
+                if (Reg h = heldIn(i.b, n)) i.b = h;
+                if (Reg h = heldIn(i.c, n)) i.c = h;
+            }
             if (i.op == LOp.nop)
                 continue;
             if (i.d && !isPhys(i.d) && vi(i.d).spilled && vi(i.d).rematIns == n)
@@ -5253,16 +5477,6 @@ private void rewriteSpills()
             Reg scratch(RC rc)
             {
                 return phys(rc == RC.fp ? fpScratch[fpUsed++] : gpScratch[gpUsed++]);
-            }
-            Symbol* slotOf(VInfo* v)
-            {
-                if (!v.slot)
-                {
-                    tym_t ty = v.rc == RC.fp ? (v.sz == 4 ? TYfloat : TYdouble) : TYllong;
-                    v.slot = symbol_genauto(ty);
-                    v.slot.Sfl = FL.auto_;
-                }
-                return v.slot;
             }
             void reload(ref Reg r)
             {
@@ -5376,6 +5590,7 @@ private void rewriteSpills()
     old.dtor();
     oldStart.dtor();
     saved.dtor();
+    segOfIns.dtor();
     usesFrame = true;
 }
 
