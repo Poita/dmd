@@ -321,6 +321,7 @@ bool lirCodegen(ref CGstate cg)
     }
     if (env!"DMD_NEWCG_VERIFY")
         verify();
+    estimateFrequencies();
     computeLiveness();
     allocate();
     if (env!"DMD_NEWCG_DUMP")
@@ -4625,8 +4626,7 @@ private void computeLiveness()
                 addRange(globalRegs[id], bfrom, bto);
             }
         }
-        const bw = blocks[segBlock[si]].Bweight;
-        const weight = bw ? cast(float)bw : 1;
+        const weight = blockFreq[segBlock[si]];
         foreach_reverse (n; segStart[si] .. end)
         {
             LIns* i = &ins[n];
@@ -5393,6 +5393,59 @@ private void fuseFloorConverts()
     }
 }
 
+/* How often each block runs: its loop weight times the chance of reaching it on
+ * an iteration of its loop. The chance flows from the entry along the edges that
+ * are not back edges, in reverse postorder, split evenly between the successors
+ * that stay in the loop (one that leaves it takes all of it) and added up where
+ * paths join, so code run on only some paths through a loop counts for less.
+ */
+@trusted
+private void estimateFrequencies()
+{
+    const nb = blocks.length;
+    blockFreq.setLength(nb);
+    foreach (bi, b; blocks[])
+        blockFreq[bi] = b.Bweight ? cast(float)b.Bweight : 1;
+    // the blocks in reverse postorder, if the optimizer's order still holds for them all
+    Barray!uint order;
+    scope (exit) order.dtor();
+    order.setLength(nb);
+    order[][] = uint.max;
+    foreach (bi; 0 .. nb)
+    {
+        const k = savedDfoidx[bi];
+        if (k >= nb || order[k] != uint.max)
+            return;
+        order[k] = cast(uint)bi;
+    }
+    Barray!float chance;
+    scope (exit) chance.dtor();
+    chance.setLength(nb);
+    chance[][] = 0;
+    chance[order[0]] = 1;
+    foreach (k; 0 .. nb)
+    {
+        const bi = order[k];
+        block* b = blocks[bi];
+        float c = chance[bi];
+        if (c > 1)
+            c = 1;
+        if (c < 1.0f / 64)
+            c = 1.0f / 64;
+        blockFreq[bi] *= c;
+        uint stay;
+        foreach (s; b.Bsucc[])
+            if (savedDfoidx[s.Bdfoidx] > k && s.Bweight >= b.Bweight)
+                ++stay;
+        foreach (s; b.Bsucc[])
+        {
+            if (savedDfoidx[s.Bdfoidx] <= k)
+                continue;               // a back edge
+            chance[s.Bdfoidx] += s.Bweight >= b.Bweight && stay ? c / stay : c;
+        }
+    }
+}
+
 /* A load or store through a register used only by it, the sum of two registers
  * computed just before (one of them maybe shifted by the log2 of the size), uses
  * them as base and index instead
@@ -6075,6 +6128,7 @@ private __gshared uint[64] occupiedMaxLen;      // the length of the longest of 
 private enum Reg clobberOwner = uint.max;       // the owner of where a call destroys a register
 private __gshared Barray!uint calls;            // the instructions that are calls that return
 private __gshared Barray!float callWeights;     // the weights of their blocks
+private __gshared Barray!float blockFreq;       // how often each block is estimated to run
 private __gshared Barray!uint defStart;         // by register - firstVreg: start of its definitions in defList
 private __gshared Barray!uint defList;          // definition positions
 
@@ -6222,12 +6276,11 @@ private void allocate()
     callWeights.setLength(0);
     foreach (bi; 0 .. blocks.length)
     {
-        const bw = blocks[bi].Bweight;
         foreach (n; blockStart[bi] .. blockStart[bi + 1])
             if (ins[n].op == LOp.call && !(ins[n].flags & F.noreturn))
             {
                 calls.push(cast(uint)n);
-                callWeights.push(bw ? cast(float)bw : 1);
+                callWeights.push(blockFreq[bi]);
             }
     }
 
@@ -6522,7 +6575,7 @@ private void splitSpilled()
         cands.setLength(0);
         foreach (v; lp.body)
         {
-            const w = blocks[segBlock[v]].Bweight ? cast(float)blocks[segBlock[v]].Bweight : 1;
+            const w = blockFreq[segBlock[v]];
             foreach (n; segStart[v] .. segEnd(v))
             {
                 LIns* i = &ins[n];
