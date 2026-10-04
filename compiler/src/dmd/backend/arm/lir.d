@@ -283,8 +283,7 @@ bool lirCodegen(ref CGstate cg)
         insertHoisted();
         if (!getenv("DMD_NEWCG_NOLICM"))
         {
-            hoistInvariants();
-            if (!getenv("DMD_NEWCG_LICM1"))
+            if (hoistInvariants() && !getenv("DMD_NEWCG_LICM1"))
                 hoistInvariants();      // again, for what is invariant in an enclosing loop
         }
         foldAddresses();
@@ -4999,21 +4998,30 @@ private void findLoops(ref Barray!uint predStart, ref Barray!uint preds, ref Bar
 }
 
 /* Move the instructions computing the same value on every iteration of a loop
- * to before the loop
+ * to before the loop. Returns whether something was moved into a loop, so doing it
+ * again may move it further out.
  */
 @trusted
-private void hoistInvariants()
+private bool hoistInvariants()
 {
     buildSegments();
     const ns = segStart.length - 1;
     if (ns < 2)
-        return;
+        return false;
 
     Barray!uint predStart, preds;
     Barray!Loop loops;
     findLoops(predStart, preds, loops);
     Barray!bool inLoop;
     inLoop.setLength(ns);
+    // the segments in loops
+    Barray!bool inAnyLoop;
+    inAnyLoop.setLength(ns);
+    inAnyLoop[][] = false;
+    foreach (ref lp; loops[])
+        foreach (v; lp.body)
+            inAnyLoop[v] = true;
+    bool again;
 
     // the number of definitions of each register, and the segment of each instruction
     Barray!uint ndefs;
@@ -5121,6 +5129,7 @@ private void hoistInvariants()
                     defInLoop[i.d - firstVreg] = false;
                     progress = true;
                     any = true;
+                    again |= inAnyLoop[pre];
                 }
         }
     }
@@ -5192,7 +5201,8 @@ private void hoistInvariants()
     foreach (ref lp; loops[])
         mem_free(lp.body.ptr);
     loops.dtor(); inLoop.dtor(); defInLoop.dtor(); moveTo.dtor(); segOf.dtor(); ndefs.dtor();
-    preds.dtor(); predStart.dtor();
+    preds.dtor(); predStart.dtor(); inAnyLoop.dtor();
+    return again;
 }
 
 /******************************* Pairing ******************************/
