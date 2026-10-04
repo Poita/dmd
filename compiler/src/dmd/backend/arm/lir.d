@@ -5331,6 +5331,7 @@ private immutable ubyte[3] gpScratch = [14, 15, 17];
 private immutable ubyte[3] fpScratch = [32+29, 32+30, 32+31];
 
 private __gshared Barray!Range[64] occupied;   // sorted ranges allocated to each register
+private __gshared uint[64] occupiedMaxLen;      // the length of the longest of them
 private enum Reg clobberOwner = uint.max;       // the owner of where a call destroys a register
 private __gshared Barray!uint calls;            // the instructions that are calls that return
 private __gshared Barray!float callWeights;     // the weights of their blocks
@@ -5338,10 +5339,26 @@ private __gshared Barray!uint defStart;         // by register - firstVreg: star
 private __gshared Barray!uint defList;          // definition positions
 
 @trusted
-private bool overlaps(ref Barray!Range occ, ref Barray!Range rs)
+private bool overlaps(ref Barray!Range occ, ref Barray!Range rs, uint maxLen = uint.max)
 {
     // both are sorted: merge walk
     size_t i, j;
+    if (maxLen != uint.max && rs.length && occ.length > 8)
+    {
+        // from the first range that may reach rs: one no longer than maxLen that starts
+        // further than maxLen before rs ends before it
+        const lo = rs[0].from > maxLen ? rs[0].from - maxLen : 0;
+        size_t a = 0, b = occ.length;
+        while (a < b)
+        {
+            const mid = (a + b) / 2;
+            if (occ[mid].from < lo)
+                a = mid + 1;
+            else
+                b = mid;
+        }
+        i = a;
+    }
     while (i < occ.length && j < rs.length)
     {
         if (occ[i].to <= rs[j].from)
@@ -5373,20 +5390,23 @@ private bool overlapsAcrossCalls(ref Barray!Range occ, ref Barray!Range rs)
 }
 
 @trusted
-private void occupy(ref Barray!Range occ, ref Barray!Range rs, Reg owner)
+private void occupy(uint p, ref Barray!Range rs, Reg owner)
 {
+    auto occ = &occupied[p];
     foreach (r; rs[])
     {
         r.owner = owner;
+        if (r.to - r.from > occupiedMaxLen[p])
+            occupiedMaxLen[p] = r.to - r.from;
         // insert in order
         size_t k = occ.length;
         occ.push(r);
-        while (k > 0 && occ[k - 1].from > r.from)
+        while (k > 0 && (*occ)[k - 1].from > r.from)
         {
-            occ[k] = occ[k - 1];
+            (*occ)[k] = (*occ)[k - 1];
             --k;
         }
-        occ[k] = r;
+        (*occ)[k] = r;
     }
 }
 
@@ -5443,7 +5463,7 @@ private void allocate()
                     occupied[p].push(Range(lastDef[p], usePos(blockStart[bi + 1]) + 1));
             }
     }
-    foreach (ref o; occupied)
+    foreach (p, ref o; occupied)
     {
         // sort the few fixed ranges
         foreach (a; 1 .. o.length)
@@ -5451,6 +5471,10 @@ private void allocate()
             {
                 Range t = o[k]; o[k] = o[k - 1]; o[k - 1] = t;
             }
+        occupiedMaxLen[p] = 0;
+        foreach (x; o[])
+            if (x.to - x.from > occupiedMaxLen[p])
+                occupiedMaxLen[p] = x.to - x.from;
     }
 
     // the calls that return, in order, and the weights of their blocks
@@ -5514,7 +5538,7 @@ private void allocate()
             else if (!vi(h).spilled && vi(h).preg != uint.max)
                 p = vi(h).preg;
             if (p != uint.max && (p >= 32) == (v.rc == RC.fp) && allocatable(p, v.rc) &&
-                (!overlaps(occupied[p], v.ranges) || !isPhys(h) && canShare(r, h, p)))
+                (!overlaps(occupied[p], v.ranges, occupiedMaxLen[p]) || !isPhys(h) && canShare(r, h, p)))
                 chosen = p;
         }
         if (chosen == uint.max)
@@ -5530,7 +5554,7 @@ private void allocate()
                     return false;
                 const p = vm.preg;
                 if ((p >= 32) == (v.rc == RC.fp) && allocatable(p, v.rc) &&
-                    (!overlaps(occupied[p], v.ranges) || canShare(r, m, p)))
+                    (!overlaps(occupied[p], v.ranges, occupiedMaxLen[p]) || canShare(r, m, p)))
                 {
                     chosen = p;
                     return true;
@@ -5552,7 +5576,7 @@ private void allocate()
         if (chosen == uint.max)
         {
             foreach (p; prefs)
-                if (!overlaps(occupied[p], v.ranges))
+                if (!overlaps(occupied[p], v.ranges, occupiedMaxLen[p]))
                 {
                     chosen = p;
                     break;
@@ -5587,7 +5611,7 @@ private void allocate()
             continue;
         }
         v.preg = chosen;
-        occupy(occupied[chosen], v.ranges, r);
+        occupy(chosen, v.ranges, r);
     }
     order.dtor();
     copyHead.dtor();
@@ -5811,9 +5835,9 @@ private void splitSpilled()
                 continue;
             auto v = vi(r);
             foreach (p; v.rc == RC.fp ? fpOrder : gpOrder)
-                if (!overlaps(occupied[p], lr))
+                if (!overlaps(occupied[p], lr, occupiedMaxLen[p]))
                 {
-                    occupy(occupied[p], lr, r);
+                    occupy(p, lr, r);
                     Split sp;
                     sp.r = r;
                     sp.preg = p;
