@@ -245,6 +245,9 @@ regm_t regmask(tym_t tym, tym_t tyf)
 bool isBranch(uint ins) { return ((ins & 0xFF00_0000) == 0x5400_0000) ||
                                  ((ins & 0x7E00_0000) == 0x3400_0000) || isTestBranch(ins); }
 
+/// Whether ins is B.cond
+bool isCondBranch(uint ins) { return (ins & 0xFF00_0010) == 0x5400_0000; }
+
 /// Whether ins is TBZ or TBNZ, whose offset is 14 bits rather than 19
 bool isTestBranch(uint ins) { return (ins & 0x7E00_0000) == 0x3600_0000; }
 
@@ -1453,9 +1456,12 @@ int branch(block* bl,int flag)
                             }
                         }
 
-                        /* And eliminate jmps to jmps   */
-                        if (isBranch(ct.Iop) &&
-                            ((op & 0x0F) == (ct.Iop & 0xF) || (ct.Iop & 0xF) == COND.al))
+                        /* And eliminate jmps to jmps: to a B.AL, or from a B.cond to
+                         * one of the same condition (the low bits of CBZ and TBZ are
+                         * a register, not a condition)
+                         */
+                        if (isCondBranch(ct.Iop) &&
+                            ((ct.Iop & 0xF) == COND.al || isCondBranch(op) && (op & 0xF) == (ct.Iop & 0xF)))
                         {
                             c.IFL1 = ct.IFL1;
                             c.IEV1.Vcode = ct.IEV1.Vcode;
