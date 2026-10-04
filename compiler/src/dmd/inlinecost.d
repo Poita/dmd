@@ -37,7 +37,7 @@ import dmd.statement;
 import dmd.tokens;
 import dmd.visitor;
 import dmd.visitor.postorder;
-import dmd.inline : restEndsWithReturn;
+import dmd.inline : restEndsWithReturn, restHasNoReturn;
 
 /// Cost from which a function is never inlined, also what marks a function
 /// that cannot be inlined
@@ -88,6 +88,8 @@ bool tooCostlyOutsideLoops(int cost) pure nothrow @safe
 int inlineCostFunction(FuncDeclaration fd, bool hasThis)
 {
     scope InlineCostVisitor icv = new InlineCostVisitor(hasThis);
+    // only for the nested functions and literals that callbacks are written as
+    icv.earlyReturns = fd.isNested() || fd.isFuncLiteralDeclaration();
     fd.fbody.accept(icv);
     return icv.cost;
 }
@@ -154,6 +156,8 @@ extern (C++) final class InlineCostVisitor : Visitor
 public:
     // if the caller can access the callee's this pointer
     immutable bool hasThis;
+    // if a return ending an if's body may leave the rest of a void function as its else
+    bool earlyReturns;
 
     int nested;
     int cost;           // zero start for subsequent AST
@@ -167,6 +171,7 @@ public:
     {
         nested = icv.nested;
         hasThis = icv.hasThis;
+        earlyReturns = icv.earlyReturns;
     }
 
     override void visit(Statement s)
@@ -196,12 +201,32 @@ public:
                  * the statements being visited next
                  */
                 IfStatement ifs;
-                if ((ifs = s2.isIfStatement()) !is null &&
+                const ifReturn = (ifs = s2.isIfStatement()) !is null &&
                     ifs.ifbody &&
                     ifs.ifbody.endsWithReturnStatement() &&
-                    !ifs.elsebody &&
-                    restEndsWithReturn(s.statements, i + 1)
-                   )
+                    !ifs.elsebody;
+                /* And, in statements only, as of a function returning void:
+                 *  if (condition)
+                 *      return;
+                 *  statements without return
+                 */
+                if (icv.earlyReturns && ifReturn && !restEndsWithReturn(s.statements, i + 1) &&
+                    !ifs.ifbody.endsWithReturnStatement().exp && restHasNoReturn(s.statements, i + 1))
+                {
+                    if (ifs.param)
+                    {
+                        cost = COST_MAX;
+                        return;
+                    }
+                    icv.cost += STATEMENT_COST;
+                    icv.expressionInlineCost(ifs.condition);
+                    ifs.ifbody.accept(icv);
+                    foreach (st; s.statements[i + 1 .. $])
+                        if (st)
+                            st.accept(icv);
+                    break;
+                }
+                if (ifReturn && restEndsWithReturn(s.statements, i + 1))
                 {
                     if (ifs.param)       // if variables are declared
                     {

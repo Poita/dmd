@@ -2015,9 +2015,17 @@ private void findUnusedNested(FuncDeclaration fd)
         extern (D) void delegate(Expression) dgInit;
         extern (D) void delegate() dgComplex;
         extern (D) void delegate(Declaration) dgRead;
+        extern (D) void delegate(VarDeclaration, FuncDeclaration) dgLiteralVar;
+        extern (D) void delegate(VarDeclaration) dgUseVar;
         extern (D) this() scope {}
         override void visit(Expression e) {}
-        override void visit(VarExp e) { dgRefer(e.var.isFuncDeclaration()); dgRead(e.var); }
+        override void visit(VarExp e)
+        {
+            dgRefer(e.var.isFuncDeclaration());
+            dgRead(e.var);
+            if (auto v = e.var.isVarDeclaration())
+                dgUseVar(v);
+        }
         override void visit(SymOffExp e) { dgRefer(e.var.isFuncDeclaration()); dgRead(e.var); }
         override void visit(ThisExp e) { dgRead(e.var); }
         override void visit(DotVarExp e) { dgRefer(e.var.isFuncDeclaration()); }
@@ -2032,7 +2040,14 @@ private void findUnusedNested(FuncDeclaration fd)
                     dgComplex();
                 else if (v._init)
                     if (auto ie = v._init.isExpInitializer())
-                        dgInit(ie.exp);
+                    {
+                        // a variable a function literal is put in, as by inlining a call given
+                        // one, refers to it only if the variable is used
+                        if (auto f = literalOf(ie.exp))
+                            dgLiteralVar(v, f);
+                        else
+                            dgInit(ie.exp);
+                    }
             }
             else if (auto f = e.declaration.isFuncDeclaration())
             {
@@ -2045,6 +2060,18 @@ private void findUnusedNested(FuncDeclaration fd)
         }
     }
     scope Refs refs = new Refs();
+    bool[void*] usedVars;
+    FuncDeclaration[void*] literalVars;
+    refs.dgLiteralVar = (VarDeclaration v, FuncDeclaration f) {
+        literalVars[cast(void*)v] = f;
+        if (cast(void*)v in usedVars)
+            refer(f);
+    };
+    refs.dgUseVar = (VarDeclaration v) {
+        usedVars[cast(void*)v] = true;
+        if (auto f = cast(void*)v in literalVars)
+            refer(*f);
+    };
     void walk(Expression e)
     {
         if (e)
@@ -2105,6 +2132,24 @@ private void findUnusedNested(FuncDeclaration fd)
     nestedAnalyzed[cast(void*)fd] = true;
     foreach (v, _; reads)
         nestedReadVars[v] = true;
+}
+
+/* The function literal that the initialization init puts in a variable, or null
+ */
+private FuncDeclaration literalOf(Expression init)
+{
+    auto ae = init.isConstructExp() ? cast(AssignExp)init : init.isBlitExp() ? cast(AssignExp)init : null;
+    if (!ae)
+        return null;
+    Expression e = ae.e2;
+    while (auto ce = e.isCastExp())
+        e = ce.e1;
+    if (auto fe = e.isFuncExp())
+        return fe.fd;
+    if (auto de = e.isDelegateExp())
+        if (de.func && de.func.isFuncLiteralDeclaration() && de.e1.isVarExp() is null)
+            return de.func;
+    return null;
 }
 
 /* The functions given as arguments to the template instances of the root modules,

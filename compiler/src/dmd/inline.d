@@ -190,6 +190,30 @@ public:
                 continue;
             static if (asStatements)
             {
+                /* if (condition) return; rest, of a function returning void, as
+                 * if (condition) {} else { rest }
+                 */
+                IfStatement ifs;
+                if ((ifs = sx.isIfStatement()) !is null && ifs.ifbody && !ifs.elsebody && !ifs.param &&
+                    ifs.ifbody.endsWithReturnStatement() && !ifs.ifbody.endsWithReturnStatement().exp &&
+                    !restEndsWithReturn(s.statements, i + 1) && restHasNoReturn(s.statements, i + 1))
+                {
+                    auto rest = Statements();
+                    foreach (st; s.statements[i + 1 .. $])
+                        if (st)
+                            rest.push(st);
+                    auto restStatement = new CompoundStatement(sx.loc, rest.move());
+                    auto cond = doInlineAs!Expression(ifs.condition, ids);
+                    Statement ifbody = doInlineAs!Statement(ifs.ifbody, ids);
+                    if (!ifbody)        // a bare return leaves nothing
+                        ifbody = new CompoundStatement(ifs.loc, Statements());
+                    ids.foundReturn = false;    // the return ends only the if's body
+                    auto elsebody = doInlineAs!Statement(restStatement, ids);
+                    auto ifs2 = new IfStatement(ifs.loc, null, cond, ifbody, elsebody, ifs.endloc);
+                    ids.foundReturn = false;
+                    as.push(ifs2);
+                    break;
+                }
                 as.push(doInlineAs!Statement(sx, ids));
             }
             else
@@ -1636,6 +1660,16 @@ public:
             enum budget = 500;          // cost a function may inline outside loops
             if (fd.inlining == PINLINE.always)
                 return true;
+            // a function literal, written for where it is called
+            if (fd.isFuncLiteralDeclaration())
+                return true;
+            // a nested function given a function literal, as a delegate to call, so the
+            // literal can be inlined into it
+            if (e.arguments && fd.isNested())
+                foreach (arg; *e.arguments)
+                    if (arg && (arg.isFuncExp() ||
+                                arg.isDelegateExp() && arg.isDelegateExp().func.isFuncLiteralDeclaration()))
+                        return true;
             const cost = inlineCostOf(fd);
             if (loopDepth)
             {
@@ -1724,6 +1758,13 @@ public:
                 else
                     return null;
             }
+
+            // a literal called directly, as where a delegate parameter was inlined
+            if (auto fe = e.isFuncExp())
+                return fe.fd;
+            if (auto de = e.isDelegateExp())
+                if (de.func && de.func.isFuncLiteralDeclaration())
+                    return de.func;
 
             /* Pattern match various ASTs looking for indirect function calls, delegate calls,
              * function literal calls, delegate literal calls, and dot member calls.
@@ -2054,6 +2095,28 @@ private void inlineScanModule(Module m, PASS pass, ErrorSink eSink)
  * Whether the statements from index i on end with a return statement,
  * the last of them being one.
  */
+/// Whether statements[i .. $] have no return statement in them
+bool restHasNoReturn(ref Statements statements, size_t i)
+{
+    import dmd.visitor.postorder : walkPostorder;
+    extern (C++) final class Finder : StoppableVisitor
+    {
+        alias visit = typeof(super).visit;
+        extern (D) this() scope {}
+        override void visit(Statement s) {}
+        override void visit(ReturnStatement s) { stop = true; }
+    }
+    foreach (st; statements[i .. $])
+    {
+        if (!st)
+            continue;
+        scope Finder f = new Finder();
+        if (walkPostorder(st, f))
+            return false;
+    }
+    return true;
+}
+
 bool restEndsWithReturn(ref Statements statements, size_t i)
 {
     if (i >= statements.length)
@@ -2483,6 +2546,9 @@ private void expandInline(CallExp ecall, FuncDeclaration fd, FuncDeclaration par
             if (vfrom.type.ty == Tdelegate ||
                 vfrom.type.isPtrToFunction())
             {
+                // the copy keeps its initializer if the function only calls the parameter
+                if (onlyCalled(vfrom, fd))
+                    unchangedCopies[vto] = true;
                 if (auto ve = arg.isVarExp())
                 {
                     if (ve.var.isFuncDeclaration())
@@ -2610,11 +2676,50 @@ private void expandInline(CallExp ecall, FuncDeclaration fd, FuncDeclaration par
  * Returns:
  *      true if v's initializer is the only value assigned to v
  */
-private bool onlyOneAssign(VarDeclaration v, FuncDeclaration fd) @safe
+private bool onlyOneAssign(VarDeclaration v, FuncDeclaration fd) @trusted
 {
     if (!v.type.isMutable())
         return true;            // currently the only case handled atm
-    return false;
+    return (v in unchangedCopies) !is null;
+}
+
+/// The copies of parameters made by inlining that are never changed
+private __gshared bool[VarDeclaration] unchangedCopies;
+
+/**
+ * Whether parameter v of fd is only ever called, so it holds its argument throughout
+ */
+private bool onlyCalled(VarDeclaration v, FuncDeclaration fd)
+{
+    import dmd.visitor.foreachvar : foreachExpAndVar;
+    import dmd.visitor.postorder : walkPostorder;
+    if (!fd.fbody || v.storage_class & (STC.ref_ | STC.out_ | STC.lazy_))
+        return false;
+    extern (C++) final class Uses : StoppableVisitor
+    {
+        alias visit = typeof(super).visit;
+        VarDeclaration v;
+        int called, all;
+        extern (D) this(VarDeclaration v) scope { this.v = v; }
+        override void visit(Expression e) {}
+        override void visit(VarExp e) { if (e.var == v) ++all; }
+        override void visit(SymOffExp e) { if (e.var == v) all += 2; }     // the address taken
+        override void visit(CallExp e)
+        {
+            if (auto ve = e.e1.isVarExp())
+                if (ve.var == v)
+                    ++called;
+        }
+    }
+    scope Uses u = new Uses(v);
+    bool complex;
+    foreachExpAndVar(fd.fbody, (Expression e) { walkPostorder(e, u); },
+        (VarDeclaration d) {
+            if (d._init)
+                if (auto ie = d._init.isExpInitializer())
+                    walkPostorder(ie.exp, u);
+        });
+    return u.all == u.called;
 }
 
 /************************************************************
