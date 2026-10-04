@@ -471,6 +471,22 @@ public:
             result = null;  // cannot be inlined as an Expression
     }
 
+    override void visit(BreakStatement s)
+    {
+        static if (asStatements)
+            result = new BreakStatement(s.loc, null);
+        else
+            result = null;  // cannot be inlined as an Expression
+    }
+
+    override void visit(ContinueStatement s)
+    {
+        static if (asStatements)
+            result = new ContinueStatement(s.loc, null);
+        else
+            result = null;  // cannot be inlined as an Expression
+    }
+
     override void visit(ThrowStatement s)
     {
         //printf("ThrowStatement.doInlineAs!%s() '%s'\n", Result.stringof.ptr, s.exp.toChars());

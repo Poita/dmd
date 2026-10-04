@@ -91,6 +91,9 @@ int inlineCostFunction(FuncDeclaration fd, bool hasThis)
     // only for the nested functions and literals that callbacks are written as
     icv.earlyReturns = fd.isNested() || fd.isFuncLiteralDeclaration();
     fd.fbody.accept(icv);
+    // a function whose loops are left by break or continue only if it is small
+    if (icv.leavesLoops && tooCostlyOutsideLoops(icv.cost))
+        return COST_MAX;
     return icv.cost;
 }
 
@@ -161,6 +164,7 @@ public:
 
     int nested;
     int cost;           // zero start for subsequent AST
+    bool leavesLoops;   // whether a loop is left by break or continue
 
     extern (D) this(bool hasThis) scope @safe
     {
@@ -243,6 +247,7 @@ public:
             }
         }
         cost += icv.cost;
+        leavesLoops |= icv.leavesLoops;
     }
 
     override void visit(UnrolledLoopStatement s)
@@ -258,6 +263,7 @@ public:
             }
         }
         cost += icv.cost;
+        leavesLoops |= icv.leavesLoops;
     }
 
     override void visit(ScopeStatement s)
@@ -339,6 +345,31 @@ public:
         //printf("ForStatement: inlineCost = %d\n", cost);
     }
 
+    /* A break or continue of a loop of the function, as it is not labeled, leaves the
+     * same loop wherever the function is inlined
+     */
+    override void visit(BreakStatement s)
+    {
+        if (s.ident || !nested)
+            cost = COST_MAX;
+        else
+        {
+            cost++;
+            leavesLoops = true;
+        }
+    }
+
+    override void visit(ContinueStatement s)
+    {
+        if (s.ident || !nested)
+            cost = COST_MAX;
+        else
+        {
+            cost++;
+            leavesLoops = true;
+        }
+    }
+
     override void visit(ThrowStatement s)
     {
         cost++;
@@ -374,6 +405,7 @@ public:
             scope LambdaInlineCost lic = new LambdaInlineCost(icv);
             walkPostorder(e, lic);
             cost += icv.cost;
+            leavesLoops |= icv.leavesLoops;
         }
     }
 
