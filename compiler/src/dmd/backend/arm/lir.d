@@ -1240,7 +1240,10 @@ private void select()
                 }
                 Reg r = gen(e);
                 if (tyfloating(ty))
+                {
                     emitIns(LOp.copy, tysize(ty), phys(32), r);
+                    hintCopy(r, phys(32));
+                }
                 else
                 {
                     const sz = tysize(ty);
@@ -1248,6 +1251,7 @@ private void select()
                         // the caller expects a value narrower than 32 bits extended to 32
                         r = extend(r, ty, 4);
                     emitIns(LOp.copy, 8, phys(0), r);
+                    hintCopy(r, phys(0));
                 }
                 break;
             }
@@ -2924,8 +2928,15 @@ private Reg genx(elem* e)
             {
                 // CSEL/FCSEL of both arms, evaluated after the comparison sets the flags
                 const c = compare(e.E1);
-                Reg a = gen(e.E2.E1);
-                Reg b = gen(e.E2.E2);
+                // an integer 0 is the zero register
+                Reg arm(elem* x)
+                {
+                    if (rc == RC.gp && x.Eoper == OPconst && el_tolong(x) == 0)
+                        return phys(31);
+                    return gen(x);
+                }
+                Reg a = arm(e.E2.E1);
+                Reg b = arm(e.E2.E2);
                 Reg d = newVreg(rc, sz);
                 auto i = emitIns(rc == RC.fp ? LOp.fcsel : LOp.csel, rc == RC.fp ? sz : (sz <= 4 ? 4 : 8), d, a, b);
                 i.cond = c;
@@ -3545,7 +3556,7 @@ private Reg arith(OPER op, tym_t ty, Reg a, elem* e2, Reg b, tym_t ty1)
         // e2 is a constant, used as an immediate operand if it can be
         if (!fp)
         {
-            long v = el_tolong(e2);
+            long v = addend(lop, el_tolong(e2), sz);
             const narrowShr = sz < 4 && (lop == LOp.lsrv || lop == LOp.asrv);
             LOp iop = narrowShr ? LOp.nop : immForm(lop, v, isz);
             if (iop != LOp.nop)
@@ -3586,6 +3597,16 @@ private Reg arith(OPER op, tym_t ty, Reg a, elem* e2, Reg b, tym_t ty1)
     }
     emitIns(lop, isz, d, a, b);
     return d;
+}
+
+/* The constant v of an operation lop of size sz, as an addend in 32 bits or fewer is
+ * sign extended: adding the unsigned 0xFFFF_FFFE is subtracting 2
+ */
+private long addend(LOp lop, long v, uint sz)
+{
+    if ((lop == LOp.add || lop == LOp.sub) && sz <= 4)
+        return (v << (64 - sz * 8)) >> (64 - sz * 8);
+    return v;
 }
 
 /* The immediate form of lop for the constant v, or LOp.nop
@@ -3664,8 +3685,8 @@ private Reg genBinary(elem* e)
     if (!tyfloating(ty) && e2.Eoper == OPconst)
     {
         const isz = sz <= 4 ? 4 : 8;
-        long v = el_tolong(e2);
         LOp lop = binop(op, ty);
+        long v = addend(lop, el_tolong(e2), sz);
         bool narrowShr = sz < 4 && (lop == LOp.lsrv || lop == LOp.asrv);
         LOp iop = narrowShr ? LOp.nop : immForm(lop, v, isz);
         if (iop != LOp.nop)
