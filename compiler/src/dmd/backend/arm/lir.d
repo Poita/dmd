@@ -290,6 +290,8 @@ bool lirCodegen(ref CGstate cg)
         foldAddresses();
         numberValues();
         reuseInvariantLoads();
+        removeBoundsChecks();
+        removeUnreachable();
         removeDead();
     }
     if (failed)
@@ -4956,6 +4958,253 @@ private void reuseInvariantLoads()
         mem_free(lp.body.ptr);
     loops.dtor(); preds.dtor(); predStart.dtor(); ndefs.dtor(); subst.dtor();
     inLoop.dtor(); defInLoop.dtor(); preLoads.dtor();
+}
+
+/* Whether cmp and the branch br after it branch when unsigned l > x, as cmp l, x; b.hi or
+ * cmp x, l; b.lo of 64 bits
+ */
+private bool lessThan(ref const LIns cmp, ref const LIns br, out Reg l, out Reg x)
+{
+    if (cmp.op != LOp.cmp || cmp.sz != 8 || br.op != LOp.bcond || !cmp.a || !cmp.b)
+        return false;
+    if (br.cond == COND.hi)
+    {
+        l = cmp.a;
+        x = cmp.b;
+        return true;
+    }
+    if (br.cond == COND.cc)     // LO
+    {
+        l = cmp.b;
+        x = cmp.a;
+        return true;
+    }
+    return false;
+}
+
+/* In a loop that goes round again only while invariant L > V (unsigned), and is entered
+ * only when L > V, a comparison of L > V at its start, before V changes, is true: the
+ * branch on it is always taken. This removes the array bounds checks of the index of a
+ * loop over the array.
+ */
+@trusted
+private void removeBoundsChecks()
+{
+    buildSegments();
+    const ns = segStart.length - 1;
+    if (ns < 2)
+        return;
+    Barray!uint predStart, preds;
+    Barray!Loop loops;
+    findLoops(predStart, preds, loops);
+    if (!loops.length)
+    {
+        preds.dtor(); predStart.dtor(); loops.dtor();
+        return;
+    }
+    // the single definitions that are copies, and the definitions of each register
+    Barray!uint ndefs;
+    ndefs.setLength(vinfo.length);
+    ndefs[][] = 0;
+    foreach (ref i; ins[])
+        if (i.d && !isPhys(i.d))
+            ++ndefs[i.d - firstVreg];
+    Barray!Reg copySrc;     // the register each single definition copies, or noReg
+    copySrc.setLength(vinfo.length);
+    copySrc[][] = noReg;
+    foreach (ref i; ins[])
+        if (i.d && !isPhys(i.d) && ndefs[i.d - firstVreg] == 1 && i.op == LOp.copy && i.a && !isPhys(i.a) &&
+            !(i.flags & F.condDef))
+            copySrc[i.d - firstVreg] = i.a;
+    Reg copied(Reg r)       // the register r is a copy of, or r
+    {
+        if (r && !isPhys(r) && copySrc[r - firstVreg])
+            return copySrc[r - firstVreg];
+        return r;
+    }
+    Barray!bool inLoop;
+    inLoop.setLength(ns);
+    foreach (ref lp; loops[])
+    {
+        inLoop[][] = false;
+        foreach (v; lp.body)
+            inLoop[v] = true;
+        // the one segment going back to the header, ending in cmp L, X; bcond hi -> header
+        uint latch = uint.max;
+        bool bad;
+        foreach (v; lp.body)
+            foreach (t; segSucc[segSuccStart[v] .. segSuccStart[v + 1]])
+                if (t == lp.header)
+                {
+                    if (latch != uint.max && latch != v)
+                        bad = true;
+                    latch = v;
+                }
+        if (bad || latch == uint.max)
+            continue;
+        const lend = segEnd(latch);
+        if (lend < segStart[latch] + 2)
+            continue;
+        const LIns* br = &ins[lend - 1];
+        const LIns* cmp = &ins[lend - 2];
+        // cmp L, X; b.hi or cmp X, L; b.lo: L > X
+        Reg cmpL, cmpX;
+        if (!lessThan(*cmp, *br, cmpL, cmpX))
+            continue;
+        const L = cmpL;
+        const V = copied(cmpX);
+        if (!L || isPhys(L) || !V || isPhys(V) || V == L)
+            continue;
+        // the branch goes back: the latch falls through out of the loop
+        if (latch + 1 < ns && inLoop[latch + 1])
+            continue;
+        // L is invariant, and V is not changed after the comparison's copy of it in the latch
+        bool lDefined;
+        foreach (v; lp.body)
+            foreach (n; segStart[v] .. segEnd(v))
+                if (ins[n].d == L)
+                    lDefined = true;
+        if (lDefined)
+            continue;
+        bool vAfter;
+        foreach (n; segStart[latch] .. lend)
+            if (ins[n].d == cmpX)
+            {
+                foreach (m; n + 1 .. lend)
+                    if (ins[m].d == V)
+                        vAfter = true;
+            }
+        if (vAfter)
+            continue;
+
+        // entered only when L > V: from a preheader ending in cbz L with V 0, or in the comparison
+        uint pre = uint.max;
+        foreach (p; preds[predStart[lp.header] .. predStart[lp.header + 1]])
+            if (!inLoop[p])
+            {
+                if (pre != uint.max)
+                    bad = true;
+                pre = p;
+            }
+        if (bad || pre == uint.max)
+            continue;
+        const pend = segEnd(pre);
+        if (pend <= segStart[pre])
+            continue;
+        const LIns* g = &ins[pend - 1];
+        bool entered;
+        if (g.op == LOp.cbz && g.cond == COND.eq && g.a == L && pre + 1 == lp.header)
+        {
+            // L != 0, and every definition of V outside the loop is 0
+            entered = true;
+            foreach (si; 0 .. ns)
+            {
+                if (inLoop[si])
+                    continue;
+                foreach (n; segStart[si] .. segEnd(si))
+                {
+                    const LIns* i = &ins[n];
+                    if (i.d != V)
+                        continue;
+                    Reg src = i.op == LOp.copy ? i.a : noReg;
+                    bool zero = i.op == LOp.movi && i.imm == 0;
+                    if (src && !isPhys(src) && ndefs[src - firstVreg] == 1)
+                        foreach (ref j; ins[])
+                            if (j.d == src)
+                                zero = j.op == LOp.movi && j.imm == 0;
+                    if (!zero)
+                        entered = false;
+                }
+            }
+        }
+        if (!entered)
+            continue;
+
+        // the comparisons at the start of the header, before V changes
+        foreach (n; segStart[lp.header] .. segEnd(lp.header))
+        {
+            LIns* i = &ins[n];
+            if (i.d == V)
+                break;
+            Reg hl, hx;
+            if (i.op == LOp.cmp && n + 1 < segEnd(lp.header) && lessThan(*i, ins[n + 1], hl, hx) &&
+                hl == L && copied(hx) == V)
+            {
+                LIns* b = &ins[n + 1];
+                // nothing else after the branch uses the flags
+                const LOp after = n + 2 < ins.length ? ins[n + 2].op : LOp.nop;
+                const flagsUsed = after == LOp.csel || after == LOp.cset || after == LOp.fcsel ||
+                                  after == LOp.bcond;
+                if (!flagsUsed)
+                {
+                    b.op = LOp.br;          // always taken
+                    b.cond = COND.al;
+                    i.op = LOp.nop;
+                }
+            }
+        }
+    }
+    foreach (ref lp; loops[])
+        mem_free(lp.body.ptr);
+    loops.dtor(); preds.dtor(); predStart.dtor(); ndefs.dtor(); inLoop.dtor(); copySrc.dtor();
+}
+
+/* Remove the code of the segments nothing reaches, and the branches to labels
+ * right after them
+ */
+@trusted
+private void removeUnreachable()
+{
+    buildSegments();
+    const ns = segStart.length - 1;
+    if (ns < 2)
+        return;
+    Barray!bool reached;
+    reached.setLength(ns);
+    reached[][] = false;
+    Barray!uint work;
+    reached[0] = true;
+    work.push(0);
+    while (work.length)
+    {
+        const v = work[work.length - 1];
+        work.setLength(work.length - 1);
+        foreach (t; segSucc[segSuccStart[v] .. segSuccStart[v + 1]])
+            if (!reached[t])
+            {
+                reached[t] = true;
+                work.push(t);
+            }
+    }
+    foreach (si; 0 .. ns)
+        if (!reached[si])
+            foreach (n; segStart[si] .. segEnd(si))
+                if (ins[n].op != LOp.label)
+                {
+                    ins[n].op = LOp.nop;
+                    ins[n].d = ins[n].a = ins[n].b = ins[n].c = noReg;
+                }
+    // a branch to a label only labels and nothing come before
+    foreach (bi; 0 .. blocks.length)
+        foreach (n; blockStart[bi] .. blockStart[bi + 1])
+        {
+            LIns* i = &ins[n];
+            if (i.op != LOp.br || !(i.flags & F.toLabel))
+                continue;
+            foreach (m; n + 1 .. blockStart[bi + 1])
+            {
+                const LIns* x = &ins[m];
+                if (x.op == LOp.label && x.target == i.target)
+                {
+                    i.op = LOp.nop;
+                    break;
+                }
+                if (x.op != LOp.nop && x.op != LOp.label)
+                    break;
+            }
+        }
+    reached.dtor();
+    work.dtor();
 }
 
 /* Remove the instructions without side effects whose results are not used
