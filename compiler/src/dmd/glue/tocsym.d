@@ -350,7 +350,7 @@ Symbol* toSymbol(Dsymbol s)
                 s.Sclass = SC.auto_;
                 s.Sfl = FL.auto_;
 
-                if (vd.nestedrefs.length)
+                if (referencedFromNested(vd))
                 {
                     /* Symbol is accessed by a nested function. Make sure
                      * it is not put in a register, and that the optimizer
@@ -680,7 +680,7 @@ Symbol* toSymbolNRVO(Dsymbol s)
              * Consider the variable volatile in the same way
              * other variables with nested ref do.
              */
-            if (var.nestedrefs.length)
+            if (referencedFromNested(var))
                 type_setcv(&shidden.Stype, shidden.Stype.Tty | mTYvolatile);
 
             return shidden;
@@ -996,4 +996,17 @@ Classsym* fake_classsym(Identifier id)
     assert(t.Tmangle == 0);
     t.Tmangle = Mangle.d;
     return t.Ttag;
+}
+
+/// The nested functions nothing refers to once the function they are in is inlined into,
+/// which are not compiled, and do not keep the variables they refer to in memory
+__gshared bool[void*] unusedNestedFuncs;
+
+/// Whether a nested function that is compiled refers to v
+bool referencedFromNested(VarDeclaration v)
+{
+    foreach (f; v.nestedrefs)
+        if (!(cast(void*)f in unusedNestedFuncs))
+            return true;
+    return false;
 }

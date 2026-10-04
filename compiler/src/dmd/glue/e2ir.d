@@ -4665,7 +4665,8 @@ elem* Dsymbol_toElem(Dsymbol s, ref IRState irs)
     else if (auto fd = s.isFuncDeclaration())
     {
         //printf("function %s\n", fd.toChars());
-        irs.deferToObj.push(fd);
+        if (!(cast(void*)fd in unusedNestedFuncs))
+            irs.deferToObj.push(fd);
     }
     else if (auto ad = s.isAttribDeclaration())
     {

@@ -609,6 +609,7 @@ void FuncDeclaration_toObjFile(FuncDeclaration fd, bool multiobj)
 
     // start code generation
     fd.semanticRun = PASS.obj;
+    findUnusedNested(fd);
 
     if (global.params.v.verbose)
     {
@@ -751,7 +752,7 @@ void FuncDeclaration_toObjFile(FuncDeclaration fd, bool multiobj)
         }
         shidden = symbol_name(name, SC.parameter, thidden);
         shidden.Sflags |= SFLtrue | SFLfree | SFLhidden;
-        if (fd.isNRVO && fd.nrvo_var && fd.nrvo_var.nestedrefs.length)
+        if (fd.isNRVO && fd.nrvo_var && referencedFromNested(fd.nrvo_var))
             type_setcv(&shidden.Stype, shidden.Stype.Tty | mTYvolatile);
         irs.shidden = shidden;
         fd.shidden = shidden;
@@ -1958,4 +1959,104 @@ private elem* toEfilename(Module m)
 
     // Turn static array into dynamic array
     return el_pair(TYdarray, el_long(TYsize_t, len), el_ptr(msfilename));
+}
+
+/**
+ * Find the functions nested in fd that nothing refers to, as every call of them was
+ * inlined, and add them to unusedNestedFuncs. Only for a body declaring nothing but
+ * variables and functions, so no code outside it can refer to them.
+ */
+private void findUnusedNested(FuncDeclaration fd)
+{
+    import dmd.visitor.foreachvar : foreachExpAndVar;
+    import dmd.visitor.postorder : walkPostorder;
+    import dmd.visitor : StoppableVisitor;
+    import dmd.funcsem : needsClosure;
+    import dmd.dsymbolsem : toAlias;
+
+    if (!fd.fbody || fd.hasInlineAsm || fd.needsClosure())
+        return;
+    bool simple = true;
+    FuncDeclarations declared;
+    FuncDeclarations work;
+    bool[void*] referred;
+    void refer(FuncDeclaration f)
+    {
+        if (f && !(cast(void*)f in referred))
+        {
+            referred[cast(void*)f] = true;
+            work.push(f);
+        }
+    }
+
+    extern (C++) final class Refs : StoppableVisitor
+    {
+        alias visit = typeof(super).visit;
+        extern (D) void delegate(FuncDeclaration) dgRefer;
+        extern (D) void delegate(FuncDeclaration) dgDeclare;
+        extern (D) void delegate(Expression) dgInit;
+        extern (D) void delegate() dgComplex;
+        extern (D) this() scope {}
+        override void visit(Expression e) {}
+        override void visit(VarExp e) { dgRefer(e.var.isFuncDeclaration()); }
+        override void visit(SymOffExp e) { dgRefer(e.var.isFuncDeclaration()); }
+        override void visit(DotVarExp e) { dgRefer(e.var.isFuncDeclaration()); }
+        override void visit(DelegateExp e) { dgRefer(e.func); }
+        override void visit(FuncExp e) { dgRefer(e.fd); }
+        override void visit(CallExp e) { dgRefer(e.f); }
+        override void visit(DeclarationExp e)
+        {
+            if (auto v = e.declaration.isVarDeclaration())
+            {
+                if (v.toAlias() != v)
+                    dgComplex();
+                else if (v._init)
+                    if (auto ie = v._init.isExpInitializer())
+                        dgInit(ie.exp);
+            }
+            else if (auto f = e.declaration.isFuncDeclaration())
+            {
+                if (!f.isFuncLiteralDeclaration())
+                    dgDeclare(f);
+            }
+            else
+                dgComplex();
+        }
+    }
+    scope Refs refs = new Refs();
+    void walk(Expression e)
+    {
+        if (e)
+            walkPostorder(e, refs);
+    }
+    refs.dgRefer = &refer;
+    refs.dgDeclare = (FuncDeclaration f) { declared.push(f); };
+    refs.dgInit = &walk;
+    refs.dgComplex = () { simple = false; };
+    void scan(Statement s)
+    {
+        foreachExpAndVar(s, &walk, (VarDeclaration v) {
+            if (v._init)
+                if (auto ie = v._init.isExpInitializer())
+                    walk(ie.exp);
+        });
+    }
+
+    scan(fd.fbody);
+    // what the functions nested in fd that are referred to refer to
+    while (work.length)
+    {
+        auto f = work.pop();
+        if (f.fbody && f != fd && f.toParent2() == fd)
+        {
+            if (f.hasInlineAsm)
+                return;
+            scan(f.fbody);
+        }
+    }
+    if (!simple)
+        return;
+    foreach (f; declared)
+        if (!(cast(void*)f in referred) && f.toParent2() == fd)
+            unusedNestedFuncs[cast(void*)f] = true;
 }
