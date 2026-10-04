@@ -1230,9 +1230,30 @@ private bool cheapArm(const(elem)* x, ref int budget)
         case OPs16_32: case OPu16_32: case OP32_16:
         case OPs8_16: case OPu8_16: case OP16_8:
             return cheapArm(x.E1, budget);
+        case OPcond:
+            // a select itself, of a comparison without side effects
+            return x.E1.Eoper >= OPle && x.E1.Eoper <= OPne && !el_sideeffect(cast(elem*)x.E1) &&
+                   scalarType(x.E1.E1.Ety) && !pairType(x.E1.E1.Ety) &&
+                   scalarType(x.Ety) && !pairType(x.Ety) &&
+                   cheapArm(x.E1.E1, budget) && cheapArm(x.E1.E2, budget) &&
+                   cheapArm(x.E2.E1, budget) && cheapArm(x.E2.E2, budget);
         default:
             return false;
     }
+}
+
+/* Whether x has a select in it, which changes the flags
+ */
+@trusted
+private bool hasSelect(const(elem)* x)
+{
+    if (x.Eoper == OPcond)
+        return true;
+    if (OTunary(x.Eoper))
+        return hasSelect(x.E1);
+    if (OTbinary(x.Eoper))
+        return hasSelect(x.E1) || hasSelect(x.E2);
+    return false;
 }
 
 /* The assignment of block b to a whole register variable of a cheap value, b's only
@@ -1337,9 +1358,22 @@ private bool ifConvert(block* b)
     if (af)
         collectAssigned(af);
     // the comparison, side effects and all, before the values, which change no flags
+    // unless they are selects themselves
+    const early = at && hasSelect(at.E2) || af && hasSelect(af.E2);
+    if (early && el_sideeffect(c))
+        return false;
+    Reg vt, vf;
+    if (early)
+    {
+        vt = at ? gen(at.E2) : noReg;
+        vf = af ? gen(af.E2) : noReg;
+    }
     const cond = compare(c);
-    Reg vt = at ? gen(at.E2) : noReg;
-    Reg vf = af ? gen(af.E2) : noReg;
+    if (!early)
+    {
+        vt = at ? gen(at.E2) : noReg;
+        vf = af ? gen(af.E2) : noReg;
+    }
     void assign(elem* a, Reg v, bool whenTrue)
     {
         Reg r = varReg(a.E1.Vsym);
@@ -3342,7 +3376,17 @@ private Reg genx(elem* e)
         {
             if (selectable(e))
             {
-                // CSEL/FCSEL of both arms, evaluated after the comparison sets the flags
+                // CSEL/FCSEL of both arms, evaluated after the comparison sets the flags,
+                // or before it if they are selects themselves
+                const early = hasSelect(e.E2.E1) || hasSelect(e.E2.E2);
+                if (early && el_sideeffect(e.E1))
+                    goto Lbranches;
+                Reg ea, eb;
+                if (early)
+                {
+                    ea = gen(e.E2.E1);
+                    eb = gen(e.E2.E2);
+                }
                 const c = compare(e.E1);
                 // an integer 0 is the zero register
                 Reg arm(elem* x)
@@ -3351,13 +3395,14 @@ private Reg genx(elem* e)
                         return phys(31);
                     return gen(x);
                 }
-                Reg a = arm(e.E2.E1);
-                Reg b = arm(e.E2.E2);
+                Reg a = early ? ea : arm(e.E2.E1);
+                Reg b = early ? eb : arm(e.E2.E2);
                 Reg d = newVreg(rc, sz);
                 auto i = emitIns(rc == RC.fp ? LOp.fcsel : LOp.csel, rc == RC.fp ? sz : (sz <= 4 ? 4 : 8), d, a, b);
                 i.cond = c;
                 return d;
             }
+        Lbranches:
             Reg d = newVreg(rc, sz);
             const lfalse = newLabel();
             const lend = newLabel();
@@ -3460,7 +3505,7 @@ private bool selectable(const(elem)* e)
     if (!scalarType(c.E1.Ety) || pairType(c.E1.Ety))
         return false;
     const ty = tybasic(e.Ety);
-    int budget = 4;
+    int budget = 7;     // room for a select in an arm
     return scalarType(ty) && !pairType(ty) && cheapArm(e.E2.E1, budget) && cheapArm(e.E2.E2, budget);
 }
 
