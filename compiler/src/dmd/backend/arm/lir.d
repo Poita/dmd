@@ -369,6 +369,8 @@ private bool supported(ref CGstate cg)
             case SC.fastpar:
                 break;
             default:
+                if (getenv("DMD_NEWCG_WHY"))
+                    fprintf(stderr, "newcg-symclass: %s %d\n", s.Sident.ptr, s.Sclass);
                 whyNot = "symbol class";
                 return false;
         }
@@ -509,6 +511,13 @@ private bool supportedElem(const(elem)* e)
             {
                 if (!supportedCallee(e.E1))
                 {
+                    if (getenv("DMD_NEWCG_WHY"))
+                    {
+                        import dmd.backend.debugprint : WReqn;
+                        fprintf(stderr, "newcg-callee: ");
+                        WReqn(cast(elem*)e.E1);
+                        fprintf(stderr, "\n");
+                    }
                     whyNot = "callee";
                     return false;
                 }
@@ -1195,6 +1204,204 @@ private void jumpToBlock(block* b, COND cond = COND.al)
     i.target = b.Bdfoidx;
 }
 
+/* The blocks done as selects by their predecessors
+ */
+private __gshared Barray!bool skipBlock;
+
+/* The cheap value of an arm of a select: no side effects or faults, few operations
+ */
+@trusted
+private bool cheapArm(const(elem)* x, ref int budget)
+{
+    if (--budget < 0)
+        return false;
+    switch (x.Eoper)
+    {
+        case OPconst:
+            return true;
+        case OPvar:
+            return !(x.Vsym.ty() & mTYvolatile) && varSupported(x.Vsym);
+        case OPadd: case OPmin: case OPand: case OPor: case OPxor:
+        case OPmul:
+            return cheapArm(x.E1, budget) && cheapArm(x.E2, budget);
+        case OPshl: case OPshr: case OPashr:
+            return x.E2.Eoper == OPconst && cheapArm(x.E1, budget);
+        case OPneg: case OPcom:
+        case OPs32_64: case OPu32_64: case OP64_32:
+        case OPs16_32: case OPu16_32: case OP32_16:
+        case OPs8_16: case OPu8_16: case OP16_8:
+            return cheapArm(x.E1, budget);
+        default:
+            return false;
+    }
+}
+
+/* The assignment of block b to a whole register variable of a cheap value, b's only
+ * code but for the comparison it may end in, tail, or null
+ */
+@trusted
+private elem* selectableAssign(block* b, block* pred, out elem* tail)
+{
+    if (b.Btry || b.Bpred.length != 1 || b.Bpred[0] != pred || !b.Belem)
+        return null;
+    elem* a = b.Belem;
+    elem* t;
+    if (b.bc == BC.iftrue)
+    {
+        if (a.Eoper != OPcomma)
+            return null;
+        t = a.E2;
+        a = a.E1;
+    }
+    else if (b.bc != BC.goto_)
+        return null;
+    if (a.Eoper != OPeq || a.Ecount || a.E1.Eoper != OPvar || a.E1.Voffset)
+        return null;
+    const ty = tybasic(a.E1.Ety);
+    if (!scalarType(ty) || pairType(ty) || tyaggregate(ty))
+        return null;
+    Reg r = varReg(a.E1.Vsym);
+    if (!r || tysize(ty) != type_size(a.E1.Vsym.Stype) || (rcOf(r) == RC.fp) != (tyfloating(ty) != 0))
+        return null;
+    // an operation at most, as both arms are evaluated
+    int budget = 2;
+    if (!cheapArm(a.E2, budget))
+        return null;
+    tail = t;
+    return a;
+}
+
+/* Do block b, ending in a comparison choosing between blocks that each assign a
+ * register variable a cheap value and go on to the same block, with selects instead
+ */
+@trusted
+private bool ifConvert(block* b)
+{
+    block* bt = b.Bsucc[0];
+    block* bf = b.Bsucc[1];
+    elem* c = b.Belem;
+    if (!c || c.Eoper < OPle || c.Eoper > OPne || !scalarType(c.E1.Ety) || pairType(c.E1.Ety) ||
+        bt == b || bf == b || bt == bf)
+        return false;
+    elem* tailT, tailF;
+    elem* at = selectableAssign(bt, b, tailT);
+    elem* af = selectableAssign(bf, b, tailF);
+    block* join;
+    elem* tail;         // the comparison both end in, choosing between their successors
+    block* st, sf;      // its successors
+    if (tailT || tailF)
+    {
+        if (!at || !af)
+            return false;
+        // an arm going to a block that only compares ends in that comparison
+        block*[2] succT = [bt.Bsucc[0], bt.Bsucc.length > 1 ? bt.Bsucc[1] : null];
+        block*[2] succF = [bf.Bsucc[0], bf.Bsucc.length > 1 ? bf.Bsucc[1] : null];
+        void through(block* arm, ref elem* t, ref block*[2] succ)
+        {
+            if (t || arm.bc != BC.goto_)
+                return;
+            block* j = arm.Bsucc[0];
+            if (j.bc == BC.iftrue && j.Belem && j.Belem.Eoper != OPcomma && !j.Btry)
+            {
+                t = j.Belem;
+                succ = [j.Bsucc[0], j.Bsucc[1]];
+            }
+        }
+        if (at)
+            through(bt, tailT, succT);
+        if (af)
+            through(bf, tailF, succF);
+        if (!tailT || !tailF || !el_match(tailT, tailF) ||
+            succT[0] != succF[0] || succT[1] != succF[1])
+            return false;
+        tail = tailT;
+        st = succT[0];
+        sf = succT[1];
+    }
+    else if (at && af && bt.Bsucc[0] == bf.Bsucc[0])
+        join = bt.Bsucc[0];
+    else if (at && bt.Bsucc[0] == bf)
+    {
+        af = null;
+        join = bf;
+    }
+    else if (af && bf.Bsucc[0] == bt)
+    {
+        at = null;
+        join = bt;
+    }
+    else
+        return false;
+
+    if (at)
+        collectAssigned(at);
+    if (af)
+        collectAssigned(af);
+    // the comparison, side effects and all, before the values, which change no flags
+    const cond = compare(c);
+    Reg vt = at ? gen(at.E2) : noReg;
+    Reg vf = af ? gen(af.E2) : noReg;
+    void assign(elem* a, Reg v, bool whenTrue)
+    {
+        Reg r = varReg(a.E1.Vsym);
+        const sz = tysize(a.E1.Ety);
+        const fp = rcOf(r) == RC.fp;
+        v = asClass(v, rcOf(r), sz);
+        const isz = fp ? sz : (sz <= 4 ? 4 : 8);
+        Reg d = newVreg(rcOf(r), isz);
+        auto i = emitIns(fp ? LOp.fcsel : LOp.csel, isz, d, whenTrue ? v : r, whenTrue ? r : v);
+        i.cond = cond;
+        copyOut(r, d, fp ? sz : 8);
+        hintCopy(r, d);
+    }
+    if (at && af && at.E1.Vsym == af.E1.Vsym)
+    {
+        // the same variable either way
+        Reg r = varReg(at.E1.Vsym);
+        const sz = tysize(at.E1.Ety);
+        const fp = rcOf(r) == RC.fp;
+        const isz = fp ? sz : (sz <= 4 ? 4 : 8);
+        Reg d = newVreg(rcOf(r), isz);
+        auto i = emitIns(fp ? LOp.fcsel : LOp.csel, isz, d, asClass(vt, rcOf(r), sz), asClass(vf, rcOf(r), sz));
+        i.cond = cond;
+        copyOut(r, d, fp ? sz : 8);
+        hintCopy(r, d);
+    }
+    else
+    {
+        if (at)
+            assign(at, vt, true);
+        if (af)
+            assign(af, vf, false);
+    }
+    if (at)
+        skipBlock[bt.Bdfoidx] = true;
+    if (af)
+        skipBlock[bf.Bdfoidx] = true;
+    // the next block with code
+    size_t k = b.Bdfoidx + 1;
+    while (k < blocks.length && skipBlock[k])
+        ++k;
+    block* next = k < blocks.length ? blocks[k] : null;
+    if (tail)
+    {
+        // the comparison the arms end in, as the arms' block would do it
+        if (st == next)
+            genCondBlock(tail, false, sf);
+        else
+        {
+            genCondBlock(tail, true, st);
+            if (sf != next)
+                jumpToBlock(sf);
+        }
+        return true;
+    }
+    // on to the join, unless it is the next block with code
+    if (next !is join)
+        jumpToBlock(join);
+    return true;
+}
+
 /* Select the instructions of all the blocks
  */
 @trusted
@@ -1233,11 +1440,15 @@ private void select()
     paramEnd = cast(uint)ins.length;
     hoisted.setLength(0);
 
+    skipBlock.setLength(blocks.length);
+    skipBlock[][] = false;
     foreach (bi, b; blocks[])
     {
         curBlock = cast(uint)bi;
         if (bi)
             blockStart.push(cast(uint)ins.length);
+        if (skipBlock[bi])
+            continue;       // done as a select by its predecessor
         blockAssigned.setLength(0);
         if (b.Belem)
             collectAssigned(b.Belem);
@@ -1255,6 +1466,8 @@ private void select()
             {
                 block* bt = b.Bsucc[0];
                 block* bf = b.Bsucc[1];
+                if (ifConvert(b))
+                    break;
                 if (bt == next)
                     genCondBlock(b.Belem, false, bf);
                 else
@@ -3247,33 +3460,9 @@ private bool selectable(const(elem)* e)
         return false;
     if (!scalarType(c.E1.Ety) || pairType(c.E1.Ety))
         return false;
-    int budget = 4;
-    bool cheap(const(elem)* x)
-    {
-        if (--budget < 0)
-            return false;
-        switch (x.Eoper)
-        {
-            case OPconst:
-                return true;
-            case OPvar:
-                return !(x.Vsym.ty() & mTYvolatile) && varSupported(x.Vsym);
-            case OPadd: case OPmin: case OPand: case OPor: case OPxor:
-            case OPmul:
-                return cheap(x.E1) && cheap(x.E2);
-            case OPshl: case OPshr: case OPashr:
-                return x.E2.Eoper == OPconst && cheap(x.E1);
-            case OPneg: case OPcom:
-            case OPs32_64: case OPu32_64: case OP64_32:
-            case OPs16_32: case OPu16_32: case OP32_16:
-            case OPs8_16: case OPu8_16: case OP16_8:
-                return cheap(x.E1);
-            default:
-                return false;
-        }
-    }
     const ty = tybasic(e.Ety);
-    return scalarType(ty) && !pairType(ty) && cheap(e.E2.E1) && cheap(e.E2.E2);
+    int budget = 4;
+    return scalarType(ty) && !pairType(ty) && cheapArm(e.E2.E1, budget) && cheapArm(e.E2.E2, budget);
 }
 
 /* The register made on entry for a constant that takes more than one instruction
