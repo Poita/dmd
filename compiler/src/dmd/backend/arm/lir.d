@@ -4375,19 +4375,16 @@ private bool pureOp(ref const LIns i)
     }
 }
 
-/* Move the instructions computing the same value on every iteration of a loop
- * to before the loop
+/// A loop of segments: its header, and all the segments reaching a back edge to it
+struct Loop { uint header; uint size; uint[] body; }
+
+/* The predecessors of each segment, and the loops, smallest first; buildSegments() has run
  */
 @trusted
-private void hoistInvariants()
+private void findLoops(ref Barray!uint predStart, ref Barray!uint preds, ref Barray!Loop loops)
 {
-    buildSegments();
     const ns = segStart.length - 1;
-    if (ns < 2)
-        return;
-
     // the predecessors of each segment
-    Barray!uint predStart, preds;
     predStart.setLength(ns + 1);
     predStart[][] = 0;
     foreach (si; 0 .. ns)
@@ -4498,29 +4495,7 @@ private void hoistInvariants()
         }
     }
 
-    // the number of definitions of each register, and the segment of each instruction
-    Barray!uint ndefs;
-    ndefs.setLength(vinfo.length);
-    ndefs[][] = 0;
-    foreach (ref i; ins[])
-        if (i.d && !isPhys(i.d))
-            ++ndefs[i.d - firstVreg];
-    Barray!uint segOf;
-    segOf.setLength(ins.length);
-    foreach (si; 0 .. ns)
-        foreach (n; segStart[si] .. segEnd(si))
-            segOf[n] = cast(uint)si;
-
-    /* Where each instruction goes: uint.max to stay, else next to instruction
-     * moveTo[n] >> 1, after it if moveTo[n] & 1, else before it
-     */
-    Barray!uint moveTo;
-    moveTo.setLength(ins.length);
-    moveTo[][] = uint.max;
-
     // the loops, one for each header with the segments of all its back edges, smallest first
-    static struct Loop { uint header; uint size; uint[] body; }
-    Barray!Loop loops;
     Barray!bool inLoop;
     inLoop.setLength(ns);
     Barray!bool isHeader;
@@ -4576,6 +4551,47 @@ private void hoistInvariants()
     }
     if (loops.length > 1)
         qsort(loops[].ptr, loops.length, Loop.sizeof, &bySize);
+    inLoop.dtor(); isHeader.dtor();
+    idom.dtor(); rpo.dtor(); order.dtor();
+}
+
+/* Move the instructions computing the same value on every iteration of a loop
+ * to before the loop
+ */
+@trusted
+private void hoistInvariants()
+{
+    buildSegments();
+    const ns = segStart.length - 1;
+    if (ns < 2)
+        return;
+
+    Barray!uint predStart, preds;
+    Barray!Loop loops;
+    findLoops(predStart, preds, loops);
+    Barray!bool inLoop;
+    inLoop.setLength(ns);
+
+    // the number of definitions of each register, and the segment of each instruction
+    Barray!uint ndefs;
+    ndefs.setLength(vinfo.length);
+    ndefs[][] = 0;
+    foreach (ref i; ins[])
+        if (i.d && !isPhys(i.d))
+            ++ndefs[i.d - firstVreg];
+    Barray!uint segOf;
+    segOf.setLength(ins.length);
+    foreach (si; 0 .. ns)
+        foreach (n; segStart[si] .. segEnd(si))
+            segOf[n] = cast(uint)si;
+
+    /* Where each instruction goes: uint.max to stay, else next to instruction
+     * moveTo[n] >> 1, after it if moveTo[n] & 1, else before it
+     */
+    Barray!uint moveTo;
+    moveTo.setLength(ins.length);
+    moveTo[][] = uint.max;
+
 
     Barray!bool defInLoop;
     defInLoop.setLength(vinfo.length);
@@ -4732,8 +4748,8 @@ private void hoistInvariants()
 
     foreach (ref lp; loops[])
         mem_free(lp.body.ptr);
-    loops.dtor(); inLoop.dtor(); isHeader.dtor(); defInLoop.dtor(); moveTo.dtor(); segOf.dtor(); ndefs.dtor();
-    idom.dtor(); rpo.dtor(); order.dtor(); preds.dtor(); predStart.dtor();
+    loops.dtor(); inLoop.dtor(); defInLoop.dtor(); moveTo.dtor(); segOf.dtor(); ndefs.dtor();
+    preds.dtor(); predStart.dtor();
 }
 
 /******************************* Pairing ******************************/
