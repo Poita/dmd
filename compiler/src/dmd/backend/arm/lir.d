@@ -6363,18 +6363,20 @@ private bool hoistInvariants()
                 {
                     newIndex[m] = cast(uint)ins.length;
                     ins.push(old[m]);
-                    // what is moved next to a moved instruction goes with it
-                    place(m * 2);
-                    place(m * 2 + 1);
                 }
             }
             foreach (n; oldStart[b] .. oldStart[b + 1])
             {
-                if (moveTo[n] != uint.max)
-                    continue;
+                /* what is moved next to an instruction that is moved too stays where
+                 * that was: it was moved out of an inner loop, to before it, and may
+                 * not be invariant in the outer loop the instruction leaves
+                 */
                 place(n * 2);
-                newIndex[n] = cast(uint)ins.length;
-                ins.push(old[n]);
+                if (moveTo[n] == uint.max)
+                {
+                    newIndex[n] = cast(uint)ins.length;
+                    ins.push(old[n]);
+                }
                 place(n * 2 + 1);
             }
         }
