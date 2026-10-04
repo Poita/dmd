@@ -43,6 +43,7 @@ import dmd.location;
 import dmd.mtype;
 import dmd.opover;
 import dmd.printast;
+import dmd.sideeffect : hasSideEffect;
 import dmd.statement;
 import dmd.tokens;
 import dmd.typesem;
@@ -1161,7 +1162,8 @@ public:
             /* `T v = call;` and `v = call;` of a scalar or POD struct local variable v: when the
              * call cannot be inlined as an expression, and the function being
              * scanned is small enough for the inlined statements not to crowd
-             * out its register variables, the call is inlined as statements that
+             * out its register variables, or the call is given a function literal
+             * to inline into the callee, the call is inlined as statements that
              * assign the returned value to v
              */
             VarDeclaration retVar(Expression e1, Expression e2)
@@ -1190,9 +1192,10 @@ public:
                 auto vd = de.declaration.isVarDeclaration();
                 ExpInitializer ie;
                 AssignExp ae;
-                if (smallCaller && vd && vd._init && (ie = vd._init.isExpInitializer()) !is null &&
+                if (vd && vd._init && (ie = vd._init.isExpInitializer()) !is null &&
                     (ae = ie.exp.isConstructExp()) !is null && ae.e1.isVarExp() &&
-                    ae.e1.isVarExp().var == vd && retVar(ae.e1, ae.e2))
+                    ae.e1.isVarExp().var == vd && retVar(ae.e1, ae.e2) &&
+                    (smallCaller || givenLiteral(ae.e2.isCallExp())))
                 {
                     auto call = ae.e2.isCallExp();
                     inlineScan(exp);
@@ -1211,7 +1214,8 @@ public:
             }
             if (auto ae = exp.isAssignExp())
             {
-                if (smallCaller && (ae.op == EXP.assign || ae.op == EXP.construct) && retVar(ae.e1, ae.e2))
+                if ((ae.op == EXP.assign || ae.op == EXP.construct) && retVar(ae.e1, ae.e2) &&
+                    (smallCaller || givenLiteral(ae.e2.isCallExp())))
                 {
                     auto call = ae.e2.isCallExp();
                     inlineScan(exp);
@@ -1222,6 +1226,70 @@ public:
                     sresult = null;
                     eresult = null;
                     return s;
+                }
+
+                /* `a[i] = call;` given a function literal, of a local a that no nested function
+                 * refers to, so the call cannot change it, as
+                 * `auto j = i; T tmp = void; tmp = call; a[j] = tmp;` with the call inlined
+                 * as statements, the index evaluated before the call as it is otherwise
+                 */
+                auto call = ae.e2.isCallExp();
+                auto ie = ae.e1.isIndexExp();
+                auto ave = ie ? ie.e1.isVarExp() : null;
+                auto av = ave ? ave.var.isVarDeclaration() : null;
+                if (ae.op == EXP.assign && call && givenLiteral(call) && av &&
+                    !av.isDataseg() && !av.isRef() && !(av.storage_class & (STC.out_ | STC.lazy_)) &&
+                    !av.nestedrefs.length && !hasSideEffect(ie.e2) &&
+                    call.type && equivalent(call.type.toBasetype(), ae.e1.type.toBasetype()))
+                {
+                    VarExp temp(Type t, const(char)[] name, Initializer init)
+                    {
+                        auto vd = new VarDeclaration(ae.loc, t, Identifier.generateId(name), init);
+                        vd.storage_class = STC.temp;
+                        vd._linkage = LINK.d;
+                        vd.parent = parent;
+                        auto ve = new VarExp(ae.loc, vd);
+                        ve.type = t;
+                        return ve;
+                    }
+                    auto val = temp(call.type, "__inlineval", new VoidInitializer(ae.loc));
+                    if (!retVar(val, call))
+                        return null;
+                    inlineScan(exp);
+                    if (exp !is ae || ae.e2 !is call)
+                        return null;            // inlined as an expression
+                    visitCallExp(call, val, true, false);
+                    auto s = sresult;
+                    sresult = null;
+                    eresult = null;
+                    if (!s)
+                        return null;
+                    Statement declare(VarExp ve)
+                    {
+                        auto de = new DeclarationExp(ae.loc, ve.var);
+                        de.type = Type.tvoid;
+                        return new ExpStatement(ae.loc, de);
+                    }
+                    auto a = Statements();
+                    if (!ie.e2.isIntegerExp())
+                    {
+                        auto idx = temp(ie.e2.type, "__inlineidx", new ExpInitializer(ae.loc, ie.e2));
+                        auto vd = idx.var.isVarDeclaration();
+                        auto ce = new ConstructExp(ae.loc, vd, ie.e2);
+                        ce.type = vd.type;
+                        (cast(ExpInitializer)vd._init).exp = ce;
+                        a.push(declare(idx));
+                        auto idx2 = new VarExp(ae.loc, vd);
+                        idx2.type = vd.type;
+                        ie.e2 = idx2;
+                    }
+                    a.push(declare(val));
+                    a.push(s);
+                    auto val2 = new VarExp(ae.loc, val.var);
+                    val2.type = val.type;
+                    ae.e2 = val2;
+                    a.push(new ExpStatement(ae.loc, ae));
+                    return new CompoundStatement(ae.loc, a.move());
                 }
             }
 
@@ -1663,13 +1731,10 @@ public:
             // a function literal, written for where it is called
             if (fd.isFuncLiteralDeclaration())
                 return true;
-            // a nested function given a function literal, as a delegate to call, so the
-            // literal can be inlined into it
-            if (e.arguments && fd.isNested())
-                foreach (arg; *e.arguments)
-                    if (arg && (arg.isFuncExp() ||
-                                arg.isDelegateExp() && arg.isDelegateExp().func.isFuncLiteralDeclaration()))
-                        return true;
+            // a function given a function literal, as a delegate to call, so the literal
+            // can be inlined into it
+            if (givenLiteral(e))
+                return true;
             const cost = inlineCostOf(fd);
             if (loopDepth)
             {
@@ -2240,8 +2305,8 @@ private bool canInline(FuncDeclaration fd, bool hasThis, bool statementsToo, PAS
 
         static bool hasDtor(Type t)
         {
-            auto tv = t.baseElemOf();
-            return tv.ty == Tstruct || tv.ty == Tclass; // for now assume these might have a destructor
+            auto ts = t.baseElemOf().isTypeStruct();
+            return ts && ts.sym.dtor;
         }
 
         /* Don't inline a function that returns non-void, but has
@@ -2681,6 +2746,17 @@ private bool onlyOneAssign(VarDeclaration v, FuncDeclaration fd) @trusted
     if (!v.type.isMutable())
         return true;            // currently the only case handled atm
     return (v in unchangedCopies) !is null;
+}
+
+/// Whether call `e` is given a function literal as an argument
+private bool givenLiteral(CallExp e)
+{
+    if (e && e.arguments)
+        foreach (arg; *e.arguments)
+            if (arg && (arg.isFuncExp() ||
+                        arg.isDelegateExp() && arg.isDelegateExp().func.isFuncLiteralDeclaration()))
+                return true;
+    return false;
 }
 
 /// The copies of parameters made by inlining that are never changed
