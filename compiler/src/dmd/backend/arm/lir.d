@@ -998,6 +998,67 @@ private Reg varRegOf(const(elem)* e)
     return noReg;
 }
 
+/* Whether e is one or two elements of an HFA variable held in registers viewed as an
+ * integer: the first element k and their number n
+ */
+@trusted
+private AggVar* hfaIntegerView(const(elem)* e, out uint k, out uint n)
+{
+    if (e.Eoper != OPvar)
+        return null;
+    auto av = aggOf(e.Vsym);
+    if (!av || av.abi.kind != AggregateABI.Kind.hfa || tyfloating(e.Ety) || tyaggregate(e.Ety) ||
+        !scalarType(e.Ety) || pairType(e.Ety))
+        return null;
+    const esz = av.abi.esz;
+    const sz = tysize(e.Ety);
+    if (e.Voffset % esz || e.Voffset + sz > av.abi.size || !(sz == esz || sz == 8 && esz == 4))
+        return null;
+    k = cast(uint)(e.Voffset / esz);
+    n = sz / esz;
+    return av;
+}
+
+/* The integer value of e, a read of one or two elements of an HFA variable held in
+ * registers, or noReg if e is not one
+ */
+@trusted
+private Reg hfaReadAsInteger(const(elem)* e)
+{
+    uint k, n;
+    auto av = hfaIntegerView(e, k, n);
+    if (!av)
+        return noReg;
+    const esz = av.abi.esz;
+    if (n == 1)
+        return asClass(av.slots[k], RC.gp, esz);
+    Reg lo = extendFrom(asClass(av.slots[k], RC.gp, 4), 32, false, 8);
+    Reg hi = asClass(av.slots[k + 1], RC.gp, 4);
+    Reg d = newVreg(RC.gp, 8);
+    auto i = emitIns(LOp.orr, 8, d, lo, hi, 32);
+    i.flags |= F.shifted;
+    i.cond = 0;         // LSL
+    return d;
+}
+
+/* Assign the integer v to e, one or two elements of an HFA variable held in registers
+ */
+@trusted
+private void hfaWriteInteger(const(elem)* e, Reg v)
+{
+    uint k, n;
+    auto av = hfaIntegerView(e, k, n);
+    const esz = av.abi.esz;
+    v = asClass(v, RC.gp, n * esz);
+    copyOut(av.slots[k], asClass(v, RC.fp, esz), esz);
+    if (n == 2)
+    {
+        Reg hi = newVreg(RC.gp, 8);
+        emitIns(LOp.lsri, 8, hi, v, noReg, 32);
+        copyOut(av.slots[k + 1], asClass(hi, RC.fp, 4), 4);
+    }
+}
+
 /* The register variable r holds, or null
  */
 @trusted
@@ -2014,6 +2075,16 @@ private bool hfaAsInteger(const(elem)* e)
            aarch64Aggregate(cast(type*)e.ET).kind == AggregateABI.Kind.hfa;
 }
 
+/* Whether e is an integer typed value, not in memory, of the aggregate of ABI a passed in
+ * integer registers, one or a pair of them
+ */
+private bool integerGpr(const(elem)* e, ref const AggregateABI a)
+{
+    return a.kind == AggregateABI.Kind.gpr && !tyaggregate(e.Ety) && !tyfloating(e.Ety) &&
+           !aggregateLvalue(e) &&
+           (a.nregs == 1 && scalarType(e.Ety) && tysize(e.Ety) <= 8 || a.nregs == 2 && pairType(e.Ety));
+}
+
 /* Whether e is an integer typed value of the HFA of ABI a, which splitHfa() handles
  */
 private bool integerHfa(const(elem)* e, ref const AggregateABI a)
@@ -2121,7 +2192,59 @@ private AggVal genAgg(elem* e)
         case OPstreq:
             return genAggAssign(e);
 
+        case OPcond:
+        {
+            // an aggregate passed in registers: the parts of either arm in the same registers
+            if (!e.ET)
+            {
+                fail("aggregate ?:");
+                return v;
+            }
+            const a = aarch64Aggregate(cast(type*)e.ET);
+            if (a.kind != AggregateABI.Kind.hfa && a.kind != AggregateABI.Kind.gpr)
+            {
+                fail("aggregate ?:");
+                return v;
+            }
+            const prc = a.kind == AggregateABI.Kind.hfa ? RC.fp : RC.gp;
+            const psz = a.kind == AggregateABI.Kind.hfa ? a.esz : 8;
+            Reg[4] d;
+            foreach (k; 0 .. a.nregs)
+            {
+                d[k] = newVreg(prc, psz);
+                defineHere(d[k]);
+            }
+            void arm(elem* x)
+            {
+                auto m = enterCond();
+                AggVal xv = genAgg(x);
+                Reg[4] r = aggParts(xv, a);
+                foreach (k; 0 .. a.nregs)
+                {
+                    copyOut(d[k], r[k], psz);
+                    hintCopy(d[k], r[k]);
+                }
+                leaveCond(m);
+            }
+            const lfalse = newLabel();
+            const lend = newLabel();
+            genCond(e.E1, false, lfalse);
+            arm(e.E2.E1);
+            jumpTo(lend);
+            placeLabel(lfalse);
+            arm(e.E2.E2);
+            placeLabel(lend);
+            v.kind = AggVal.Kind.parts;
+            v.r = d;
+            return v;
+        }
+
         default:
+            if (getenv("DMD_NEWCG_WHY"))
+            {
+                import dmd.backend.debugprint : oper_str;
+                fprintf(stderr, "newcg-aggop: %s %d\n", oper_str(e.Eoper), e.Eoper);
+            }
             fail("aggregate op");
             return v;
     }
@@ -2293,7 +2416,12 @@ private void copyMem(Mem d, Mem s, uint size)
 {
     if (size > 256)
     {
-        fail("large aggregate copy");
+        // a loop over the bytes
+        Reg da = addressOf(d);
+        Reg sa = addressOf(s);
+        Reg n = newVreg(RC.gp, 8);
+        emitIns(LOp.movi, 8, n, noReg, noReg, size);
+        copyLoop(da, sa, n);
         return;
     }
     uint off = 0;
@@ -2309,6 +2437,40 @@ private void copyMem(Mem d, Mem s, uint size)
         store(t, md, chunkType(n));
         off += n;
     }
+}
+
+/* The address of memory m
+ */
+@trusted
+private Reg addressOf(Mem m)
+{
+    if (m.index)
+    {
+        fail("address of indexed memory");
+        return newVreg(RC.gp, 8);
+    }
+    Reg d = newVreg(RC.gp, 8);
+    if (m.sym)
+    {
+        auto i = emitIns(LOp.lea, 8, d, noReg, noReg, m.offset);
+        i.sym = m.sym;
+        if (!isStatic(m.sym))
+            usesFrame = true;
+        return d;
+    }
+    if (!m.offset)
+        return m.base;
+    if (m.offset > 0 && m.offset < 4096)
+        emitIns(LOp.addi, 8, d, m.base, noReg, m.offset);
+    else if (m.offset < 0 && m.offset > -4096)
+        emitIns(LOp.subi, 8, d, m.base, noReg, -m.offset);
+    else
+    {
+        Reg c = newVreg(RC.gp, 8);
+        emitIns(LOp.movi, 8, c, noReg, noReg, m.offset);
+        emitIns(LOp.add, 8, d, m.base, c);
+    }
+    return d;
 }
 
 /* memcpy(d, s, n) as (d OPmemcpy (s OPparam n)), and memset(s, value, n) as
@@ -2340,7 +2502,27 @@ private void genMemOp(elem* e)
 
     elem* evalue = p.E2;
     elem* enumbytes = p.E1;
-    if (tysize(evalue.Ety) != 1 && evalue.Eoper != OPstrpar)
+    const esize = evalue.Eoper == OPstrpar ? 1 : tysize(evalue.Ety);
+    if (esize == 4 || esize == 8)
+    {
+        // the element repeated in 8 bytes, stored over the bytes of the count of elements
+        Reg s = gen(e.E1);
+        Reg n = newVreg(RC.gp, 8);
+        emitIns(LOp.lsli, 8, n, gen(enumbytes), noReg, esize == 4 ? 2 : 3);
+        Reg value = asClass(gen(evalue), RC.gp, esize);
+        Reg v8 = value;
+        if (esize == 4)
+        {
+            Reg lo = extendFrom(value, 32, false, 8);
+            v8 = newVreg(RC.gp, 8);
+            auto i = emitIns(LOp.orr, 8, v8, lo, lo, 32);
+            i.flags |= F.shifted;
+            i.cond = 0;         // LSL
+        }
+        fillLoop(s, v8, n);
+        return;
+    }
+    if (esize != 1)
     {
         fail("memset of elements");
         return;
@@ -2780,6 +2962,8 @@ private Reg genx(elem* e)
 
         case OPvar:
         {
+            if (Reg r = hfaReadAsInteger(e))
+                return r;
             if (Reg r = varRegOf(e))
                 return asClass(r, rc, sz);
             Reg d = newVreg(rc, sz);
@@ -3245,7 +3429,7 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
         {
             // in consecutive registers from p.reg
             const a = aarch64Aggregate(ep.ET);
-            if (!tyaggregate(ep.Ety) && !aggregateLvalue(ep) && !integerHfa(ep, a) ||
+            if (!tyaggregate(ep.Ety) && !aggregateLvalue(ep) && !integerHfa(ep, a) && !integerGpr(ep, a) ||
                 a.kind != AggregateABI.Kind.hfa && a.kind != AggregateABI.Kind.gpr ||
                 !FuncParamRegs_alloc(*cgp, fpr, ep.ET, ep.Ety, p.reg, p.reg2) || p.reg == NOREG || p.reg == 8)
             {
@@ -3329,6 +3513,19 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
         if (holdsAggregate(p.e.Ety, p.e.ET))
         {
             const a = aarch64Aggregate(p.e.ET);
+            if (integerGpr(p.e, a))
+            {
+                // the bits of the aggregate are the value
+                if (a.nregs == 1)
+                    aggArgs[i][0] = gen(p.e);
+                else
+                {
+                    Pair v = genPair(p.e);
+                    aggArgs[i][0] = v.lo;
+                    aggArgs[i][1] = v.hi;
+                }
+                continue;
+            }
             if (!tyaggregate(p.e.Ety) && !aggregateLvalue(p.e))
             {
                 aggArgs[i] = splitHfa(p.e, a);
@@ -3483,6 +3680,13 @@ private Reg genAssign(elem* e)
     {
         genAssignPair(e);
         return noReg;
+    }
+    uint hk, hn;
+    if (hfaIntegerView(e1, hk, hn))
+    {
+        Reg v = gen(e.E2);
+        hfaWriteInteger(e1, v);
+        return v;
     }
     if (e1.Eoper == OPvar)
     {
