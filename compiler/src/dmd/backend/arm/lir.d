@@ -318,8 +318,9 @@ bool lirCodegen(ref CGstate cg)
         numberValues();
         reuseInvariantLoads();
         removeBoundsChecks();
-        if (!env!"DMD_NEWCG_NOSLP")
-            vectorize();
+        // the vectors made may be of values the same throughout a loop
+        if (!env!"DMD_NEWCG_NOSLP" && vectorize() && !env!"DMD_NEWCG_NOLICM")
+            hoistInvariants();
         removeUnreachable();
         removeDead();
         fuseSignTests();
@@ -6078,7 +6079,8 @@ private struct Slp
     Barray!VNode nodes;
     Barray!uint moved;                  // copies moved after the vectors they copy from are taken apart
     Barray!uint movedTo;
-    Barray!bool movedDest;              // by register: defined by a copy moved later
+    Barray!Reg movedReg;                // the registers set by copies moved, each before instruction movedAt
+    Barray!uint movedAt;
     // variables set together, as lanes 0 and 1 of a vector made after each pair of copies to them
     Barray!Reg pairOther;               // by register: the other of its pair, or noReg
     Barray!ubyte pairLane;
@@ -6093,7 +6095,7 @@ private struct Slp
     {
         ndefs.dtor(); defAt.dtor(); useStart.dtor(); useList.dtor(); done.dtor();
         resA.dtor(); resB.dtor(); curSrc.dtor(); forwarded.dtor(); vecOf.dtor(); laneOf.dtor(); vecAt.dtor();
-        claim.dtor(); nodes.dtor(); moved.dtor(); movedTo.dtor(); movedDest.dtor(); inserts.dtor();
+        claim.dtor(); nodes.dtor(); moved.dtor(); movedTo.dtor(); movedReg.dtor(); movedAt.dtor(); inserts.dtor();
         pairOther.dtor(); pairLane.dtor(); pairW.dtor(); pinned.dtor(); usedPairs.dtor();
     }
 
@@ -6122,11 +6124,14 @@ private struct Slp
     {
         if (once(r))
             return true;
-        if (!r || isPhys(r) || r - firstVreg >= nregs || movedDest[r - firstVreg])
+        if (!r || isPhys(r) || r - firstVreg >= nregs)
             return false;
         if (p > q) { const t = p; p = q; q = t; }
         foreach (k; p + 1 .. q + 1)
             if (ins[k].d == r)
+                return false;
+        foreach (j, m; movedReg[])
+            if (m == r && movedAt[j] > p && movedAt[j] <= q)
                 return false;
         return true;
     }
@@ -6139,6 +6144,9 @@ private struct Slp
         foreach (k; rs .. n)
             if (ins[k].d == r)
                 ++c;
+        foreach (j, m; movedReg[])
+            if (m == r && movedAt[j] >= rs && movedAt[j] <= n)
+                ++c;
         return c;
     }
 
@@ -6150,7 +6158,7 @@ private struct Slp
             user0 == uint.max || user1 == uint.max)
             return false;
         const P = x0 - firstVreg, Q = x1 - firstVreg;
-        if (pairOther[P] != x1 || pairLane[P] != 0 || movedDest[P] || movedDest[Q])
+        if (pairOther[P] != x1 || pairLane[P] != 0)
             return false;
         // the vector is made after each copy to x1, which follows that to x0
         const e = defsBefore(x1, at);
@@ -6563,6 +6571,9 @@ private struct Slp
                         if (z.d == c.d || z.a == c.d || z.b == c.d || z.c == c.d || partner && z.d == partner)
                             return int.min;
                     }
+                    foreach (j, mr; movedReg[])
+                        if ((mr == c.d || partner && mr == partner) && movedAt[j] > u && movedAt[j] <= v.at)
+                            return int.min;
                     foreach (j, w; moved[])
                         if (w == u)
                             return int.min;
@@ -6680,7 +6691,8 @@ private struct Slp
                 if (movedTo[j] == k)
                 {
                     inserts.push(Insert(v.at, ins[u]));
-                    movedDest[ins[u].d - firstVreg] = true;
+                    movedReg.push(ins[u].d);
+                    movedAt.push(v.at);
                     done[u] = true;
                     ins[u] = LIns.init;
                 }
@@ -6703,7 +6715,7 @@ private struct Slp
 /* Find pairs of float operations done as one on vectors
  */
 @trusted
-private void vectorize()
+private bool vectorize()
 {
     buildSegments();
     const ns = segStart.length - 1;
@@ -6726,7 +6738,7 @@ private void vectorize()
             any = true;
     }
     if (!any)
-        return;
+        return false;
 
     // copies of floats from registers defined once into registers defined once are not needed
     {
@@ -6802,8 +6814,6 @@ private void vectorize()
     s.laneOf.setLength(nregs);
     s.vecAt.setLength(nregs);
     s.vecAt[][] = uint.max;
-    s.movedDest.setLength(nregs);
-    s.movedDest[][] = false;
 
     // the regions: segments each falling into the next, its only way in
     Barray!uint npred, regStart, regionOf;
@@ -6836,8 +6846,9 @@ private void vectorize()
     for (size_t k = 0; k < regStart.length; k += 2)
         vectorizeRegion(s, regStart[k], regStart[k + 1]);
 
-    if (s.inserts.length)
-        applyInserts(s.inserts);
+    if (!s.inserts.length)
+        return false;
+    applyInserts(s.inserts);
 
     // the vectors of the pairs used are made after each copy to lane 1, which follows that to lane 0
     s.inserts.setLength(0);
@@ -6871,8 +6882,8 @@ private void vectorize()
             s.inserts.push(Insert(cast(uint)n + 1, w));
         }
     }
-    if (s.inserts.length)
-        applyInserts(s.inserts);
+    applyInserts(s.inserts);
+    return true;
 }
 
 /* Pair variables of floats set only by copies, each copy to one in a region
@@ -7083,28 +7094,6 @@ private void vectorizeRegion(ref Slp s, uint rs, uint re)
         }
     }
 
-    // sums of the lanes
-    foreach (n; rs .. re)
-    {
-        const i = &ins[n];
-        if (i.op != LOp.fadd || i.sz != 4 || s.done[n] || i.flags & F.condDef)
-            continue;
-        const x0 = s.resA[n], x1 = s.resB[n];
-        if (!s.once(x0) || !s.once(x1) || x0 == x1)
-            continue;
-        const n0 = s.defAt[x0 - firstVreg], n1 = s.defAt[x1 - firstVreg];
-        if (n0 < rs || n1 < rs || n0 >= n || n1 >= n || ins[n0].op != ins[n1].op || !Slp.pairable(ins[n0]))
-            continue;
-        const nn = n;
-        void sum(Reg V)
-        {
-            ins[nn].op = LOp.vfaddp;
-            ins[nn].a = V;
-            ins[nn].b = noReg;
-        }
-        attempt(x0, x1, n, n, n0 > n1 ? n0 : n1, 0, n, uint.max, &sum);
-    }
-
     // any two like operations near each other
     foreach_reverse (n; rs .. re)
     {
@@ -7124,6 +7113,38 @@ private void vectorizeRegion(ref Slp s, uint rs, uint re)
             if (s.done[n])
                 break;
         }
+    }
+
+    // sums of the lanes
+    foreach (n; rs .. re)
+    {
+        const i = &ins[n];
+        if (i.op != LOp.fadd || i.sz != 4 || s.done[n] || i.flags & F.condDef)
+            continue;
+        const x0 = s.resA[n], x1 = s.resB[n];
+        if (!s.once(x0) || !s.once(x1) || x0 == x1)
+            continue;
+        // the lanes of a vector made already
+        const V = s.vecOf[x0 - firstVreg];
+        if (V && V == s.vecOf[x1 - firstVreg] && s.laneOf[x0 - firstVreg] != s.laneOf[x1 - firstVreg] &&
+            s.vecAt[V - firstVreg] < n)
+        {
+            ins[n].op = LOp.vfaddp;
+            ins[n].a = V;
+            ins[n].b = noReg;
+            continue;
+        }
+        const n0 = s.defAt[x0 - firstVreg], n1 = s.defAt[x1 - firstVreg];
+        if (n0 < rs || n1 < rs || n0 >= n || n1 >= n || ins[n0].op != ins[n1].op || !Slp.pairable(ins[n0]))
+            continue;
+        const nn = n;
+        void sum(Reg V)
+        {
+            ins[nn].op = LOp.vfaddp;
+            ins[nn].a = V;
+            ins[nn].b = noReg;
+        }
+        attempt(x0, x1, n, n, n0 > n1 ? n0 : n1, 0, n, uint.max, &sum);
     }
 }
 
