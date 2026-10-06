@@ -415,8 +415,9 @@ Symbol* toSymbol(Dsymbol s)
             {
                 import dmd.backend.dt : DtBuilder, dtConstantBytes, dt_free;
                 import dmd.glue.todt : Initializer_toDt;
+                // only of scalar elements, whose bytes make no other symbols
                 auto tb = vd.type.toBasetype();
-                if (tb.isTypeSArray() || tb.isTypeBasic())
+                if ((tb.isTypeSArray() || tb.isTypeBasic()) && tb.baseElemOf().isTypeBasic())
                 {
                     auto dtb = DtBuilder(0);
                     Initializer_toDt(vd._init, dtb, vd.isCsymbol());
