@@ -99,6 +99,15 @@ enum LOp : ubyte
     ldp,            // d, c = [a + imm], [a + imm + sz]
     stp,            // [b + imm], [b + imm + sz] = a, c
     call,           // call sym, or the address in a; imm is the mask of argument registers
+    // on vectors of two floats, in the low 64 bits of a register
+    vfadd, vfsub, vfmul, vfdiv,     // d = a op b, lane by lane
+    vfmule,         // d = a * the float b
+    vfneg, vfabs, vfsqrt,           // d = op a, lane by lane
+    vdup,           // d = the float a in both lanes
+    vzip,           // d = the floats a and b
+    vrev,           // d = the lanes of a swapped
+    vlane1,         // d = the float in lane 1 of a
+    vfaddp,         // d = the sum of the lanes of a
 }
 
 /// Flags of an instruction
@@ -309,6 +318,8 @@ bool lirCodegen(ref CGstate cg)
         numberValues();
         reuseInvariantLoads();
         removeBoundsChecks();
+        if (!env!"DMD_NEWCG_NOSLP")
+            vectorize();
         removeUnreachable();
         removeDead();
         fuseSignTests();
@@ -5629,9 +5640,6 @@ private void hoistInvariantTests()
         defInLoop.dtor();
     }
 
-    // what is put before each instruction
-    // leads: it begins the block that begins at `at`, rather than ends the one before
-    static struct Insert { uint at; LIns i; bool leads; }
     Barray!Insert inserts;
     scope (exit) inserts.dtor();
     Barray!uint chosen;
@@ -5852,9 +5860,20 @@ private void hoistInvariantTests()
             }
         }
     }
+    applyInserts(inserts);
+}
+
+/// An instruction put before the one at `at`; one that `leads` begins the block
+/// beginning at `at`, rather than ending the one before
+private struct Insert { uint at; LIns i; bool leads; }
+
+/* Put the inserts before their places, those for one place in the order made
+ */
+@trusted
+private void applyInserts(ref Barray!Insert inserts)
+{
     if (!inserts.length)
         return;
-    // in the order of their places, those for one place in the order made
     foreach (a; 1 .. inserts.length)
         for (size_t b = a; b > 0 && (inserts[b - 1].at > inserts[b].at ||
                                      inserts[b - 1].at == inserts[b].at && inserts[b - 1].leads > inserts[b].leads); --b)
@@ -5999,6 +6018,1115 @@ private void foldAddresses()
     ndefs.dtor(); nuses.dtor(); defAt.dtor();
 }
 
+/******************************* Vectors ******************************/
+
+/* Pairs of the same float operation on independent values are done as one
+ * operation on a vector of the two, when that takes fewer instructions,
+ * counting those that make the vectors of operands no pair computes and that
+ * take the results out where they are used on their own. The pairs grow from
+ * stores to adjacent places, from sums of two like operations, and from any two
+ * like operations near each other, within regions of code run straight through.
+ */
+
+/// What a node of a tree of pairs is
+private enum VK : ubyte
+{
+    pack,       // the operation of instructions m0 and m1, on the vectors of nodes k0 (and k1)
+    load,       // a load of adjacent floats, those of loads m0 and m1
+    splat,      // the value r0 in both lanes
+    zip,        // the values r0 and r1
+    vec,        // the vector vec made before, holding r0 and r1
+}
+
+private struct VNode
+{
+    VK kind;
+    bool swap;          // pack: m1's operands are taken the other way around
+    bool rev;           // load: m1 is the one at the lower address
+    bool byElem;        // splat: only multiplied by, so not made
+    uint m0, m1;
+    Reg r0, r1;
+    int k0 = -1, k1 = -1;
+    uint at;            // the instruction it is made before
+    Reg vec;
+}
+
+/// A way to reach a float in memory: sym + imm + the sum of terms reg << shift
+private struct VAddr
+{
+    const(Symbol)* sym;
+    long imm;
+    Reg[4] reg;
+    ubyte[4] shift;
+    uint nterms;
+    bool ok;
+}
+
+private struct Slp
+{
+  nothrow:
+    Barray!uint ndefs, defAt;           // by register: its definitions, and the last
+    Barray!uint useStart, useList;      // by register: the instructions using it
+    Barray!bool done;                   // by instruction: replaced
+    Barray!Reg resA, resB;              // by instruction: its operands, followed through copies
+    Barray!Reg curSrc;                  // by register: the register it is a copy of here
+    Barray!Reg forwarded;               // the registers with curSrc set
+    Barray!Reg vecOf;                   // by register: the vector it was taken from
+    Barray!ubyte laneOf;                // by register: the lane of the vector it was taken from
+    Barray!uint vecAt;                  // by register: where the vector it is was made
+    Barray!int claim;                   // by instruction: the node of the tree it is in, or -1
+    Barray!VNode nodes;
+    Barray!uint moved;                  // copies moved after the vectors they copy from are taken apart
+    Barray!uint movedTo;
+    Barray!bool movedDest;              // by register: defined by a copy moved later
+    // variables set together, as lanes 0 and 1 of a vector made after each pair of copies to them
+    Barray!Reg pairOther;               // by register: the other of its pair, or noReg
+    Barray!ubyte pairLane;
+    Barray!Reg pairW;                   // by register: the vector of its pair, once needed
+    Barray!bool pinned;                 // by register: its pair's vector is used, so its copies stay put
+    Barray!Reg usedPairs;               // the lane 0 registers of the pairs whose vectors are used
+    Barray!Insert inserts;
+    uint rs, re;                        // the region
+    uint nregs;                         // the registers there were before
+
+    void dtor()
+    {
+        ndefs.dtor(); defAt.dtor(); useStart.dtor(); useList.dtor(); done.dtor();
+        resA.dtor(); resB.dtor(); curSrc.dtor(); forwarded.dtor(); vecOf.dtor(); laneOf.dtor(); vecAt.dtor();
+        claim.dtor(); nodes.dtor(); moved.dtor(); movedTo.dtor(); movedDest.dtor(); inserts.dtor();
+        pairOther.dtor(); pairLane.dtor(); pairW.dtor(); pinned.dtor(); usedPairs.dtor();
+    }
+
+    @trusted bool once(Reg r) { return r && !isPhys(r) && r - firstVreg < nregs && ndefs[r - firstVreg] == 1; }
+
+    /* The operation n does, if it may be one of a pair
+     */
+    @trusted static bool pairable(ref const LIns i)
+    {
+        if (i.sz != 4 || !i.d || isPhys(i.d) || rcOf(i.d) != RC.fp || i.flags & F.condDef)
+            return false;
+        switch (i.op)
+        {
+            case LOp.fadd, LOp.fsub, LOp.fmul, LOp.fdiv, LOp.fneg, LOp.fabs, LOp.fsqrt:
+                return true;
+            case LOp.ld:
+                return !(i.flags & (F.volatile_ | F.scaled)) && !i.sym;
+            default:
+                return false;
+        }
+    }
+
+    /* Whether register r holds the same value just after p as just after q
+     */
+    @trusted bool stable(Reg r, uint p, uint q)
+    {
+        if (once(r))
+            return true;
+        if (!r || isPhys(r) || r - firstVreg >= nregs || movedDest[r - firstVreg])
+            return false;
+        if (p > q) { const t = p; p = q; q = t; }
+        foreach (k; p + 1 .. q + 1)
+            if (ins[k].d == r)
+                return false;
+        return true;
+    }
+
+    /* The number of definitions of r in the region before n
+     */
+    @trusted uint defsBefore(Reg r, uint n)
+    {
+        uint c;
+        foreach (k; rs .. n)
+            if (ins[k].d == r)
+                ++c;
+        return c;
+    }
+
+    /* Whether the vector of the pair x0, x1, as read by user0 and user1, is that at `at`
+     */
+    @trusted bool pairHolds(Reg x0, Reg x1, uint user0, uint user1, uint at)
+    {
+        if (!x0 || !x1 || isPhys(x0) || isPhys(x1) || x0 - firstVreg >= nregs || x1 - firstVreg >= nregs ||
+            user0 == uint.max || user1 == uint.max)
+            return false;
+        const P = x0 - firstVreg, Q = x1 - firstVreg;
+        if (pairOther[P] != x1 || pairLane[P] != 0 || movedDest[P] || movedDest[Q])
+            return false;
+        // the vector is made after each copy to x1, which follows that to x0
+        const e = defsBefore(x1, at);
+        return defsBefore(x0, user0) == e && defsBefore(x1, user1) == e;
+    }
+
+    /* Whether r is made by a copy of a variable of a pair, in the region
+     */
+    @trusted bool copyOfVar(Reg r)
+    {
+        const n = defAt[r - firstVreg];
+        const i = &ins[n];
+        return n >= rs && n < re && i.op == LOp.copy && i.a && !isPhys(i.a) && i.a - firstVreg < nregs &&
+            pairOther[i.a - firstVreg];
+    }
+
+    @trusted bool isPairVec(ref const VNode v)
+    {
+        return v.kind == VK.vec && v.r0 && !isPhys(v.r0) && v.r0 - firstVreg < nregs &&
+            pairW[v.r0 - firstVreg] == v.vec;
+    }
+
+    /* Whether memory may be written between p and q, other than by the stores
+     * at p and q themselves
+     */
+    @trusted bool writesBetween(uint p, uint q)
+    {
+        if (p > q) { const t = p; p = q; q = t; }
+        foreach (k; p + 1 .. q)
+            if (writesMemory(ins[k]) || ins[k].op == LOp.call)
+                return true;
+        return false;
+    }
+
+    /* How load or store n reaches memory
+     */
+    @trusted VAddr addrOf(uint n)
+    {
+        const i = &ins[n];
+        VAddr a;
+        a.sym = i.sym;
+        a.imm = i.imm;
+        a.ok = true;
+        void term(Reg r, uint shift, int depth)
+        {
+            if (!a.ok)
+                return;
+            if (once(r) && depth < 6 && !(shift && ins[defAt[r - firstVreg]].op != LOp.lsli))
+            {
+                const d = &ins[defAt[r - firstVreg]];
+                if (d.sz == 8 && !(d.flags & F.condDef))
+                {
+                    switch (d.op)
+                    {
+                        case LOp.addi:
+                            a.imm += d.imm;
+                            term(d.a, 0, depth + 1);
+                            return;
+                        case LOp.add:
+                            if (d.flags & F.shifted && d.cond != 0)
+                                break;
+                            term(d.a, 0, depth + 1);
+                            term(d.b, d.flags & F.shifted ? cast(uint)d.imm : 0, depth + 1);
+                            return;
+                        case LOp.lsli:
+                            term(d.a, shift + cast(uint)d.imm, depth + 1);
+                            return;
+                        case LOp.copy:
+                            if (once(d.a))
+                            {
+                                term(d.a, shift, depth + 1);
+                                return;
+                            }
+                            break;
+                        default:
+                            break;
+                    }
+                }
+            }
+            if (a.nterms == a.reg.length)
+            {
+                a.ok = false;
+                return;
+            }
+            // kept in order, so equal sums are equal
+            uint k = a.nterms++;
+            for (; k > 0 && (a.reg[k - 1] > r || a.reg[k - 1] == r && a.shift[k - 1] > shift); --k)
+            {
+                a.reg[k] = a.reg[k - 1];
+                a.shift[k] = a.shift[k - 1];
+            }
+            a.reg[k] = r;
+            a.shift[k] = cast(ubyte)shift;
+        }
+        const isLoad = i.op == LOp.ld;
+        const base = isLoad ? i.a : i.b;
+        const index = isLoad ? i.b : i.c;
+        if (base)
+            term(base, 0, 0);
+        if (index)
+            term(index, i.flags & F.scaled ? (i.sz == 8 ? 3 : 2) : 0, 0);
+        return a;
+    }
+
+    /* Whether the floats loaded or stored by p and q are adjacent, q's after p's,
+     * the registers reaching them not changing between
+     */
+    @trusted bool adjacent(uint p, uint q)
+    {
+        auto a = addrOf(p), b = addrOf(q);
+        if (!a.ok || !b.ok || a.sym != b.sym || a.nterms != b.nterms || b.imm != a.imm + 4)
+            return false;
+        foreach (k; 0 .. a.nterms)
+            if (a.reg[k] != b.reg[k] || a.shift[k] != b.shift[k] || !stable(a.reg[k], p, q))
+                return false;
+        return true;
+    }
+
+    /* Whether instruction n uses the value of register r, defined at rdef,
+     * directly or through what it uses
+     */
+    @trusted bool dependsOn(uint n, Reg r, uint rdef, ref int budget)
+    {
+        if (--budget < 0)
+            return true;
+        Reg[2] xs = [resA[n], resB[n]];
+        foreach (x; xs)
+        {
+            if (!x)
+                continue;
+            if (x == r)
+                return true;
+            if (once(x))
+            {
+                const k = defAt[x - firstVreg];
+                if (k > rdef && k >= rs && k < n && dependsOn(k, r, rdef, budget))
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    /* The node for lanes x0 and x1, used by user0 and user1, consumed by a pack
+     * made at `at`; or -1
+     */
+    @trusted int build(Reg x0, Reg x1, uint user0, uint user1, uint at, int depth)
+    {
+        // the same pair again
+        foreach (k, ref v; nodes[])
+            if (v.r0 == x0 && v.r1 == x1)
+            {
+                if (v.kind == VK.splat || v.kind == VK.zip)
+                {
+                    // made where first needed, from values that do not change
+                    if (v.at != at && !(once(x0) && once(x1)))
+                        continue;
+                    if (at < v.at)
+                        v.at = at;
+                }
+                if (isPairVec(v) && !pairHolds(x0, x1, user0, user1, at))
+                    continue;
+                return cast(int)k;
+            }
+        if (nodes.length >= 64)
+            return -1;
+        VNode v;
+        v.r0 = x0;
+        v.r1 = x1;
+        v.at = at;
+        if (x0 && x0 == x1)
+        {
+            if (claimedResult(x0) || !stable(x0, user0, at) || !stable(x0, user1, at))
+                return -1;
+            v.kind = VK.splat;
+            return push(v);
+        }
+        if (x0 && x1 && !isPhys(x0) && !isPhys(x1) && x0 - firstVreg < nregs && x1 - firstVreg < nregs &&
+            vecOf[x0 - firstVreg] && vecOf[x0 - firstVreg] == vecOf[x1 - firstVreg] &&
+            laneOf[x0 - firstVreg] == 0 && laneOf[x1 - firstVreg] == 1)
+        {
+            v.kind = VK.vec;
+            v.vec = vecOf[x0 - firstVreg];
+            return push(v);
+        }
+        if (depth < 12 && once(x0) && once(x1))
+        {
+            const i0 = defAt[x0 - firstVreg], i1 = defAt[x1 - firstVreg];
+            const a = &ins[i0], b = &ins[i1];
+            if (i0 != i1 && i0 >= rs && i0 < re && i1 >= rs && i1 < re && !done[i0] && !done[i1] &&
+                claim[i0] < 0 && claim[i1] < 0 && a.op == b.op && pairable(*a) && pairable(*b))
+            {
+                const top = i0 > i1 ? i0 : i1;
+                v.m0 = i0;
+                v.m1 = i1;
+                v.at = top;
+                if (a.op == LOp.ld)
+                {
+                    const lo = i0 < i1 ? i0 : i1;
+                    if (!writesBetween(lo, top))
+                    {
+                        if (adjacent(i0, i1))
+                        {
+                            v.kind = VK.load;
+                            if (stableAddress(i0, top))
+                                return pushClaimed(v);
+                        }
+                        else if (adjacent(i1, i0))
+                        {
+                            v.kind = VK.load;
+                            v.rev = true;
+                            if (stableAddress(i1, top))
+                                return pushClaimed(v);
+                        }
+                    }
+                }
+                else
+                {
+                    int budget = 48;
+                    const indep = i0 < i1 ? !dependsOn(i1, x0, i0, budget) : !dependsOn(i0, x1, i1, budget);
+                    if (indep)
+                    {
+                        v.kind = VK.pack;
+                        const self = pushClaimed(v);
+                        Reg a0 = resA[i0], b0 = resB[i0], a1 = resA[i1], b1 = resB[i1];
+                        if (b.op == LOp.fadd || b.op == LOp.fmul)
+                        {
+                            if (score(a0, b1) + score(b0, a1) > score(a0, a1) + score(b0, b1))
+                            {
+                                nodes[self].swap = true;
+                                const t = a1; a1 = b1; b1 = t;
+                            }
+                        }
+                        int k0 = build(a0, a1, i0, i1, top, depth + 1);
+                        int k1 = -1;
+                        if (k0 >= 0 && b0)
+                            k1 = build(b0, b1, i0, i1, top, depth + 1);
+                        if (k0 >= 0 && (k1 >= 0 || !b0))
+                        {
+                            nodes[self].k0 = k0;
+                            nodes[self].k1 = k1;
+                            return self;
+                        }
+                        // not a pack after all: forget what was built for it
+                        foreach (ref w; nodes[self .. $])
+                            if (w.kind == VK.pack || w.kind == VK.load)
+                            {
+                                claim[w.m0] = -1;
+                                claim[w.m1] = -1;
+                            }
+                        nodes.setLength(self);
+                        v.kind = VK.zip;
+                    }
+                }
+            }
+        }
+        // a copy of a variable made once is the variable as it was there
+        Reg p0 = x0, p1 = x1;
+        uint u0 = user0, u1 = user1;
+        if (once(x0) && copyOfVar(x0))
+        {
+            u0 = defAt[x0 - firstVreg];
+            p0 = ins[u0].a;
+        }
+        if (once(x1) && copyOfVar(x1))
+        {
+            u1 = defAt[x1 - firstVreg];
+            p1 = ins[u1].a;
+        }
+        if (pairHolds(p0, p1, u0, u1, at))
+        {
+            x0 = v.r0 = p0;
+            x1 = v.r1 = p1;
+            Reg* W = &pairW[x0 - firstVreg];
+            if (!*W)
+            {
+                const r = newVreg(RC.fp, 8);
+                growTo(r);
+                W = &pairW[x0 - firstVreg];
+                *W = r;
+                pairW[x1 - firstVreg] = r;
+            }
+            v.kind = VK.vec;
+            v.vec = *W;
+            return push(v);
+        }
+        // the values as they are
+        if (!x0 || !x1 || isPhys(x0) || isPhys(x1) || claimedResult(x0) || claimedResult(x1) ||
+            !stable(x0, user0, at) || !stable(x1, user1, at))
+            return -1;
+        v.kind = VK.zip;
+        v.at = at;
+        return push(v);
+    }
+
+    @trusted int push(ref VNode v)
+    {
+        nodes.push(v);
+        return cast(int)nodes.length - 1;
+    }
+
+    @trusted int pushClaimed(ref VNode v)
+    {
+        const k = push(v);
+        claim[v.m0] = k;
+        claim[v.m1] = k;
+        return k;
+    }
+
+    /* Whether r is the result of an instruction in the tree
+     */
+    @trusted bool claimedResult(Reg r)
+    {
+        return once(r) && claim[defAt[r - firstVreg]] >= 0;
+    }
+
+    /* Whether the address registers of load n are the same at `at`
+     */
+    @trusted bool stableAddress(uint n, uint at)
+    {
+        const i = &ins[n];
+        return (!i.a || stable(i.a, n, at)) && (!i.b || stable(i.b, n, at));
+    }
+
+    /* How likely x and y are to make a good pair
+     */
+    @trusted int score(Reg x, Reg y)
+    {
+        if (x == y)
+            return 2;
+        if (once(x) && once(y))
+        {
+            const i = defAt[x - firstVreg], j = defAt[y - firstVreg];
+            if (ins[i].op == ins[j].op && pairable(ins[i]))
+                return ins[i].op == LOp.ld ? 3 : 2;
+        }
+        return 0;
+    }
+
+    /* The gain, in quarter instructions, of the tree rooted at node `root`,
+     * worth `rootGain`; the copies to move are put in `moved`; int.min if it cannot be done
+     */
+    @trusted int gain(int root, int rootGain, uint rootAt, uint rootAt2)
+    {
+        int g = rootGain;
+        moved.setLength(0);
+        movedTo.setLength(0);
+        // splats only multiplied by are not made
+        foreach (ref v; nodes[])
+            if (v.kind == VK.splat)
+                v.byElem = true;
+        foreach (ref v; nodes[])
+            if (v.kind == VK.pack)
+            {
+                if (ins[v.m0].op != LOp.fmul && v.k0 >= 0 && nodes[v.k0].kind == VK.splat)
+                    nodes[v.k0].byElem = false;
+                if (v.k1 >= 0 && nodes[v.k1].kind == VK.splat && ins[v.m0].op != LOp.fmul)
+                    nodes[v.k1].byElem = false;
+                if (ins[v.m0].op == LOp.fmul && v.k0 >= 0 && nodes[v.k0].kind == VK.splat &&
+                    v.k1 >= 0 && nodes[v.k1].kind == VK.splat)
+                    nodes[v.k1].byElem = false;
+            }
+        if (nodes[root].kind == VK.splat)
+            nodes[root].byElem = false;
+        foreach (k, ref v; nodes[])
+        {
+            final switch (v.kind)
+            {
+                case VK.pack:
+                    g += 4;
+                    break;
+                case VK.load:
+                    g += v.rev ? 0 : 4;
+                    break;
+                case VK.splat:
+                    g -= v.byElem ? 0 : 4;
+                    continue;
+                case VK.zip:
+                    g -= 4;
+                    continue;
+                case VK.vec:
+                    continue;
+            }
+            // the results used other than by the tree are taken out
+            uint[2] ms = [v.m0, v.m1];
+            foreach (lane, m; ms)
+            {
+                const r = ins[m].d;
+                bool outside;
+                foreach (u; useList[useStart[r - firstVreg] .. useStart[r - firstVreg + 1]])
+                {
+                    if (claim[u] >= 0 && ins[u].op != LOp.ld || u == rootAt || u == rootAt2)
+                        continue;
+                    // a copy to the variable of the lane's pair is expected to go, the pair's vector made instead
+                    const c = &ins[u];
+                    const toPair = c.op == LOp.copy && c.d && !isPhys(c.d) && c.d - firstVreg < nregs &&
+                        pairOther[c.d - firstVreg] && pairLane[c.d - firstVreg] == lane;
+                    if (!toPair)
+                        outside = true;
+                    if (u < rs || u >= re || u > v.at)
+                        continue;
+                    // a copy before the vector is made is moved after it
+                    if (c.op != LOp.copy || c.d == noReg || isPhys(c.d) || done[u] ||
+                        c.d - firstVreg < nregs && pinned[c.d - firstVreg])
+                        return int.min;
+                    // nor past a copy to the other of its pair
+                    const partner = c.d - firstVreg < nregs ? pairOther[c.d - firstVreg] : noReg;
+                    foreach (q; u + 1 .. v.at + 1)
+                    {
+                        const z = &ins[q];
+                        if (z.d == c.d || z.a == c.d || z.b == c.d || z.c == c.d || partner && z.d == partner)
+                            return int.min;
+                    }
+                    foreach (j, w; moved[])
+                        if (w == u)
+                            return int.min;
+                    moved.push(u);
+                    movedTo.push(cast(uint)k);
+                }
+                if (outside)
+                    g -= lane ? 4 : 1;
+            }
+        }
+        return g;
+    }
+
+    /* Make the vectors of the tree, its root replacing nothing
+     */
+    @trusted void rewrite()
+    {
+        foreach (k, ref v; nodes[])
+            made(cast(int)k);
+    }
+
+    @trusted Reg made(int k)
+    {
+        VNode* v = &nodes[k];
+        if (v.vec)
+            return v.vec;
+        if (v.kind == VK.splat && v.byElem)
+            return v.r0;
+        Reg kid0 = v.k0 >= 0 ? made(v.k0) : noReg;
+        Reg kid1 = v.k1 >= 0 ? made(v.k1) : noReg;
+        v = &nodes[k];
+        const Reg V = newVreg(RC.fp, 8);
+        growTo(V);
+        LIns i;
+        i.d = V;
+        i.sz = 8;
+        final switch (v.kind)
+        {
+            case VK.splat:
+                i.op = LOp.vdup;
+                i.a = v.r0;
+                break;
+            case VK.zip:
+                i.op = LOp.vzip;
+                i.a = v.r0;
+                i.b = v.r1;
+                break;
+            case VK.vec:
+                assert(0);
+            case VK.load:
+            {
+                i = ins[v.rev ? v.m1 : v.m0];
+                i.d = V;
+                i.sz = 8;
+                i.flags &= ~F.signed;
+                break;
+            }
+            case VK.pack:
+            {
+                const m = &ins[v.m0];
+                const bool elem = m.op == LOp.fmul && v.k1 >= 0 && nodes[v.k1].kind == VK.splat && nodes[v.k1].byElem;
+                const bool elem0 = !elem && m.op == LOp.fmul && v.k0 >= 0 && nodes[v.k0].kind == VK.splat &&
+                    nodes[v.k0].byElem;
+                switch (m.op)
+                {
+                    case LOp.fadd: i.op = LOp.vfadd; break;
+                    case LOp.fsub: i.op = LOp.vfsub; break;
+                    case LOp.fmul: i.op = elem || elem0 ? LOp.vfmule : LOp.vfmul; break;
+                    case LOp.fdiv: i.op = LOp.vfdiv; break;
+                    case LOp.fneg: i.op = LOp.vfneg; break;
+                    case LOp.fabs: i.op = LOp.vfabs; break;
+                    case LOp.fsqrt: i.op = LOp.vfsqrt; break;
+                    default: assert(0);
+                }
+                i.a = elem0 ? kid1 : kid0;
+                i.b = elem0 ? kid0 : kid1;
+                break;
+            }
+        }
+        inserts.push(Insert(v.at, i));
+        Reg result = V;
+        if (v.kind == VK.load && v.rev)
+        {
+            const Reg R = newVreg(RC.fp, 8);
+            growTo(R);
+            LIns r;
+            r.op = LOp.vrev;
+            r.sz = 8;
+            r.d = R;
+            r.a = V;
+            inserts.push(Insert(v.at, r));
+            result = R;
+        }
+        v.vec = result;
+        vecAt[result - firstVreg] = v.at;
+        if (v.kind == VK.pack || v.kind == VK.load)
+        {
+            // the results used on their own are taken out, and the copies of them moved after
+            uint[2] ms = [v.m0, v.m1];
+            foreach (lane, m; ms)
+            {
+                const r = ins[m].d;
+                LIns x;
+                x.op = lane ? LOp.vlane1 : LOp.copy;
+                x.sz = 4;
+                x.d = r;
+                x.a = result;
+                inserts.push(Insert(v.at, x));
+                vecOf[r - firstVreg] = result;
+                laneOf[r - firstVreg] = cast(ubyte)lane;
+                done[m] = true;
+                ins[m] = LIns.init;
+            }
+            foreach (j, u; moved[])
+                if (movedTo[j] == k)
+                {
+                    inserts.push(Insert(v.at, ins[u]));
+                    movedDest[ins[u].d - firstVreg] = true;
+                    done[u] = true;
+                    ins[u] = LIns.init;
+                }
+        }
+        return result;
+    }
+
+    @trusted void growTo(Reg r)
+    {
+        const n = r - firstVreg + 1;
+        if (vecAt.length < n)
+        {
+            const old = vecAt.length;
+            vecAt.setLength(n);
+            vecAt[old .. n] = uint.max;
+        }
+    }
+}
+
+/* Find pairs of float operations done as one on vectors
+ */
+@trusted
+private void vectorize()
+{
+    buildSegments();
+    const ns = segStart.length - 1;
+    Slp s;
+    scope (exit) s.dtor();
+    const nregs = cast(uint)vinfo.length;
+    s.nregs = nregs;
+    s.ndefs.setLength(nregs);
+    s.ndefs[][] = 0;
+    s.defAt.setLength(nregs);
+    bool any;
+    foreach (n, ref i; ins[])
+    {
+        if (i.d && !isPhys(i.d))
+        {
+            ++s.ndefs[i.d - firstVreg];
+            s.defAt[i.d - firstVreg] = cast(uint)n;
+        }
+        if (Slp.pairable(i) && i.op != LOp.ld)
+            any = true;
+    }
+    if (!any)
+        return;
+
+    // copies of floats from registers defined once into registers defined once are not needed
+    {
+        Barray!Reg subst;
+        scope (exit) subst.dtor();
+        subst.setLength(nregs);
+        subst[][] = noReg;
+        bool copies;
+        foreach (n, ref i; ins[])
+            if (i.op == LOp.copy && s.once(i.d) && s.once(i.a) && rcOf(i.d) == RC.fp && rcOf(i.a) == RC.fp &&
+                vi(i.d).sz == vi(i.a).sz)
+            {
+                subst[i.d - firstVreg] = i.a;
+                copies = true;
+            }
+        if (copies)
+        {
+            Reg value(Reg r)
+            {
+                while (r && !isPhys(r) && subst[r - firstVreg])
+                    r = subst[r - firstVreg];
+                return r;
+            }
+            foreach (n, ref i; ins[])
+            {
+                if (i.op == LOp.copy && i.d && !isPhys(i.d) && subst[i.d - firstVreg])
+                {
+                    --s.ndefs[i.d - firstVreg];
+                    i = LIns.init;
+                    continue;
+                }
+                i.a = value(i.a);
+                i.b = value(i.b);
+                i.c = value(i.c);
+            }
+        }
+    }
+
+    // the uses of each register
+    s.useStart.setLength(nregs + 1);
+    s.useStart[][] = 0;
+    foreach (ref i; ins[])
+    {
+        void count(Reg r) { if (!isPhys(r)) ++s.useStart[r - firstVreg + 1]; }
+        forUses(i, &count);
+    }
+    foreach (k; 0 .. nregs)
+        s.useStart[k + 1] += s.useStart[k];
+    s.useList.setLength(s.useStart[nregs]);
+    {
+        Barray!uint fill;
+        scope (exit) fill.dtor();
+        fill.setLength(nregs);
+        fill[][] = s.useStart[0 .. nregs];
+        foreach (n, ref i; ins[])
+        {
+            void add(Reg r) { if (!isPhys(r)) s.useList[fill[r - firstVreg]++] = cast(uint)n; }
+            forUses(i, &add);
+        }
+    }
+    s.done.setLength(ins.length);
+    s.done[][] = false;
+    s.claim.setLength(ins.length);
+    s.claim[][] = -1;
+    s.resA.setLength(ins.length);
+    s.resA[][] = noReg;
+    s.resB.setLength(ins.length);
+    s.resB[][] = noReg;
+    s.curSrc.setLength(nregs);
+    s.curSrc[][] = noReg;
+    s.vecOf.setLength(nregs);
+    s.vecOf[][] = noReg;
+    s.laneOf.setLength(nregs);
+    s.vecAt.setLength(nregs);
+    s.vecAt[][] = uint.max;
+    s.movedDest.setLength(nregs);
+    s.movedDest[][] = false;
+
+    // the regions: segments each falling into the next, its only way in
+    Barray!uint npred, regStart, regionOf;
+    scope (exit) { npred.dtor(); regStart.dtor(); regionOf.dtor(); }
+    npred.setLength(ns);
+    npred[][] = 0;
+    foreach (t; segSucc[])
+        ++npred[t];
+    regionOf.setLength(ins.length);
+    uint si = 0;
+    while (si < ns)
+    {
+        uint sj = si;
+        while (sj + 1 < ns && segSuccStart[sj + 1] - segSuccStart[sj] == 1 && segSucc[segSuccStart[sj]] == sj + 1 &&
+               npred[sj + 1] == 1 && segEnd(sj) == segStart[sj + 1] &&
+               !(segEnd(sj) > segStart[sj] && isBranch(ins[segEnd(sj) - 1].op)))
+            ++sj;
+        if (segEnd(sj) > segStart[si])
+        {
+            foreach (n; segStart[si] .. segEnd(sj))
+                regionOf[n] = cast(uint)regStart.length;
+            regStart.push(segStart[si]);
+            regStart.push(segEnd(sj));
+        }
+        si = sj + 1;
+    }
+
+    findPairs(s, regionOf);
+
+    for (size_t k = 0; k < regStart.length; k += 2)
+        vectorizeRegion(s, regStart[k], regStart[k + 1]);
+
+    if (s.inserts.length)
+        applyInserts(s.inserts);
+
+    // the vectors of the pairs used are made after each copy to lane 1, which follows that to lane 0
+    s.inserts.setLength(0);
+    foreach (P; s.usedPairs[])
+    {
+        const Q = s.pairOther[P - firstVreg];
+        const W = s.pairW[P - firstVreg];
+        foreach (n, ref i; ins[])
+        {
+            if (i.d != Q)
+                continue;
+            uint p = cast(uint)n;
+            while (p > 0 && ins[p].d != P)
+                --p;
+            LIns w;
+            w.sz = 8;
+            w.d = W;
+            const x = ins[p].a, y = i.a;
+            if (s.once(x) && s.once(y) && s.vecOf[x - firstVreg] && s.vecOf[x - firstVreg] == s.vecOf[y - firstVreg] &&
+                s.laneOf[x - firstVreg] == 0 && s.laneOf[y - firstVreg] == 1)
+            {
+                w.op = LOp.copy;
+                w.a = s.vecOf[x - firstVreg];
+            }
+            else
+            {
+                w.op = LOp.vzip;
+                w.a = P;
+                w.b = Q;
+            }
+            s.inserts.push(Insert(cast(uint)n + 1, w));
+        }
+    }
+    if (s.inserts.length)
+        applyInserts(s.inserts);
+}
+
+/* Pair variables of floats set only by copies, each copy to one in a region
+ * followed there by one to the other before the next to the first
+ */
+@trusted
+private void findPairs(ref Slp s, ref Barray!uint regionOf)
+{
+    const nregs = s.nregs;
+    s.pairOther.setLength(nregs);
+    s.pairOther[][] = noReg;
+    s.pairLane.setLength(nregs);
+    s.pairW.setLength(nregs);
+    s.pairW[][] = noReg;
+    s.pinned.setLength(nregs);
+    s.pinned[][] = false;
+
+    // the definitions of each variable that may be in a pair
+    Barray!bool ok;
+    Barray!uint dStart, dList, fill, order;
+    scope (exit) { ok.dtor(); dStart.dtor(); dList.dtor(); fill.dtor(); order.dtor(); }
+    ok.setLength(nregs);
+    foreach (k; 0 .. nregs)
+        ok[k] = s.ndefs[k] >= 2 && vinfo[k].rc == RC.fp && vinfo[k].sz == 4;
+    foreach (ref i; ins[])
+        if (i.d && !isPhys(i.d) && i.d - firstVreg < nregs && (i.op != LOp.copy || i.sz != 4 || i.flags & F.condDef))
+            ok[i.d - firstVreg] = false;
+    dStart.setLength(nregs + 1);
+    dStart[][] = 0;
+    foreach (ref i; ins[])
+        if (i.d && !isPhys(i.d) && i.d - firstVreg < nregs && ok[i.d - firstVreg])
+            ++dStart[i.d - firstVreg + 1];
+    foreach (k; 0 .. nregs)
+        dStart[k + 1] += dStart[k];
+    dList.setLength(dStart[nregs]);
+    fill.setLength(nregs);
+    fill[][] = dStart[0 .. nregs];
+    foreach (n, ref i; ins[])
+        if (i.d && !isPhys(i.d) && i.d - firstVreg < nregs && ok[i.d - firstVreg])
+        {
+            dList[fill[i.d - firstVreg]++] = cast(uint)n;
+            if (dStart[i.d - firstVreg] + 1 == fill[i.d - firstVreg])
+                order.push(i.d - firstVreg);        // in the order of their first definitions
+        }
+
+    foreach (a, P; order[])
+    {
+        if (s.pairOther[P])
+            continue;
+        const dp = dList[dStart[P] .. dStart[P + 1]];
+        foreach (Q; order[a + 1 .. $])
+        {
+            const dq = dList[dStart[Q] .. dStart[Q + 1]];
+            if (dq[0] > dp[0] + 16)
+                break;
+            if (s.pairOther[Q] || dq.length != dp.length)
+                continue;
+            bool match = true;
+            foreach (k; 0 .. dp.length)
+                if (regionOf[dp[k]] != regionOf[dq[k]] || dq[k] <= dp[k] || dq[k] > dp[k] + 16 ||
+                    k + 1 < dp.length && dp[k + 1] <= dq[k])
+                {
+                    match = false;
+                    break;
+                }
+            if (!match)
+                continue;
+            s.pairOther[P] = cast(Reg)(Q + firstVreg);
+            s.pairOther[Q] = cast(Reg)(P + firstVreg);
+            s.pairLane[P] = 0;
+            s.pairLane[Q] = 1;
+            break;
+        }
+    }
+}
+
+private bool isBranch(LOp op) { return op == LOp.br || op == LOp.bcond || op == LOp.cbz; }
+
+@trusted
+private void vectorizeRegion(ref Slp s, uint rs, uint re)
+{
+    if (env!"DMD_NEWCG_SLPT") fprintf(stderr, "slpt: region %d %d\n", rs, re);
+    if (re - rs < 4)
+        return;
+    s.rs = rs;
+    s.re = re;
+    bool any;
+    // the operands followed through copies of variables
+    foreach (n; rs .. re)
+    {
+        auto i = &ins[n];
+        Reg res(Reg r)
+        {
+            if (r && !isPhys(r) && r - firstVreg < s.nregs && s.curSrc[r - firstVreg])
+                return s.curSrc[r - firstVreg];
+            return r;
+        }
+        s.resA[n] = res(i.a);
+        s.resB[n] = res(i.b);
+        if (i.d && !isPhys(i.d) && i.d - firstVreg < s.nregs && s.ndefs[i.d - firstVreg] > 1)
+        {
+            const src = i.op == LOp.copy ? s.resA[n] : noReg;
+            s.curSrc[i.d - firstVreg] = s.once(src) && rcOf(src) == rcOf(i.d) ? src : noReg;
+            if (s.curSrc[i.d - firstVreg])
+                s.forwarded.push(i.d);
+        }
+        if (Slp.pairable(*i) && i.op != LOp.ld)
+            any = true;
+    }
+    // what is followed through copies here is not elsewhere
+    scope (exit)
+    {
+        foreach (r; s.forwarded[])
+            s.curSrc[r - firstVreg] = noReg;
+        s.forwarded.setLength(0);
+    }
+    if (!any)
+        return;
+
+    void attempt(Reg x0, Reg x1, uint user0, uint user1, uint at, int rootGain, uint rootAt, uint rootAt2,
+                 scope void delegate(Reg) nothrow finish)
+    {
+        s.nodes.setLength(0);
+        const root = s.build(x0, x1, user0, user1, at, 0);
+        if (env!"DMD_NEWCG_SLPT") fprintf(stderr, "slpt: try %d %d at %d root %d kind %d\n", x0 - firstVreg, x1 - firstVreg, at, root, root >= 0 ? s.nodes[root].kind : -1);
+        bool ok = root >= 0 && (s.nodes[root].kind == VK.pack || s.nodes[root].kind == VK.load);
+        if (ok)
+        {
+            const g = s.gain(root, rootGain, rootAt, rootAt2);
+            if (env!"DMD_NEWCG_SLP")
+                fprintf(stderr, "newcg-slp: %s at %d nodes %d gain %d\n", funcsym_p.Sident.ptr, cast(int)at,
+                    cast(int)s.nodes.length, g);
+            ok = g > 0 && g != int.min;
+        }
+        if (ok)
+        {
+            // DMD_NEWCG_SLPMAX limits it to that many trees, for bisecting
+            __gshared long limit = -2;
+            __gshared long count;
+            if (limit == -2)
+            {
+                auto p = env!"DMD_NEWCG_SLPMAX";
+                limit = p ? atoll(p) : -1;
+            }
+            ok = limit < 0 || count < limit;
+            ++count;
+            if (ok && env!"DMD_NEWCG_SLP")
+                fprintf(stderr, "newcg-slp: made %d\n", cast(int)(count - 1));
+        }
+        if (ok)
+        {
+            foreach (ref v; s.nodes[])
+                if (s.isPairVec(v) && !s.pinned[v.r0 - firstVreg])
+                {
+                    s.pinned[v.r0 - firstVreg] = true;
+                    s.pinned[v.r1 - firstVreg] = true;
+                    s.usedPairs.push(v.r0);
+                }
+            const V = s.made(root);
+            s.rewrite();
+            finish(V);
+        }
+        foreach (ref v; s.nodes[])
+            if (v.kind == VK.pack || v.kind == VK.load)
+            {
+                s.claim[v.m0] = -1;
+                s.claim[v.m1] = -1;
+            }
+    }
+
+    // stores of adjacent floats
+    foreach (n; rs .. re)
+    {
+        const i = &ins[n];
+        if (i.op != LOp.st || i.sz != 4 || s.done[n] || rcOf(i.a) != RC.fp || i.flags & F.scaled)
+            continue;
+        foreach (m; n + 1 .. re)
+        {
+            const j = &ins[m];
+            if (j.op == LOp.st && j.sz == 4 && !s.done[m] && rcOf(j.a) == RC.fp && !(j.flags & F.scaled) &&
+                !s.writesBetween(n, m))
+            {
+                // lane 0 is the one at the lower address, whose address the vector is stored to
+                uint lo = uint.max;
+                if (s.adjacent(n, m) && (!i.b || s.stable(i.b, n, m)) && (!i.c || s.stable(i.c, n, m)))
+                    lo = n;
+                else if (s.adjacent(m, n))
+                    lo = m;
+                if (lo != uint.max)
+                {
+                    const hi = m, other = lo == n ? m : n;
+                    void store(Reg V)
+                    {
+                        LIns w = ins[lo];
+                        w.sz = 8;
+                        w.a = V;
+                        s.inserts.push(Insert(hi, w));
+                        s.done[n] = s.done[m] = true;
+                        ins[n] = LIns.init;
+                        ins[m] = LIns.init;
+                    }
+                    attempt(s.resA[lo], s.resA[other], lo, other, m, 4, n, m, &store);
+                    break;
+                }
+            }
+            if (j.op == LOp.call || writesMemory(*j) || j.op == LOp.ld)
+                break;
+        }
+    }
+
+    // sums of the lanes
+    foreach (n; rs .. re)
+    {
+        const i = &ins[n];
+        if (i.op != LOp.fadd || i.sz != 4 || s.done[n] || i.flags & F.condDef)
+            continue;
+        const x0 = s.resA[n], x1 = s.resB[n];
+        if (!s.once(x0) || !s.once(x1) || x0 == x1)
+            continue;
+        const n0 = s.defAt[x0 - firstVreg], n1 = s.defAt[x1 - firstVreg];
+        if (n0 < rs || n1 < rs || n0 >= n || n1 >= n || ins[n0].op != ins[n1].op || !Slp.pairable(ins[n0]))
+            continue;
+        const nn = n;
+        void sum(Reg V)
+        {
+            ins[nn].op = LOp.vfaddp;
+            ins[nn].a = V;
+            ins[nn].b = noReg;
+        }
+        attempt(x0, x1, n, n, n0 > n1 ? n0 : n1, 0, n, uint.max, &sum);
+    }
+
+    // any two like operations near each other
+    foreach_reverse (n; rs .. re)
+    {
+        const i = &ins[n];
+        if (s.done[n] || !Slp.pairable(*i) || i.op == LOp.ld || !s.once(i.d))
+            continue;
+        int tries = 0;
+        for (uint m = n; m > rs && n - m < 48 && tries < 8; )
+        {
+            --m;
+            const j = &ins[m];
+            if (s.done[m] || j.op != i.op || !Slp.pairable(*j) || !s.once(j.d))
+                continue;
+            ++tries;
+            void nothing(Reg) { }
+            attempt(j.d, i.d, m, n, n, 0, uint.max, uint.max, &nothing);
+            if (s.done[n])
+                break;
+        }
+    }
+}
+
 /******************************* Loop invariants ******************************/
 
 /* Whether the result of i depends only on its operands, and computing it
@@ -6015,6 +7143,7 @@ private bool pureOp(ref const LIns i)
         case LOp.fadd, LOp.fsub, LOp.fmul, LOp.fdiv, LOp.fneg, LOp.fabs, LOp.fsqrt:
         case LOp.scvtf, LOp.ucvtf, LOp.fcvtzs, LOp.fcvtzu, LOp.fcvtms, LOp.fcvt:
         case LOp.lea:
+        case LOp.vfadd: .. case LOp.vfaddp:
             return true;
         case LOp.copy:
             return !isPhys(i.a) && !env!"DMD_NEWCG_LICMNOCOPY";
@@ -7917,6 +9046,32 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
             cdb.gen1(INSTR.addsub_imm(1, i.op == LOp.spsub, 0, 0, cast(uint)i.imm, 31, 31));   // SUB/ADD SP,SP,#imm
             break;
 
+        case LOp.vfadd: .. case LOp.vfaddp:
+        {
+            const d = pr(i.d);
+            def(d);
+            static immutable uint[LOp.vfaddp - LOp.vfadd + 1] base = [
+                0x0E20D400,     // FADD Vd.2S,Vn.2S,Vm.2S
+                0x0EA0D400,     // FSUB
+                0x2E20DC00,     // FMUL
+                0x2E20FC00,     // FDIV
+                0x0F809000,     // FMUL Vd.2S,Vn.2S,Vm.S[0]
+                0x2EA0F800,     // FNEG Vd.2S,Vn.2S
+                0x0EA0F800,     // FABS
+                0x2EA1F800,     // FSQRT
+                0x0E040400,     // DUP Vd.2S,Vn.S[0]
+                0x0E803800,     // ZIP1 Vd.2S,Vn.2S,Vm.2S
+                0x0EA00800,     // REV64 Vd.2S,Vn.2S
+                0x5E0C0400,     // MOV Sd,Vn.S[1]
+                0x7E30D800,     // FADDP Sd,Vn.2S
+            ];
+            uint w = base[i.op - LOp.vfadd] | (pr(i.a) & 31) << 5 | (d & 31);
+            if (i.b)
+                w |= (pr(i.b) & 31) << 16;
+            cdb.gen1(w);
+            break;
+        }
+
         case LOp.call:
         {
             cgp.calledafunc = 1;
@@ -8032,6 +9187,7 @@ private void verify()
                 break;
             case LOp.fadd: .. case LOp.fcsel:
             case LOp.fmovi, LOp.fcvt:
+            case LOp.vfadd: .. case LOp.vfaddp:
                 want(i.d, RC.fp, "d"); want(i.a, RC.fp, "a"); want(i.b, RC.fp, "b");
                 break;
             case LOp.scvtf, LOp.ucvtf:
