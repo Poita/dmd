@@ -53,6 +53,28 @@ private ref Tarr _d_arrayappendcTX_(Tarr : T[], T)(return ref scope Tarr px, siz
         if (n == 0)
             return px;
 
+        enum sizeelem = T.sizeof;
+        auto newlength = px.length + n;
+
+        if (!gc_expandArrayUsed(px, newlength * sizeelem, isshared))
+            return _d_arrayappendcTXGrow(px, n, isshared);
+
+        // we were able to expand in place, just update the length
+        px = px.ptr[0 .. newlength];
+        return px;
+    }
+    else
+        assert(0, "Cannot append to array if compiling without support for runtime type information!");
+}
+
+/* `_d_arrayappendcTX_` when the block cannot hold the array grown in place, by
+ * moving it to a new block: apart, so the common case needs to save little
+ */
+private ref Tarr _d_arrayappendcTXGrow(Tarr : T[], T)(return ref scope Tarr px, size_t n, bool isshared) @trusted
+{
+    version (DigitalMars) pragma(inline, false);
+    version (D_TypeInfo)
+    {
         import core.stdc.string : memcpy, memset;
         import core.internal.lifetime : __doPostblit;
         import core.internal.array.utils: __arrayAlloc, newCapacity, __typeAttrs;
@@ -68,43 +90,36 @@ private ref Tarr _d_arrayappendcTX_(Tarr : T[], T)(return ref scope Tarr px, siz
         auto newsize = newlength * sizeelem;
         auto size = length * sizeelem;
 
-        if (!gc_expandArrayUsed(px, newsize, isshared))
+        // could not set the size, we must reallocate.
+        auto newcap = newCapacity(newlength, sizeelem);
+        auto attrs = __typeAttrs!T(cast(void*)px.ptr) | BlkAttr.APPENDABLE;
+
+        T* ptr = cast(T*)GC.malloc(newcap, attrs, typeid(T));
+        if (ptr is null)
         {
-            // could not set the size, we must reallocate.
-            auto newcap = newCapacity(newlength, sizeelem);
-            auto attrs = __typeAttrs!T(cast(void*)px.ptr) | BlkAttr.APPENDABLE;
-
-            T* ptr = cast(T*)GC.malloc(newcap, attrs, typeid(T));
-            if (ptr is null)
-            {
-                onOutOfMemoryError();
-                assert(0);
-            }
-
-            if (newsize != newcap)
-            {
-                // For small blocks that are always fully scanned, if we allocated more
-                // capacity than was requested, we are responsible for zeroing that
-                // memory.
-                // TODO: should let the GC figure this out, as this property may
-                // not always hold.
-                if (!(attrs & BlkAttr.NO_SCAN) && newcap < PAGESIZE)
-                    memset(ptr + newlength, 0, newcap - newsize);
-
-                gc_shrinkArrayUsed(ptr[0 .. newlength], newcap, isshared);
-            }
-
-            memcpy(ptr, px.ptr, size);
-
-            // do potsblit processing.
-            __doPostblit!T(ptr[0 .. length]);
-
-            px = ptr[0 .. newlength];
-            return px;
+            onOutOfMemoryError();
+            assert(0);
         }
 
-        // we were able to expand in place, just update the length
-        px = px.ptr[0 .. newlength];
+        if (newsize != newcap)
+        {
+            // For small blocks that are always fully scanned, if we allocated more
+            // capacity than was requested, we are responsible for zeroing that
+            // memory.
+            // TODO: should let the GC figure this out, as this property may
+            // not always hold.
+            if (!(attrs & BlkAttr.NO_SCAN) && newcap < PAGESIZE)
+                memset(ptr + newlength, 0, newcap - newsize);
+
+            gc_shrinkArrayUsed(ptr[0 .. newlength], newcap, isshared);
+        }
+
+        memcpy(ptr, px.ptr, size);
+
+        // do potsblit processing.
+        __doPostblit!T(ptr[0 .. length]);
+
+        px = ptr[0 .. newlength];
         return px;
     }
     else

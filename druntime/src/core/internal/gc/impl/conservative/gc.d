@@ -1509,6 +1509,76 @@ class ConservativeGC : GC
             // cannot "expand" by shrinking.
             return false;
 
+        if (!atomic)
+        {
+            /* The cached block of the array, as when one array is appended to again
+             * and again: its used length is checked and set here, as
+             * __setArrayAllocLength does, when the array ends where the used part
+             * of the block does and what is added fits; anything else is left to
+             * the general case below
+             */
+            if (auto bic = __getBlkInfo(slice.ptr))
+            {
+                auto base = bic.base;
+                immutable size = bic.size;
+                immutable attr = bic.attr;
+                if (attr & BlkAttr.APPENDABLE)
+                {
+                    if (size <= PAGESIZE / 2)
+                    {
+                        // the array is at the base, its length at the end, before any TypeInfo
+                        immutable offset = slice.ptr - base;
+                        immutable used = newUsed + offset;
+                        immutable existing = slice.length + offset;
+                        immutable typeInfoSize = (attr & BlkAttr.STRUCTFINAL) ? size_t.sizeof : 0;
+                        if (size <= 256)
+                        {
+                            auto length = cast(ubyte*)(base + size - typeInfoSize - SMALLPAD);
+                            if (used <= size - SMALLPAD - typeInfoSize && *length == cast(ubyte) existing)
+                            {
+                                *length = cast(ubyte) used;
+                                return true;
+                            }
+                        }
+                        else
+                        {
+                            auto length = cast(ushort*)(base + size - typeInfoSize - MEDPAD);
+                            if (used <= size - MEDPAD - typeInfoSize && *length == existing)
+                            {
+                                *length = cast(ushort) used;
+                                return true;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // the array is after a prefix, its length at the base
+                        immutable offset = slice.ptr - (base + LARGEPREFIX(base));
+                        immutable used = newUsed + offset;
+                        immutable existing = slice.length + offset;
+                        auto length = cast(size_t*) base;
+                        if (used + LARGEPAD(base) <= size && *length == existing)
+                        {
+                            *length = used;
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        return expandArrayUsedAnyhow(slice, newUsed, atomic);
+    }
+
+    /* `expandArrayUsed` beyond the cached block that holds what is added: apart,
+     * so appending in place needs to save little
+     */
+    private bool expandArrayUsedAnyhow(void[] slice, size_t newUsed, bool atomic) nothrow @trusted
+    {
+        import core.internal.gc.blockmeta;
+        import core.internal.gc.blkcache;
+        import core.internal.array.utils;
+
         // lookup the block info, using the cache if possible
         auto bic = atomic ? null : __getBlkInfo(slice.ptr);
         auto info = bic ? *bic : query(slice.ptr);

@@ -18,9 +18,6 @@ alias BlkAttr = GC.BlkAttr;
   */
 private enum N_CACHE_BLOCKS = 8;
 
-// note this is TLS, so no need to sync.
-BlkInfo *__blkcache_storage;
-
 static if (N_CACHE_BLOCKS == 1)
 {
     version=single_cache;
@@ -32,17 +29,29 @@ else
 
     // ensure N_CACHE_BLOCKS is power of 2.
     static assert(!((N_CACHE_BLOCKS - 1) & N_CACHE_BLOCKS));
-
-    version (random_cache)
-    {
-        int __nextRndNum = 0;
-    }
-    int __nextBlkIdx;
 }
+
+/* The thread's cache state, in one thread local variable so that a lookup finds
+ * all of it at once: thread locals are reached through a call on some platforms
+ */
+private struct BlkCacheState
+{
+    BlkInfo* storage;
+    static if (N_CACHE_BLOCKS != 1)
+    {
+        version (random_cache)
+            int nextRndNum;
+        int nextBlkIdx;     // the head: the entry put in or found last
+    }
+}
+
+// note this is TLS, so no need to sync.
+private BlkCacheState __blkcacheState;
 
 @property BlkInfo *__blkcache() nothrow @nogc
 {
-    if (!__blkcache_storage)
+    auto state = &__blkcacheState;
+    if (!state.storage)
     {
         import core.stdc.stdlib : calloc;
         import core.thread.threadbase;
@@ -56,10 +65,10 @@ else
         immutable size = BlkInfo.sizeof * N_CACHE_BLOCKS;
         // use C alloc, because this may become a detached thread, and the GC
         // would then clean up the cache without zeroing this pointer.
-        __blkcache_storage = cast(BlkInfo*) calloc(size, 1);
-        tBase.tlsGCData = __blkcache_storage;
+        state.storage = cast(BlkInfo*) calloc(size, 1);
+        tBase.tlsGCData = state.storage;
     }
-    return __blkcache_storage;
+    return state.storage;
 }
 
 // free the allocation on thread exit.
@@ -69,8 +78,8 @@ void cleanupBlkCache(void* storage) nothrow @nogc
     {
         // check if this is the same thread as the current running thread, and
         // if so, make sure we don't leave a dangling pointer.
-        if (__blkcache_storage is storage)
-            __blkcache_storage = null;
+        if (__blkcacheState.storage is storage)
+            __blkcacheState.storage = null;
         import core.stdc.stdlib : free;
         free(storage);
     }
@@ -137,10 +146,15 @@ unittest
   */
 BlkInfo *__getBlkInfo(void *interior) nothrow @nogc
 {
-    BlkInfo *ptr = __blkcache;
+    auto state = &__blkcacheState;
+    BlkInfo *ptr = state.storage;
     if (ptr is null)
-        // if for some reason we don't have a cache, return null.
-        return null;
+    {
+        ptr = __blkcache;
+        if (ptr is null)
+            // if for some reason we don't have a cache, return null.
+            return null;
+    }
     version (single_cache)
     {
         if (ptr.base && ptr.base <= interior && (interior - ptr.base) < ptr.size)
@@ -158,25 +172,43 @@ BlkInfo *__getBlkInfo(void *interior) nothrow @nogc
     }
     else
     {
-        // try to do a smart lookup, using __nextBlkIdx as the "head"
-        auto curi = ptr + __nextBlkIdx;
-        for (auto i = curi; i >= ptr; --i)
+        // try to do a smart lookup, using the head first
+        auto curi = ptr + state.nextBlkIdx;
+        if (curi.base && curi.base <= interior && cast(size_t)(interior - curi.base) < curi.size)
+            return curi;
+        BlkInfo* found;
+        for (auto i = curi; i > ptr; )
         {
+            --i;
             if (i.base && i.base <= interior && cast(size_t)(interior - i.base) < i.size)
-                return i;
+            {
+                found = i;
+                break;
+            }
         }
-
-        for (auto i = ptr + N_CACHE_BLOCKS - 1; i > curi; --i)
-        {
-            if (i.base && i.base <= interior && cast(size_t)(interior - i.base) < i.size)
-                return i;
-        }
+        if (!found)
+            for (auto i = ptr + N_CACHE_BLOCKS - 1; i > curi; --i)
+            {
+                if (i.base && i.base <= interior && cast(size_t)(interior - i.base) < i.size)
+                {
+                    found = i;
+                    break;
+                }
+            }
+        if (!found)
+            return null; // not in cache.
+        // swapped with the head, as the next lookup is likely of the same block
+        auto t = *found;
+        *found = *curi;
+        *curi = t;
+        return curi;
     }
     return null; // not in cache.
 }
 
 void __insertBlkInfoCache(BlkInfo bi, BlkInfo *curpos) nothrow @nogc
 {
+    auto state = &__blkcacheState;
     auto cache = __blkcache;
     if (cache is null)
         // no cache to use.
@@ -200,8 +232,8 @@ void __insertBlkInfoCache(BlkInfo bi, BlkInfo *curpos) nothrow @nogc
                 // cache block info.  This means that the ordering of the cache
                 // doesn't mean anything.  Certain patterns of allocation may
                 // render the cache near-useless.
-                cache[__nextBlkIdx] = bi;
-                __nextBlkIdx = (__nextBlkIdx+1) & (N_CACHE_BLOCKS - 1);
+                cache[state.nextBlkIdx] = bi;
+                state.nextBlkIdx = (state.nextBlkIdx+1) & (N_CACHE_BLOCKS - 1);
             }
         }
         else version (random_cache)
@@ -211,12 +243,12 @@ void __insertBlkInfoCache(BlkInfo bi, BlkInfo *curpos) nothrow @nogc
             // element.
             if (!curpos)
             {
-                __nextBlkIdx = (__nextRndNum = 1664525 * __nextRndNum + 1013904223) & (N_CACHE_BLOCKS - 1);
-                curpos = cache + __nextBlkIdx;
+                state.nextBlkIdx = (state.nextRndNum = 1664525 * state.nextRndNum + 1013904223) & (N_CACHE_BLOCKS - 1);
+                curpos = cache + state.nextBlkIdx;
             }
             else
             {
-                __nextBlkIdx = curpos - cache;
+                state.nextBlkIdx = curpos - cache;
             }
             *curpos = bi;
         }
@@ -229,13 +261,13 @@ void __insertBlkInfoCache(BlkInfo bi, BlkInfo *curpos) nothrow @nogc
             //
             if (!curpos)
             {
-                __nextBlkIdx = (__nextBlkIdx+1) & (N_CACHE_BLOCKS - 1);
-                curpos = cache + __nextBlkIdx;
+                state.nextBlkIdx = (state.nextBlkIdx+1) & (N_CACHE_BLOCKS - 1);
+                curpos = cache + state.nextBlkIdx;
             }
-            else if (curpos !is cache + __nextBlkIdx)
+            else if (curpos !is cache + state.nextBlkIdx)
             {
-                *curpos = cache[__nextBlkIdx];
-                curpos = cache + __nextBlkIdx;
+                *curpos = cache[state.nextBlkIdx];
+                curpos = cache + state.nextBlkIdx;
             }
             *curpos = bi;
         }
