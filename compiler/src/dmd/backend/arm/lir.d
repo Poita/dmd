@@ -1928,6 +1928,20 @@ private void genCond(elem* e, bool jumpIfTrue, uint l, block* t = null)
         case OPandand:
         case OPoror:
         {
+            // x > s || -x > s as |x| > s, the same for NaN, with x made once
+            elem* ax, as;
+            if (e.Eoper == OPoror && absCompare(e, ax, as))
+            {
+                const fsz = tysize(ax.Ety);
+                Reg x = gen(ax);
+                Reg a = newVreg(RC.fp, fsz);
+                emitIns(LOp.fabs, fsz, a, x);
+                Reg b = gen(as);
+                emitIns(LOp.fcmp, fsz, noReg, a, b);
+                const c = e.E1.Eoper == OPgt ? COND.gt : COND.ge;
+                jump(jumpIfTrue ? c : cast(COND)(c ^ 1));
+                return;
+            }
             const isAnd = e.Eoper == OPandand;
             if (jumpIfTrue == isAnd)
             {
@@ -2006,6 +2020,26 @@ private Reg flagValue(elem* e, uint sz)
     auto i = emitIns(LOp.cset, 4, d);
     i.cond = c;
     return d;
+}
+
+/* Whether e is x > s || -x > s (or -x > s || x > s, or with >=) of floats with
+ * no side effects, setting x and s
+ */
+@trusted
+private bool absCompare(elem* e, out elem* x, out elem* s)
+{
+    elem* a = e.E1, b = e.E2;
+    if (a.Eoper != b.Eoper || a.Eoper != OPgt && a.Eoper != OPge || !tyfloating(a.E1.Ety) ||
+        tycomplex(a.E1.Ety) || tysize(a.E1.Ety) > 8 || !el_match(a.E2, b.E2))
+        return false;
+    if (b.E1.Eoper == OPneg && el_match(b.E1.E1, a.E1))
+        x = a.E1;
+    else if (a.E1.Eoper == OPneg && el_match(a.E1.E1, b.E1))
+        x = b.E1;
+    else
+        return false;
+    s = a.E2;
+    return !el_sideeffect(x) && !el_sideeffect(s);
 }
 
 /* Jump if the value of e is nonzero (or zero if !jumpIfTrue)

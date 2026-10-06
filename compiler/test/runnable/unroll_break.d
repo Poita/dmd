@@ -44,8 +44,22 @@ pragma(inline, false) int nested(const int[] a)
     return s;
 }
 
+// |d| > s written as d > s || -d > s, for numbers and NaN
+pragma(inline, false) int beyond(float d, float s)
+{
+    if (d > s || -d > s)
+        return 1;
+    if (-d >= s || d >= s)
+        return 2;
+    return 3;
+}
+
 void main()
 {
+    if (beyond(2, 1) != 1 || beyond(-2, 1) != 1 || beyond(1, 1) != 2 || beyond(-1, 1) != 2 ||
+        beyond(0.5f, 1) != 3 || beyond(float.nan, 1) != 3 || beyond(1, float.nan) != 3 ||
+        beyond(-0.0f, 0) != 2 || beyond(float.infinity, 1e30f) != 1)
+        assert(0);
     if (firstOver([1, 5, 9, 2], 4) != 1 || firstOver([1, 2, 3, 4], 9) != 4 || firstOver([7, 0, 0, 0], 0) != 0)
         assert(0);
     float[8] f = [1, 1.5f, 2, 9, 3, 3, 3, 3];
