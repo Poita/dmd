@@ -1906,8 +1906,33 @@ private void genCond(elem* e, bool jumpIfTrue, uint l, block* t = null)
             return;
 
         case OPbool:
+        case OPu8_16: case OPs8_16: case OPu16_32: case OPs16_32: case OPu32_64: case OPs32_64:
+            // nonzero as the value it extends is
             genCond(e.E1, jumpIfTrue, l, t);
             return;
+
+        case OPcond:
+        {
+            // c ? a : b as the test of a, or that of b
+            if (!tyintegral(e.Ety) || e.E2.Eoper != OPcolon)
+            {
+                valueCond(e, jumpIfTrue, &jump);
+                return;
+            }
+            const lelse = newLabel();
+            const lend = newLabel();
+            genCond(e.E1, false, lelse);
+            auto m = enterCond();
+            genCond(e.E2.E1, jumpIfTrue, l, t);
+            leaveCond(m);
+            jumpTo(lend);
+            placeLabel(lelse);
+            m = enterCond();
+            genCond(e.E2.E2, jumpIfTrue, l, t);
+            leaveCond(m);
+            placeLabel(lend);
+            return;
+        }
 
         case OPand:
         {

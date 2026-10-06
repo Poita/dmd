@@ -31,8 +31,24 @@ pragma(inline, false) int countFalse(const bool[] a, int x)
     return s;
 }
 
+// branches on selects of bools, and on widened values
+pragma(inline, false) int pick(bool c, bool a, int b, ubyte u)
+{
+    int s;
+    if (c ? a : b > 3)
+        s += 1;
+    if (!(c ? b < 0 : a))
+        s += 10;
+    if (cast(int)u)
+        s += 100;
+    return s;
+}
+
 void main()
 {
+    if (pick(true, true, 0, 0) != 1 + 10 || pick(true, false, -1, 1) != 100 || pick(false, true, 5, 2) != 101 ||
+        pick(false, false, 2, 0) != 10)
+        assert(0);
     if (countFalse([true, false, false, true], 5) != 10 - 0 || countFalse([true, false], 1) != 1 - 1)
         assert(0);
     foreach (x; -3 .. 9)
