@@ -4834,10 +4834,18 @@ private void numberValues()
         return h ^ (h >> 17);
     }
     bool any;
+    // what is known flows on into a segment entered only from the one before
+    Barray!uint follows;
+    scope (exit) follows.dtor();
+    soleFallthrough(follows);
+    uint count;
     foreach (si; 0 .. ns)
     {
-        ++gen;
-        uint count;
+        if (!follows[si] || env!"DMD_NEWCG_NOEBB")
+        {
+            ++gen;
+            count = 0;
+        }
         foreach (n; segStart[si] .. segEnd(si))
         {
             LIns* i = &ins[n];
@@ -7294,36 +7302,13 @@ private bool vectorize()
     // the regions: segments each falling into the next, its only way in
     Barray!uint npred, regStart, regionOf;
     scope (exit) { npred.dtor(); regStart.dtor(); regionOf.dtor(); }
-    // the ways into each segment: branches to it, and from the one before unless that jumps or returns
-    bool fallsThrough(size_t k)
-    {
-        const end = segEnd(k);
-        if (end > segStart[k] && ins[end - 1].op == LOp.br)
-            return false;
-        const b = blocks[segBlock[k]];
-        const last = k + 1 == ns || segBlock[k + 1] != segBlock[k];
-        return !(last && (b.bc == BC.ret || b.bc == BC.exit || b.bc == BC.retexp));
-    }
-    npred.setLength(ns);
-    npred[][] = 0;
-    foreach (k; 0 .. ns)
-    {
-        const end = segEnd(k);
-        if (end > segStart[k] && isBranch(ins[end - 1].op))
-        {
-            const i = &ins[end - 1];
-            ++npred[i.flags & F.toLabel ? labelSeg[i.target] : blockSeg[i.target]];
-        }
-        if (k + 1 < ns && fallsThrough(k))
-            ++npred[k + 1];
-    }
+    soleFallthrough(npred);
     regionOf.setLength(ins.length);
     uint si = 0;
     while (si < ns)
     {
         uint sj = si;
-        while (sj + 1 < ns && npred[sj + 1] == 1 && fallsThrough(sj) && segEnd(sj) == segStart[sj + 1] &&
-               !(segEnd(sj) > segStart[sj] && isBranch(ins[segEnd(sj) - 1].op)))
+        while (sj + 1 < ns && npred[sj + 1] && !(segEnd(sj) > segStart[sj] && isBranch(ins[segEnd(sj) - 1].op)))
             ++sj;
         if (segEnd(sj) > segStart[si])
         {
@@ -7455,6 +7440,44 @@ private void findPairs(ref Slp s, ref Barray!uint regionOf)
 }
 
 private bool isBranch(LOp op) { return op == LOp.br || op == LOp.bcond || op == LOp.cbz; }
+
+/* For each segment, whether the only way into it is falling through from the
+ * one before, which may branch elsewhere too; buildSegments() has run
+ */
+@trusted
+private void soleFallthrough(ref Barray!uint only)
+{
+    const ns = segStart.length - 1;
+    // the ways into each segment: branches to it, and from the one before unless that jumps or returns
+    bool fallsThrough(size_t k)
+    {
+        const end = segEnd(k);
+        if (end > segStart[k] && ins[end - 1].op == LOp.br)
+            return false;
+        const b = blocks[segBlock[k]];
+        const last = k + 1 == ns || segBlock[k + 1] != segBlock[k];
+        return !(last && (b.bc == BC.ret || b.bc == BC.exit || b.bc == BC.retexp));
+    }
+    Barray!uint npred;
+    scope (exit) npred.dtor();
+    npred.setLength(ns);
+    npred[][] = 0;
+    foreach (k; 0 .. ns)
+    {
+        const end = segEnd(k);
+        if (end > segStart[k] && isBranch(ins[end - 1].op))
+        {
+            const i = &ins[end - 1];
+            ++npred[i.flags & F.toLabel ? labelSeg[i.target] : blockSeg[i.target]];
+        }
+        if (k + 1 < ns && fallsThrough(k))
+            ++npred[k + 1];
+    }
+    only.setLength(ns);
+    only[][] = 0;
+    foreach (k; 1 .. ns)
+        only[k] = npred[k] == 1 && fallsThrough(k - 1) && segEnd(k - 1) == segStart[k];
+}
 
 @trusted
 private void vectorizeRegion(ref Slp s, uint rs, uint re)
