@@ -5590,24 +5590,27 @@ private void hoistInvariantTests()
         return n;
     }
     /* the instruction of the test segment si setting the flags (or the CBZ) and its
-     * branch, if all the segment does is the test
+     * branch, if all the segment does is the test and compute what it reads
      */
     bool test(size_t si, out uint setter, out uint branch)
     {
-        const n = first(si);
         const end = segEnd(si);
-        if (n + 1 == end && ins[n].op == LOp.cbz)
-        {
-            setter = branch = n;
-            return true;
-        }
-        if (n + 2 == end && ins[n + 1].op == LOp.bcond && ins[n].op != LOp.call && setsFlags(ins[n].op))
-        {
-            setter = n;
-            branch = n + 1;
-            return true;
-        }
-        return false;
+        if (end == segStart[si])
+            return false;
+        uint n;
+        if (ins[end - 1].op == LOp.cbz)
+            n = end - 1;
+        else if (end - 1 > segStart[si] && ins[end - 1].op == LOp.bcond && ins[end - 2].op != LOp.call &&
+                 setsFlags(ins[end - 2].op))
+            n = end - 2;
+        else
+            return false;
+        foreach (k; first(si) .. n)
+            if (!pureOp(ins[k]) || !ins[k].d || isPhys(ins[k].d))
+                return false;
+        setter = n;
+        branch = end - 1;
+        return true;
     }
 
     Barray!uint segOf;
@@ -5627,7 +5630,8 @@ private void hoistInvariantTests()
     }
 
     // what is put before each instruction
-    static struct Insert { uint at; LIns i; }
+    // leads: it begins the block that begins at `at`, rather than ends the one before
+    static struct Insert { uint at; LIns i; bool leads; }
     Barray!Insert inserts;
     scope (exit) inserts.dtor();
     Barray!uint chosen;
@@ -5723,8 +5727,19 @@ private void hoistInvariantTests()
                     continue;
                 if (ins[sw].op != LOp.cbz && w + 1 < ns)
                 {
-                    const nf = first(w + 1);
-                    if (nf < segEnd(w + 1) && readsFlags(ins[nf].op))
+                    // read after its branch, before they are set again
+                    bool read;
+                    foreach (k; segStart[w + 1] .. segEnd(w + 1))
+                    {
+                        if (readsFlags(ins[k].op))
+                        {
+                            read = true;
+                            break;
+                        }
+                        if (setsFlags(ins[k].op))
+                            break;
+                    }
+                    if (read)
                         continue;
                 }
                 // what the tests read is defined before where they go in the preheader
@@ -5739,8 +5754,39 @@ private void hoistInvariantTests()
                 if (early)
                     chosen.push(w);
             }
-            if (chosen.length < 2)
+            // done first, they spare the others: worth it unless the only one is first already
+            if (!chosen.length || chosen.length == 1 && chosen[0] == v)
                 continue;
+            /* The run is left at its start when one of them holds, before what it
+             * computes: what that is must be used only in the run, or after it where
+             * only the run leads
+             */
+            {
+                const after = last + 1;
+                const bodyOk = after < ns && predStart[after + 1] - predStart[after] == 1 &&
+                    preds[predStart[after]] == last;
+                bool local = true;
+                foreach (w; v .. last + 1)
+                    foreach (k; segStart[w] .. segEnd(w))
+                    {
+                        const d = ins[k].d;
+                        if (!d || isPhys(d))
+                            continue;
+                        foreach (m, ref u; ins[])
+                        {
+                            const sm = segOf[m];
+                            if (sm >= v && sm <= last || bodyOk && sm == after)
+                                continue;
+                            bool uses;
+                            void check(Reg r) { uses |= r == d; }
+                            forUses(u, &check);
+                            if (uses)
+                                local = false;
+                        }
+                    }
+                if (!local)
+                    continue;
+            }
 
             // in the preheader: each test as 0 or 1, ored together
             Reg any;
@@ -5784,32 +5830,25 @@ private void hoistInvariantTests()
                 else
                     any = r;
             }
-            // in the loop: the first of them tests the register, the others go
-            foreach (k, w; chosen[])
+            // in the loop: a test of the register starts the run, and they go
+            {
+                LIns b;
+                b.op = LOp.cbz;
+                b.cond = COND.ne;
+                b.a = any;
+                b.sz = 4;
+                b.target = target;
+                b.flags = toLabel;
+                inserts.push(Insert(first(v), b, true));
+            }
+            foreach (w; chosen[])
             {
                 uint sw, bw;
                 test(w, sw, bw);
-                if (k == 0)
-                {
-                    LIns* b = &ins[bw];
-                    b.op = LOp.cbz;
-                    b.cond = COND.ne;
-                    b.a = any;
-                    b.sz = 4;
-                    b.imm = 0;
-                    if (sw != bw)
-                    {
-                        ins[sw].op = LOp.nop;
-                        ins[sw].a = ins[sw].b = noReg;
-                    }
-                }
-                else
-                {
-                    ins[sw].op = LOp.nop;
-                    ins[sw].a = ins[sw].b = noReg;
-                    ins[bw].op = LOp.nop;
-                    ins[bw].a = noReg;
-                }
+                ins[sw].op = LOp.nop;
+                ins[sw].a = ins[sw].b = noReg;
+                ins[bw].op = LOp.nop;
+                ins[bw].a = noReg;
             }
         }
     }
@@ -5817,7 +5856,8 @@ private void hoistInvariantTests()
         return;
     // in the order of their places, those for one place in the order made
     foreach (a; 1 .. inserts.length)
-        for (size_t b = a; b > 0 && inserts[b - 1].at > inserts[b].at; --b)
+        for (size_t b = a; b > 0 && (inserts[b - 1].at > inserts[b].at ||
+                                     inserts[b - 1].at == inserts[b].at && inserts[b - 1].leads > inserts[b].leads); --b)
         {
             Insert t = inserts[b];
             inserts[b] = inserts[b - 1];
@@ -5832,10 +5872,16 @@ private void hoistInvariantTests()
     Barray!uint newIndex;
     scope (exit) newIndex.dtor();
     newIndex.setLength(old.length + 1);
+    Barray!uint leadIndex;      // where the instructions leading the block at each place start
+    scope (exit) leadIndex.dtor();
+    leadIndex.setLength(old.length + 1);
     ins.setLength(0);
     size_t k = 0;
     foreach (n; 0 .. old.length + 1)
     {
+        while (k < inserts.length && inserts[k].at == n && !inserts[k].leads)
+            ins.push(inserts[k++].i);
+        leadIndex[n] = cast(uint)ins.length;
         while (k < inserts.length && inserts[k].at == n)
             ins.push(inserts[k++].i);
         newIndex[n] = cast(uint)ins.length;
@@ -5843,7 +5889,7 @@ private void hoistInvariantTests()
             ins.push(old[n]);
     }
     foreach (ref b; blockStart[])
-        b = newIndex[b];
+        b = leadIndex[b];
     foreach (ref v; vinfo[])
         if (v.loadIns != uint.max)
             v.loadIns = newIndex[v.loadIns];
