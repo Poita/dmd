@@ -100,6 +100,8 @@ enum LOp : ubyte
     ldp,            // d, c = [a + imm], [a + imm + sz]
     stp,            // [b + imm], [b + imm + sz] = a, c
     call,           // call sym, or the address in a; imm is the mask of argument registers
+    ccmp,           // flags = cond ? a <=> b : the flags imm
+    ccmpi,          // flags = cond ? a <=> imm >> 4 : the flags imm & 15
     // on vectors of two floats, in the low 64 bits of a register
     vfadd, vfsub, vfmul, vfdiv,     // d = a op b, lane by lane
     vfmule,         // d = a * the float b
@@ -329,6 +331,7 @@ bool lirCodegen(ref CGstate cg)
         removeDead();
         fuseSignTests();
         fuseMultiplyAdds();
+        fuseCompareChains();
     }
     if (failed)
     {
@@ -5566,6 +5569,143 @@ private void fuseMultiplyAdds()
     }
 }
 
+/* A chain of comparisons each made a value 0 or 1 and joined by | (or &), as
+ *      cmp1; c1 = cset cond1; cmp2; c2 = cset cond2; o = orr c1, c2; ...
+ * as comparisons each made only when the ones before do not decide the
+ * result (CCMP), and one cset of the last condition
+ */
+@trusted
+private void fuseCompareChains()
+{
+    static bool setsFlags(LOp op)
+    {
+        return op == LOp.cmp || op == LOp.cmpi || op == LOp.tsti || op == LOp.fcmp || op == LOp.fcmpz ||
+            op == LOp.call || op == LOp.ccmp || op == LOp.ccmpi;
+    }
+    static bool readsFlags(LOp op)
+    {
+        return op == LOp.csel || op == LOp.cset || op == LOp.fcsel || op == LOp.bcond || op == LOp.ccmp ||
+            op == LOp.ccmpi;
+    }
+    // the flags that make condition c hold, or fail
+    static uint nzcvFor(uint c, bool holds)
+    {
+        enum N = 8, Z = 4, C = 2;
+        switch (c)
+        {
+            case COND.eq: return holds ? Z : 0;
+            case COND.ne: return holds ? 0 : Z;
+            case COND.cs: return holds ? C : 0;
+            case COND.cc: return holds ? 0 : C;
+            case COND.mi: return holds ? N : 0;
+            case COND.pl: return holds ? 0 : N;
+            case COND.hi: return holds ? C : 0;
+            case COND.ls: return holds ? 0 : C;
+            case COND.ge: return holds ? 0 : N;
+            case COND.lt: return holds ? N : 0;
+            case COND.gt: return holds ? 0 : Z;
+            case COND.le: return holds ? Z : 0;
+            default: assert(0);
+        }
+    }
+    Barray!uint ndefs, nuses, defAt;
+    scope (exit) { ndefs.dtor(); nuses.dtor(); defAt.dtor(); }
+    ndefs.setLength(vinfo.length);
+    nuses.setLength(vinfo.length);
+    defAt.setLength(vinfo.length);
+    ndefs[][] = 0;
+    nuses[][] = 0;
+    bool any;
+    foreach (n, ref i; ins[])
+    {
+        if (i.d && !isPhys(i.d))
+        {
+            ++ndefs[i.d - firstVreg];
+            defAt[i.d - firstVreg] = cast(uint)n;
+        }
+        void use(Reg r) { if (!isPhys(r)) ++nuses[r - firstVreg]; }
+        forUses(i, &use);
+        any |= i.op == LOp.cset;
+    }
+    if (!any)
+        return;
+    buildSegments();
+    foreach (si; 0 .. segStart.length - 1)
+    {
+        const start = segStart[si];
+        // the cset ending a chain made here, by register, kept as defAt
+        foreach (n; start .. segEnd(si))
+        {
+            LIns* o = &ins[n];
+            if ((o.op != LOp.orr && o.op != LOp.and_) || o.flags & F.shifted || o.sz != 4 || !o.d || isPhys(o.d))
+                continue;
+            const isOr = o.op == LOp.orr;
+            // one operand a single use cset made just after its comparison, the other a single
+            // use cset made before that comparison, with nothing touching the flags between
+            bool csetOnce(Reg r)
+            {
+                return r && !isPhys(r) && ndefs[r - firstVreg] == 1 && nuses[r - firstVreg] == 1 &&
+                    ins[defAt[r - firstVreg]].op == LOp.cset;
+            }
+            foreach (k; 0 .. 2)
+            {
+                const Reg later = k ? o.a : o.b, earlier = k ? o.b : o.a;
+                if (!csetOnce(later) || !csetOnce(earlier))
+                    continue;
+                const c2 = defAt[later - firstVreg], c1 = defAt[earlier - firstVreg];
+                if (c1 < start || c2 < start || c1 >= c2 || c2 >= n)
+                    continue;
+                // the comparison of the later one, right before it but for what leaves the flags be
+                uint s2 = c2;
+                while (s2 > c1 + 1 && !setsFlags(ins[s2 - 1].op) && !readsFlags(ins[s2 - 1].op))
+                    --s2;
+                --s2;
+                if (s2 <= c1)
+                    continue;
+                LIns* cmp = &ins[s2];
+                if (cmp.op != LOp.cmp && !(cmp.op == LOp.cmpi && cmp.imm >= 0 && cmp.imm < 32))
+                    continue;
+                // nothing else touches the flags from the earlier cset to the join
+                bool clear = true;
+                foreach (q; c1 + 1 .. n)
+                    if (q != s2 && q != c2 && (setsFlags(ins[q].op) || readsFlags(ins[q].op)))
+                    {
+                        clear = false;
+                        break;
+                    }
+                if (!clear)
+                    continue;
+                // the earlier result decides when it holds (|) or fails (&): compare only otherwise
+                const cond1 = ins[c1].cond, cond2 = ins[c2].cond;
+                if (cond1 == COND.al || cond1 >= COND.vs && cond1 <= COND.vc || cond2 == COND.al ||
+                    cond2 >= COND.vs && cond2 <= COND.vc)
+                    continue;
+                const run = isOr ? cond1 ^ 1 : cond1;
+                const nzcv = nzcvFor(cond2, isOr);
+                if (cmp.op == LOp.cmp)
+                {
+                    cmp.op = LOp.ccmp;
+                    cmp.imm = nzcv;
+                }
+                else
+                {
+                    cmp.op = LOp.ccmpi;
+                    cmp.imm = cmp.imm << 4 | nzcv;
+                }
+                cmp.cond = cast(ubyte)run;
+                ins[c1] = LIns.init;
+                ins[c2] = LIns.init;
+                // the join is the cset of the last condition, which may join a chain further on
+                o.op = LOp.cset;
+                o.cond = cast(ubyte)cond2;
+                o.a = o.b = noReg;
+                defAt[o.d - firstVreg] = cast(uint)n;
+                break;
+            }
+        }
+    }
+}
+
 @trusted
 private void fuseSignTests()
 {
@@ -9015,6 +9155,16 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
             cdb.gen1(INSTR.madd(sf, pr(i.b), pr(i.c), pr(i.a), d));
             break;
         }
+
+        case LOp.ccmp:          // CCMP a,b,#nzcv,cond
+            cdb.gen1(sf << 31 | 0x7A400000 | (pr(i.b) & 31) << 16 | i.cond << 12 | (pr(i.a) & 31) << 5 |
+                     cast(uint)i.imm & 15);
+            break;
+
+        case LOp.ccmpi:         // CCMP a,#imm5,#nzcv,cond
+            cdb.gen1(sf << 31 | 0x7A400800 | cast(uint)(i.imm >> 4) << 16 | i.cond << 12 | (pr(i.a) & 31) << 5 |
+                     cast(uint)i.imm & 15);
+            break;
 
         case LOp.sdiv: case LOp.udiv:
         {
