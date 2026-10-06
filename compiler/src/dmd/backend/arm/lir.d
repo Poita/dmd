@@ -3513,6 +3513,24 @@ private Reg genx(elem* e)
                 // CSEL/FCSEL of both arms, evaluated after the comparison sets the flags,
                 // or before it if they are selects themselves
                 const early = hasSelect(e.E2.E1) || hasSelect(e.E2.E2);
+                // a comparison of a register variable assigned in it, (v = x) op y, as the
+                // assignment and then the comparison of v
+                elem* assigned;
+                if (early && e.E1.Eoper >= OPle && e.E1.Eoper <= OPne && !el_sideeffect(e.E1.E2))
+                {
+                    elem* l = e.E1.E1;
+                    if (l.Eoper == OPeq && !l.Ecount && l.E1.Eoper == OPvar && !l.E1.Voffset &&
+                        !el_sideeffect(l.E2) && varReg(l.E1.Vsym) &&
+                        tysize(l.E1.Ety) == type_size(l.E1.Vsym.Stype))
+                    {
+                        gen(l);
+                        assigned = l;
+                        e.E1.E1 = l.E1;
+                    }
+                }
+                scope (exit)
+                    if (assigned)
+                        e.E1.E1 = assigned;
                 if (early && el_sideeffect(e.E1))
                     goto Lbranches;
                 Reg ea, eb;
