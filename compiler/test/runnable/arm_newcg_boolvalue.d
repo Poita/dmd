@@ -19,8 +19,22 @@ pragma(inline, false) int count(const int[] xs, int lo, int hi)
     return n;
 }
 
+// branches on the negation of loaded bools
+pragma(inline, false) int countFalse(const bool[] a, int x)
+{
+    int s;
+    foreach (i; 0 .. a.length)
+        if (!a[i])
+            s += x;
+        else if (!(a[i] && x > 2))
+            s -= 1;
+    return s;
+}
+
 void main()
 {
+    if (countFalse([true, false, false, true], 5) != 10 - 0 || countFalse([true, false], 1) != 1 - 1)
+        assert(0);
     foreach (x; -3 .. 9)
     {
         if (inRange(x, 0, 5) != (x >= 0 && x <= 5)) assert(0);

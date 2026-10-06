@@ -1895,6 +1895,16 @@ private void genCond(elem* e, bool jumpIfTrue, uint l, block* t = null)
             genCond(e.E1, !jumpIfTrue, l, t);
             return;
 
+        case OPxor:
+            // !b of a bool, 0 or 1, is b ^ 1
+            if (tybasic(e.E1.Ety) == TYbool && e.E2.Eoper == OPconst && el_tolong(e.E2) == 1)
+            {
+                genCond(e.E1, !jumpIfTrue, l, t);
+                return;
+            }
+            valueCond(e, jumpIfTrue, &jump);
+            return;
+
         case OPbool:
             genCond(e.E1, jumpIfTrue, l, t);
             return;
