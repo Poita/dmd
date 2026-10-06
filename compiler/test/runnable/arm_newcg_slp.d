@@ -119,6 +119,40 @@ pragma(inline, false) float accumulate(const Vec2[] v, float k)
     return r + sx - sy;
 }
 
+// absolute values by negating what is negative, the larger of two, and their squares
+pragma(inline, false) float worstSlope(const float[] h, size_t n)
+{
+    float worst = 0;
+    foreach (y; 0 .. n - 1)
+        foreach (x; 0 .. n - 1)
+        {
+            const h00 = h[y * n + x], h10 = h[y * n + x + 1];
+            const h01 = h[(y + 1) * n + x], h11 = h[(y + 1) * n + x + 1];
+            float gx = h10 - h00;
+            if (gx < 0)
+                gx = -gx;
+            float gx2 = h11 - h01;
+            if (gx2 < 0)
+                gx2 = -gx2;
+            if (gx2 > gx)
+                gx = gx2;
+            float gy = h01 - h00;
+            if (gy < 0)
+                gy = -gy;
+            float gy2 = h11 - h10;
+            if (gy2 < 0)
+                gy2 = -gy2;
+            if (gy2 > gy)
+                gy = gy2;
+            gx *= 1.5f;
+            gy *= 1.5f;
+            const s = gx * gx + gy * gy;
+            if (s > worst)
+                worst = s;
+        }
+    return worst;
+}
+
 uint bits(float f) { return *cast(uint*)&f; }
 
 ulong digest(T)(const T[] a)
@@ -169,6 +203,9 @@ void main()
     const nx = digest(n[]);
 
     if (bits(accumulate(pos[], 0.75f)) != 0xc047d3a2)
+        assert(0);
+    float[16] hs = [0.5f, 1, -2, 0.25f, 3, -0.0f, 0, 7, 1.5f, -1, 2, 2, 0.125f, 4, -3, 1];
+    if (bits(worstSlope(hs[], 4)) != 0x4354c400)
         assert(0);
     const float[4] st = [1, 2, 3, 4];
     if (setTwice(st[], 0.5f, false) != 0.5f * 3 + 1 * 4 || setTwice(st[], 0.5f, true) != 7 * 3 + 9 * 4)
