@@ -568,7 +568,7 @@ private bool supportedElem(const(elem)* e)
 
             case OPrelconst:
                 whyNot = "address of variable";
-                return varSupported(e.Vsym);
+                return varSupported(e.Vsym) || tlvDescriptor(e.Vsym);
 
             case OPind:
             case OPneg:
@@ -692,6 +692,15 @@ private bool supportedCallee(const(elem)* e1)
     if (e1.Eoper == OPind)
         return supportedElem(e1.E1);
     return false;
+}
+
+/* Whether s is the TLV descriptor of a thread local variable on Mach-O, whose
+ * address is all that is taken of it, to call its thunk
+ */
+@trusted
+private bool tlvDescriptor(const Symbol* s)
+{
+    return config.objfmt == OBJ_MACH && (s.ty() & mTYLINK) == mTYthread && isStatic(s);
 }
 
 /******************************* Variables ******************************/
@@ -7726,7 +7735,8 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
                     fl = FL.extern_;                // not a PC relative address
                 cdb.gencs1(INSTR.adr(1, 0, d), 0, fl, s);       // ADRP d,sym@PAGE
                 const isFunc = tyfunc(s.ty()) && (s.Sclass == SC.global || s.Sclass == SC.extern_ || s.Sclass == SC.comdat);
-                const uint w = config.objfmt == OBJ_MACH && (MachObj_isGOTRef(s) || isFunc)
+                // a TLV descriptor is reached as through the GOT, with TLVP relocations
+                const uint w = config.objfmt == OBJ_MACH && (MachObj_isGOTRef(s) || isFunc || tlvDescriptor(s))
                     ? INSTR.ldr_imm_gen(1, d, d, 0)             // LDR d,[d,sym@GOTPAGEOFF]
                     : INSTR.addsub_imm(1, 0, 0, 0, 0, d, d);    // ADD d,d,sym@PAGEOFF
                 cdb.gencs1(w, 0, fl, s);
