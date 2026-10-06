@@ -1006,11 +1006,7 @@ restart:
         }
         if (debugc) printf("...Loop %p done...\n",&l);
 
-        /* The AArch64 code generator of backend/arm/lir.d gains next to nothing
-         * from the induction variable rewrites, which cost compile time
-         */
-        import dmd.backend.arm.lir : newCodegenEnabled;
-        if (go.mfoptim & MFliv && !(config.target_cpu == TARGET_AArch64 && newCodegenEnabled()))
+        if (go.mfoptim & MFliv)
         {
             loopiv(go, bo, l);      /* induction variables          */
             if (addblk)             /* if we added a block          */
