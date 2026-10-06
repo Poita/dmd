@@ -1962,6 +1962,52 @@ private void genCond(elem* e, bool jumpIfTrue, uint l, block* t = null)
     }
 }
 
+/* Whether e is comparisons of integers joined by && and ||, at most `terms` of them,
+ * each of cheap operands with no side effects, so all can be made whatever the
+ * others give
+ */
+@trusted
+private bool flagSafe(const(elem)* e, ref int terms)
+{
+    switch (e.Eoper)
+    {
+        case OPandand: case OPoror:
+            return flagSafe(e.E1, terms) && flagSafe(e.E2, terms);
+        case OPlt: case OPle: case OPgt: case OPge: case OPeqeq: case OPne:
+        {
+            if (--terms < 0)
+                return false;
+            const ty = e.E1.Ety;
+            if (!scalarType(ty) || pairType(ty) || tyfloating(ty) || tyfloating(e.E2.Ety))
+                return false;
+            int budget = 2;
+            return cheapArm(e.E1, budget) && cheapArm(e.E2, budget = 2);
+        }
+        default:
+            return false;
+    }
+}
+
+/* The value 0 or 1 of comparisons joined by && and ||, made without branches
+ */
+@trusted
+private Reg flagValue(elem* e, uint sz)
+{
+    if (e.Eoper == OPandand || e.Eoper == OPoror)
+    {
+        Reg a = flagValue(e.E1, 4);
+        Reg b = flagValue(e.E2, 4);
+        Reg d = newVreg(RC.gp, sz <= 4 ? 4 : sz);
+        emitIns(e.Eoper == OPandand ? LOp.and_ : LOp.orr, 4, d, a, b);
+        return d;
+    }
+    const c = compare(e);
+    Reg d = newVreg(RC.gp, sz <= 4 ? 4 : sz);
+    auto i = emitIns(LOp.cset, 4, d);
+    i.cond = c;
+    return d;
+}
+
 /* Jump if the value of e is nonzero (or zero if !jumpIfTrue)
  */
 @trusted
@@ -3443,6 +3489,10 @@ private Reg genx(elem* e)
         case OPandand:
         case OPoror:
         {
+            // comparisons safe to make whatever the others give, as values joined by and/orr
+            int terms = 6;
+            if (flagSafe(e, terms))
+                return flagValue(e, sz);
             Reg d = newVreg(RC.gp, sz);
             const lfalse = newLabel();
             const lend = newLabel();
