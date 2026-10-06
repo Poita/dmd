@@ -406,6 +406,24 @@ T[] _d_newarrayT(T)(size_t length, bool isShared=false) @trusted
         import core.stdc.string : memset;
         memset(result.ptr, 0, length * T.sizeof);
     }
+    else static if (__traits(isScalar, T) && 16 % T.sizeof == 0)
+    {
+        // the initial value repeated over 16 bytes, stored 16 at a time (as the
+        // GC aligns blocks), then the elements left one at a time
+        ulong[2] words = void;
+        foreach (k; 0 .. 16 / T.sizeof)
+            (cast(T*) words.ptr)[k] = T.init;
+        const w0 = words[0], w1 = words[1];
+        auto p = cast(ulong*) result.ptr;
+        const n16 = length * T.sizeof / 16;
+        foreach (i; 0 .. n16)
+        {
+            p[2 * i] = w0;
+            p[2 * i + 1] = w1;
+        }
+        foreach (ref elem; result[n16 * (16 / T.sizeof) .. $])
+            elem = T.init;
+    }
     else
     {
         import core.internal.lifetime : emplaceInitializer;
