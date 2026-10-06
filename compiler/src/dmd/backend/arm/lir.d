@@ -113,6 +113,7 @@ enum LOp : ubyte
     vfaddp,         // d = the sum of the lanes of a
     vfcmeq, vfcmge, vfcmgt,         // d = all ones in each lane where a op b, else zeros
     vfcmeqz, vfcmgez, vfcmgtz, vfcmltz, vfcmlez,    // d = all ones in each lane where a op 0, else zeros
+    vzip2,          // d = the floats in lane 1 of a and of b
     vbsl,           // d = the bits of b where a has ones, else those of c
 }
 
@@ -6369,6 +6370,9 @@ private struct VNode
     ubyte cond;         // select: eq, mi, ls, ge or gt
     uint at;            // the instruction it is made before
     Reg vec;
+    Reg za, zb;         // zip: vectors holding r0 and r1, in lane 0 (or both in lane 1)
+    bool zip2;
+    Reg wa, wb;         // zip: the variables whose pair vectors are za and zb
 }
 
 /// A way to reach a float in memory: sym + imm + the sum of terms reg << shift
@@ -6876,7 +6880,61 @@ private struct Slp
             return -1;
         v.kind = VK.zip;
         v.at = at;
+        // the lanes taken from vectors holding them, so their values on their own may go
+        Reg sa, sb, pa, pb;
+        ubyte la, lb;
+        laneSource(x0, user0, at, sa, la, pa);
+        laneSource(x1, user1, at, sb, lb, pb);
+        if ((sa || sb) && (la == lb || !sa && lb == 0 || !sb && la == 0))
+        {
+            v.za = sa ? sa : x0;
+            v.zb = sb ? sb : x1;
+            v.zip2 = la == 1;
+            v.wa = pa;
+            v.wb = pb;
+        }
         return push(v);
+    }
+
+    /* A vector holding the value x has, as read by user, at `at`, and its lane:
+     * the vector of x's pair, or one made of x; noReg if neither
+     */
+    @trusted void laneSource(Reg x, uint user, uint at, out Reg src, out ubyte lane, out Reg pairVar)
+    {
+        if (!x || isPhys(x) || x - firstVreg >= nregs)
+            return;
+        if (vecOf[x - firstVreg] && vecAt[vecOf[x - firstVreg] - firstVreg] <= at)
+        {
+            src = vecOf[x - firstVreg];
+            lane = laneOf[x - firstVreg];
+            return;
+        }
+        Reg p = x;
+        uint u = user;
+        if (once(x) && copyOfVar(x))
+        {
+            u = defAt[x - firstVreg];
+            p = ins[u].a;
+        }
+        if (!p || isPhys(p) || p - firstVreg >= nregs || u == uint.max)
+            return;
+        const P = p - firstVreg;
+        if (!pairOther[P])
+            return;
+        // the vector, made after each copy to lane 1, holds what p held at u
+        const Reg q1 = pairLane[P] ? p : pairOther[P];
+        if (defsBefore(q1, at) != defsBefore(p, u))
+            return;
+        if (!pairW[P])
+        {
+            const r = newVreg(RC.fp, 8);
+            growTo(r);
+            pairW[P] = r;
+            pairW[pairOther[P] - firstVreg] = r;
+        }
+        src = pairW[P];
+        lane = pairLane[P];
+        pairVar = pairLane[P] ? pairOther[P] : p;
     }
 
     /* Forget the nodes from k on
@@ -7068,6 +7126,13 @@ private struct Slp
                     if (c.op != LOp.copy || c.d == noReg || isPhys(c.d) || done[u] ||
                         c.d - firstVreg < nregs && pinned[c.d - firstVreg])
                         return infeasible(1, u, k);
+                    // nor one to lane 1 of a pair whose vector the tree reads, as the vector is made after it
+                    if (c.d - firstVreg < nregs && pairOther[c.d - firstVreg] && pairLane[c.d - firstVreg] == 1)
+                        foreach (ref w; nodes[])
+                            if (isPairVec(w) && (w.r0 == c.d || w.r1 == c.d) ||
+                                w.kind == VK.zip && (w.wa == c.d || w.wb == c.d ||
+                                    w.wa == pairOther[c.d - firstVreg] || w.wb == pairOther[c.d - firstVreg]))
+                                return infeasible(5, u, k);
                     // nor past a copy to the other of its pair
                     const partner = c.d - firstVreg < nregs ? pairOther[c.d - firstVreg] : noReg;
                     foreach (q; u + 1 .. v.at + 1)
@@ -7133,9 +7198,9 @@ private struct Slp
                 i.a = v.r0;
                 break;
             case VK.zip:
-                i.op = LOp.vzip;
-                i.a = v.r0;
-                i.b = v.r1;
+                i.op = v.zip2 ? LOp.vzip2 : LOp.vzip;
+                i.a = v.za ? v.za : v.r0;
+                i.b = v.zb ? v.zb : v.r1;
                 break;
             case VK.vec:
                 assert(0);
@@ -7636,13 +7701,23 @@ private void vectorizeRegion(ref Slp s, uint rs, uint re)
         }
         if (ok)
         {
+            void pin(Reg p)
+            {
+                if (s.pinned[p - firstVreg])
+                    return;
+                s.pinned[p - firstVreg] = true;
+                s.pinned[s.pairOther[p - firstVreg] - firstVreg] = true;
+                s.usedPairs.push(p);
+            }
             foreach (ref v; s.nodes[])
-                if (s.isPairVec(v) && !s.pinned[v.r0 - firstVreg])
-                {
-                    s.pinned[v.r0 - firstVreg] = true;
-                    s.pinned[v.r1 - firstVreg] = true;
-                    s.usedPairs.push(v.r0);
-                }
+            {
+                if (s.isPairVec(v))
+                    pin(v.r0);
+                if (v.kind == VK.zip && v.wa)
+                    pin(v.wa);
+                if (v.kind == VK.zip && v.wb)
+                    pin(v.wb);
+            }
             const V = s.made(root);
             s.rewrite();
             finish(V);
@@ -9701,11 +9776,11 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
             break;
         }
 
-        case LOp.vfadd: .. case LOp.vfcmlez:
+        case LOp.vfadd: .. case LOp.vzip2:
         {
             const d = pr(i.d);
             def(d);
-            static immutable uint[LOp.vfcmlez - LOp.vfadd + 1] base = [
+            static immutable uint[LOp.vzip2 - LOp.vfadd + 1] base = [
                 0x0E20D400,     // FADD Vd.2S,Vn.2S,Vm.2S
                 0x0EA0D400,     // FSUB
                 0x2E20DC00,     // FMUL
@@ -9727,6 +9802,7 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
                 0x0EA0C800,     // FCMGT
                 0x0EA0E800,     // FCMLT
                 0x2EA0D800,     // FCMLE
+                0x0E807800,     // ZIP2 Vd.2S,Vn.2S,Vm.2S
             ];
             uint w = base[i.op - LOp.vfadd] | (pr(i.a) & 31) << 5 | (d & 31);
             if (i.b)
