@@ -67,6 +67,7 @@ enum LOp : ubyte
     add, sub, mul, sdiv, udiv, and_, orr, eor, lslv, lsrv, asrv, rorv, // d = a op b
     addi, subi, lsli, lsri, asri, andi, orri, eori, rori,          // d = a op imm
     msub,           // d = c - a * b
+    madd,           // d = c + a * b
     neg,            // d = -a
     mvn,            // d = ~a
     sext,           // d = a sign extended from imm bits
@@ -327,6 +328,7 @@ bool lirCodegen(ref CGstate cg)
         removeUnreachable();
         removeDead();
         fuseSignTests();
+        fuseMultiplyAdds();
     }
     if (failed)
     {
@@ -1210,7 +1212,7 @@ private LIns* emitIns(LOp op, uint sz, Reg d = noReg, Reg a = noReg, Reg b = noR
             case LOp.movi:
             case LOp.add: .. case LOp.rorv:
             case LOp.addi: .. case LOp.rori:
-            case LOp.msub, LOp.neg, LOp.mvn, LOp.cset, LOp.csel:
+            case LOp.msub, LOp.madd, LOp.neg, LOp.mvn, LOp.cset, LOp.csel:
             case LOp.fcvtzs, LOp.fcvtzu:
                 if (!vi(d).sym)
                     knownExtended(d, 32, false, 8);
@@ -5493,6 +5495,77 @@ private void estimateFrequencies()
  * of its top bit: CMP x,#0 and B.LT as TBNZ x,#31 (or #63), and B.GE as TBZ; and a
  * test of one bit for nothing but a branch, TST x,#bit and B.NE as TBNZ, B.EQ as TBZ
  */
+/* An addition to, or subtraction from, a product computed only for it, in the
+ * same segment, as one multiply-add or multiply-subtract
+ */
+@trusted
+private void fuseMultiplyAdds()
+{
+    Barray!uint ndefs, nuses, defAt;
+    scope (exit) { ndefs.dtor(); nuses.dtor(); defAt.dtor(); }
+    ndefs.setLength(vinfo.length);
+    nuses.setLength(vinfo.length);
+    defAt.setLength(vinfo.length);
+    ndefs[][] = 0;
+    nuses[][] = 0;
+    bool any;
+    foreach (n, ref i; ins[])
+    {
+        if (i.d && !isPhys(i.d))
+        {
+            ++ndefs[i.d - firstVreg];
+            defAt[i.d - firstVreg] = cast(uint)n;
+        }
+        void use(Reg r) { if (!isPhys(r)) ++nuses[r - firstVreg]; }
+        forUses(i, &use);
+        any |= i.op == LOp.mul;
+    }
+    if (!any)
+        return;
+    bool once(Reg r) { return r && !isPhys(r) && ndefs[r - firstVreg] == 1; }
+    buildSegments();
+    foreach (si; 0 .. segStart.length - 1)
+    {
+        const start = segStart[si];
+        foreach (n; start .. segEnd(si))
+        {
+            LIns* i = &ins[n];
+            if ((i.op != LOp.add && i.op != LOp.sub) || i.flags & F.shifted || rcOf(i.d) != RC.gp)
+                continue;
+            // the product, b of either, or a of an addition
+            foreach (k; 0 .. (i.op == LOp.add ? 2 : 1))
+            {
+                const Reg m = k == 0 ? i.b : i.a;
+                if (!once(m) || nuses[m - firstVreg] != 1)
+                    continue;
+                const p = defAt[m - firstVreg];
+                const mul = &ins[p];
+                if (p < start || p >= n || mul.op != LOp.mul || mul.sz != i.sz || mul.flags & F.condDef)
+                    continue;
+                // its operands the same where the sum is
+                bool same(Reg r)
+                {
+                    if (once(r))
+                        return true;
+                    foreach (q; p + 1 .. n)
+                        if (ins[q].d == r || ins[q].op == LOp.call && isPhys(r))
+                            return false;
+                    return true;
+                }
+                if (!same(mul.a) || !same(mul.b))
+                    continue;
+                const Reg other = k == 0 ? i.a : i.b;
+                i.op = i.op == LOp.add ? LOp.madd : LOp.msub;
+                i.c = other;
+                i.a = mul.a;
+                i.b = mul.b;
+                ins[p] = LIns.init;
+                break;
+            }
+        }
+    }
+}
+
 @trusted
 private void fuseSignTests()
 {
@@ -7446,7 +7519,7 @@ private bool pureOp(ref const LIns i)
     {
         case LOp.add: .. case LOp.rorv:
         case LOp.addi: .. case LOp.rori:
-        case LOp.msub, LOp.neg, LOp.mvn, LOp.sext, LOp.zext:
+        case LOp.msub, LOp.madd, LOp.neg, LOp.mvn, LOp.sext, LOp.zext:
         case LOp.fadd, LOp.fsub, LOp.fmul, LOp.fdiv, LOp.fneg, LOp.fabs, LOp.fsqrt:
         case LOp.scvtf, LOp.ucvtf, LOp.fcvtzs, LOp.fcvtzu, LOp.fcvtms, LOp.fcvt:
         case LOp.lea:
@@ -8932,6 +9005,14 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
             const d = pr(i.d);
             def(d);
             cdb.gen1(INSTR.msub(sf, pr(i.b), pr(i.c), pr(i.a), d));
+            break;
+        }
+
+        case LOp.madd:
+        {
+            const d = pr(i.d);
+            def(d);
+            cdb.gen1(INSTR.madd(sf, pr(i.b), pr(i.c), pr(i.a), d));
             break;
         }
 
