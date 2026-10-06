@@ -95,6 +95,12 @@ void outdata(Symbol* s)
 
     dt_t* dtstart = s.Sdt;
     s.Sdt = null;                      // it will be free'd
+    // the bytes of an immutable variable kept, so loads of them may be folded
+    if (s.ty() & mTYimmutable && !(s.ty() & (mTYvolatile | mTYshared)) && !s.Sconstdata)
+    {
+        import core.atomic : atomicStore;
+        atomicStore(s.Sconstdata, cast(shared(const(ubyte))*)dtConstantBytes(dtstart, 4096));
+    }
     targ_size_t datasize = 0;
     tym_t ty = s.ty();
     if (ty & mTYexport && config.wflags & WFexpdef && s.Sclass != SC.static_)

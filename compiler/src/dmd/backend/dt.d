@@ -191,6 +191,55 @@ uint dt_size(const(dt_t)* dt)
 }
 
 /************************************
+ * The bytes of dt, when it is only bytes and zeros, at most max of them, in a
+ * block beginning with their count as a uint; null otherwise.
+ */
+@trusted
+const(ubyte)* dtConstantBytes(const(dt_t)* dt, uint max)
+{
+    import core.stdc.stdlib : malloc;
+    size_t size = 0;
+    for (auto d = dt; d; d = d.DTnext)
+    {
+        switch (d.dt)
+        {
+            case DT.ibytes: size += d.DTn;              break;
+            case DT.nbytes: size += d.DTpbytes.length;  break;
+            case DT.azeros: size += d.DTazeros;         break;
+            default:        return null;
+        }
+        if (size > max)
+            return null;
+    }
+    if (!size)
+        return null;
+    auto p = cast(ubyte*)malloc(uint.sizeof + size);
+    if (!p)
+        return null;
+    *cast(uint*)p = cast(uint)size;
+    ubyte* q = p + uint.sizeof;
+    for (auto d = dt; d; d = d.DTnext)
+    {
+        switch (d.dt)
+        {
+            case DT.ibytes:
+                memcpy(q, d.DTdata.ptr, d.DTn);
+                q += d.DTn;
+                break;
+            case DT.nbytes:
+                memcpy(q, d.DTpbytes.ptr, d.DTpbytes.length);
+                q += d.DTpbytes.length;
+                break;
+            default:
+                memset(q, 0, cast(size_t)d.DTazeros);
+                q += cast(size_t)d.DTazeros;
+                break;
+        }
+    }
+    return p;
+}
+
+/************************************
  * Return true if dt is all zeros.
  */
 bool dtallzeros(const(dt_t)* dt)

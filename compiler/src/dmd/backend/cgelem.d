@@ -3366,6 +3366,63 @@ private elem* elbit(elem* e, Goal goal)
  *      * & e => e
  */
 
+/*************************
+ * The constant loaded by *(&s + offset) of an immutable variable s whose bytes
+ * are known, of a scalar type that is not a pointer; null if it is not one.
+ */
+@trusted
+private elem* constantLoad(elem* e)
+{
+    import core.atomic : atomicLoad;
+    import core.stdc.stdlib : free;
+    import dmd.backend.dt : dtConstantBytes;
+    const tym = tybasic(e.Ety);
+    elem* a = e.E1;
+    Symbol* s = a.Vsym;
+    // the bytes are kept only for immutable variables
+    if (!s.Sconstdata && !(s.ty() & mTYimmutable) || s.ty() & (mTYvolatile | mTYshared) || e.Ety & mTYvolatile ||
+        !(sytab[s.Sclass] & SCDATA) || typtr(tym) || !(tyintegral(tym) || tym == TYfloat || tym == TYdouble ||
+        tym == TYdouble_alias))
+        return null;
+    const size = tysize(tym);
+    if (size <= 0 || size > 8 || a.Voffset < 0)
+        return null;
+    const(ubyte)* p = cast(const(ubyte)*)atomicLoad(s.Sconstdata);
+    const(ubyte)* own;
+    if (!p && s.Sdt)
+        p = own = dtConstantBytes(s.Sdt, 4096);
+    scope (exit)
+        if (own)
+            free(cast(void*)own);
+    if (!p || a.Voffset + size > *cast(const(uint)*)p)
+        return null;
+    ulong bits = 0;
+    memcpy(&bits, p + uint.sizeof + a.Voffset, size);
+    elem* c = el_calloc();
+    c.Eoper = OPconst;
+    c.Ety = e.Ety;
+    c.ET = e.ET;
+    switch (tym)
+    {
+        case TYfloat:
+            c.Vfloat = *cast(float*)&bits;
+            break;
+        case TYdouble, TYdouble_alias:
+            c.Vdouble = *cast(double*)&bits;
+            break;
+        default:
+            // sign extended as the type is
+            if (!tyuns(tym) && size < 8)
+            {
+                const shift = 64 - size * 8;
+                bits = cast(ulong)(cast(long)(bits << shift) >> shift);
+            }
+            c.Vllong = bits;
+            break;
+    }
+    return c;
+}
+
 @trusted
 private elem* elind(elem* e, Goal goal)
 {
@@ -3374,6 +3431,13 @@ private elem* elind(elem* e, Goal goal)
     switch (e1.Eoper)
     {
         case OPrelconst:
+            // a load of an immutable variable's bytes is them
+            if (OPTIMIZER)
+                if (elem* c = constantLoad(e))
+                {
+                    el_free(e);
+                    return c;
+                }
             // AArch64 addresses data through a register, other than a function being called
             if (sytab[e1.Vsym.Sclass] & SCDATA && cgstate.AArch64 &&
                 (e1.Vsym.Sfl != FL.func || !tyfunc(tym)))

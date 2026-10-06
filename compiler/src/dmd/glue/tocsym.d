@@ -407,6 +407,25 @@ Symbol* toSymbol(Dsymbol s)
             type_setmangle(&t, m);
             s.Stype = t;
 
+            /* The bytes of an immutable variable of plain values, so the
+             * optimizer may fold loads of them wherever it is used
+             */
+            if (vd.isDataseg() && vd.type.isImmutable() && !(t.Tty & (mTYvolatile | mTYshared)) &&
+                vd._init && !vd.ctorinit && !vd.type.hasPointers() && vd.type.size(vd.loc) <= 4096)
+            {
+                import dmd.backend.dt : DtBuilder, dtConstantBytes, dt_free;
+                import dmd.glue.todt : Initializer_toDt;
+                auto tb = vd.type.toBasetype();
+                if (tb.isTypeSArray() || tb.isTypeBasic())
+                {
+                    auto dtb = DtBuilder(0);
+                    Initializer_toDt(vd._init, dtb, vd.isCsymbol());
+                    auto d = dtb.finish();
+                    s.Sconstdata = cast(shared(const(ubyte))*)dtConstantBytes(d, 4096);
+                    dt_free(d);
+                }
+            }
+
             s.lposscopestart = toSrcpos(vd.loc);
             s.lnoscopeend = vd.endlinnum;
             result = s;

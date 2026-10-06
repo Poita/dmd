@@ -53,6 +53,7 @@ struct Symbol
     Symbol* Sforward;           // forward to another Symbol
     Symbol* Sisym;              // import version of this symbol
     dt_t* Sdt;                  // variables: initializer
+    shared(const(ubyte))* Sconstdata;   // immutable variables: their bytes once output, after their count as a uint
     int Salignment;             // variables: alignment, 0 or -1 means default alignment
 
     type* Stype;                // type of Symbol

@@ -3823,6 +3823,72 @@ private void unrollWalker(elem* e, uint defnum, Symbol* v, targ_llong increment,
 
 
 /********************************
+ * Whether e loads from an immutable variable whose bytes are known, at an
+ * address computed from one of vars
+ */
+@trusted
+private bool loadsTableAt(const(elem)* e, const(Symbol*)[] vars)
+{
+    static bool uses(const(elem)* e, const(Symbol*)[] vars)
+    {
+        if (e.Eoper == OPvar)
+        {
+            foreach (v; vars)
+                if (e.Vsym == v)
+                    return true;
+            return false;
+        }
+        if (OTbinary(e.Eoper))
+            return uses(e.E1, vars) || uses(e.E2, vars);
+        if (OTunary(e.Eoper))
+            return uses(e.E1, vars);
+        return false;
+    }
+    static bool table(const(elem)* e)
+    {
+        if (e.Eoper == OPrelconst)
+        {
+            const s = e.Vsym;
+            return s.Sconstdata || (s.ty() & mTYimmutable) && s.Sdt;
+        }
+        if (OTbinary(e.Eoper))
+            return table(e.E1) || table(e.E2);
+        if (OTunary(e.Eoper))
+            return table(e.E1);
+        return false;
+    }
+    if (e.Eoper == OPind && table(e.E1) && uses(e.E1, vars))
+        return true;
+    if (OTbinary(e.Eoper))
+        return loadsTableAt(e.E1, vars) || loadsTableAt(e.E2, vars);
+    if (OTunary(e.Eoper))
+        return loadsTableAt(e.E1, vars);
+    return false;
+}
+
+/********************************
+ * Add to vars, up to its capacity, the variables e assigns one of vars to
+ */
+@trusted
+private void addCopies(const(elem)* e, ref const(Symbol)*[4] vars, ref size_t n)
+{
+    if (e.Eoper == OPeq && e.E1.Eoper == OPvar && e.E2.Eoper == OPvar && n < vars.length)
+        foreach (v; vars[0 .. n])
+            if (e.E2.Vsym == v)
+            {
+                vars[n++] = e.E1.Vsym;
+                break;
+            }
+    if (OTbinary(e.Eoper))
+    {
+        addCopies(e.E1, vars, n);
+        addCopies(e.E2, vars, n);
+    }
+    else if (OTunary(e.Eoper))
+        addCopies(e.E1, vars, n);
+}
+
+/********************************
  * AArch64: completely unroll a loop of a few iterations whose body has
  * branches, such as `continue` statements. Each iteration becomes a copy of
  * the blocks of the loop, the copies following one another, with the
@@ -3846,7 +3912,7 @@ private bool unrollBranches(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
 
     block* head = l.Lhead;
     block* tail = l.Ltail;
-    enum maxBlocks = 16;
+    enum maxBlocks = 48;
     block*[maxBlocks] blocks;
     size_t nblocks = 0;
     for (size_t i = 0; (i = vec_index(i, l.Lloop)) < bo.dfo.length; ++i)
@@ -3904,9 +3970,24 @@ private bool unrollBranches(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
     const targ_llong n = (final_ - initial) / increment;
     enum maxIterations = 8;
     int cost = 0;
+    bool tables;
+    const(Symbol)*[4] vars;
+    size_t nvars = 1;
+    vars[0] = v;
     foreach (b; blocks[0 .. nblocks])
+        if (b.Belem)
+            addCopies(b.Belem, vars, nvars);
+    foreach (b; blocks[0 .. nblocks])
+    {
         cost += b.Belem ? el_length(b.Belem) : 0;
-    if (n < 2 || n > maxIterations || cost * n > 400)
+        if (b.Belem && loadsTableAt(b.Belem, vars[0 .. nvars]))
+            tables = true;
+    }
+    // the larger loops only when their copies become much less
+    if (nblocks > 16 && !tables)
+        return false;
+    // loads of tables indexed by v become constants in each copy, making it much less
+    if (n < 2 || n > maxIterations || cost * n > (tables ? 3000 : 400))
         return false;
 
     // the block with the increment
