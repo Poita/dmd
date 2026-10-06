@@ -324,6 +324,8 @@ bool lirCodegen(ref CGstate cg)
         numberValues();
         reuseInvariantLoads();
         removeBoundsChecks();
+        if (!env!"DMD_NEWCG_NOCOPYPROP")
+            propagateCopies();
         // the vectors made may be of values the same throughout a loop
         if (!env!"DMD_NEWCG_NOSLP" && vectorize() && !env!"DMD_NEWCG_NOLICM")
             hoistInvariants();
@@ -4906,6 +4908,79 @@ private void numberValues()
     ndefs.dtor();
     subst.dtor();
     ver.dtor();
+}
+
+/* A register defined once by a copy of another, all of whose uses come after
+ * it in a run of segments each entered only from the one before, and before the
+ * other changes, has those uses take the other instead
+ */
+@trusted
+private void propagateCopies()
+{
+    buildSegments();
+    const ns = segStart.length - 1;
+    Barray!uint ndefs, nuses, follows, segOf;
+    scope (exit) { ndefs.dtor(); nuses.dtor(); follows.dtor(); segOf.dtor(); }
+    ndefs.setLength(vinfo.length);
+    nuses.setLength(vinfo.length);
+    ndefs[][] = 0;
+    nuses[][] = 0;
+    foreach (ref i; ins[])
+    {
+        if (i.d && !isPhys(i.d))
+            ++ndefs[i.d - firstVreg];
+        void use(Reg r) { if (!isPhys(r)) ++nuses[r - firstVreg]; }
+        forUses(i, &use);
+    }
+    soleFallthrough(follows);
+    // the end of the run each segment is in
+    Barray!uint runEnd;
+    scope (exit) runEnd.dtor();
+    runEnd.setLength(ns);
+    foreach_reverse (si; 0 .. ns)
+        runEnd[si] = si + 1 < ns && follows[si + 1] && !(segEnd(si) > segStart[si] && isBranch(ins[segEnd(si) - 1].op) &&
+                                                         ins[segEnd(si) - 1].op == LOp.br)
+            ? runEnd[si + 1] : segEnd(si);
+    foreach (si; 0 .. ns)
+    {
+        foreach (n; segStart[si] .. segEnd(si))
+        {
+            LIns* c = &ins[n];
+            if (c.op != LOp.copy || !c.d || isPhys(c.d) || !c.a || isPhys(c.a) || c.d == c.a ||
+                ndefs[c.d - firstVreg] != 1 || c.flags & F.condDef)
+                continue;
+            const t = c.d, v = c.a;
+            const vt = &vinfo[t - firstVreg], vv = &vinfo[v - firstVreg];
+            if (vt.rc != vv.rc || vt.sz != vv.sz || (vt.rc == RC.fp && c.sz != vt.sz) || vt.sym && !vv.sym)
+                continue;
+            // the uses, all before v changes
+            uint left = nuses[t - firstVreg];
+            const end = runEnd[si];
+            uint q = n + 1;
+            for (; q < end && left; ++q)
+            {
+                const i = &ins[q];
+                uint here;
+                void count(Reg r) { if (r == t) ++here; }
+                forUses(*cast(LIns*)i, &count);
+                left -= here;
+                if (i.d == v || i.op == LOp.call && isPhys(v))
+                    break;
+            }
+            if (left)
+                continue;
+            foreach (k; n + 1 .. q)
+            {
+                LIns* i = &ins[k];
+                if (i.a == t) i.a = v;
+                if (i.b == t) i.b = v;
+                if (i.c == t) i.c = v;
+            }
+            nuses[v - firstVreg] += nuses[t - firstVreg];
+            nuses[t - firstVreg] = 0;
+            *c = LIns.init;
+        }
+    }
 }
 
 /* Whether i may change memory: a call that does not return changes nothing that is read after it
