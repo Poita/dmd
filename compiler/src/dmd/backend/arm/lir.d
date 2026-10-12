@@ -5658,8 +5658,12 @@ private void propagateCopies()
                 void count(Reg r) { if (r == t) ++here; }
                 forUses(*cast(LIns*)i, &count);
                 left -= here;
+                // what changes v reads it first, so its own uses take it too
                 if (i.d == v || i.op == LOp.call && isPhys(v))
+                {
+                    ++q;
                     break;
+                }
             }
             if (left)
                 continue;
