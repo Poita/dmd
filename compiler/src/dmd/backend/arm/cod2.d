@@ -725,7 +725,8 @@ void cdmul(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         {
             if (x.Eoper == conv && !x.Ecount)
                 return true;
-            if (x.Eoper != OPconst)
+            // the constant's type is changed in place, which a common subexpression cannot have
+            if (x.Eoper != OPconst || x.Ecount)
                 return false;
             const c = el_tolong(x);
             return conv == OPu32_64 ? c >= 0 && c <= uint.max : c >= int.min && c <= int.max;
