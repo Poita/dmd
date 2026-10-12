@@ -785,7 +785,10 @@ public:
                 vto.parent = ids.parent;
                 vto.csym = null;
                 vto.nrvo = ids.propagateNRVO && varIsNRVO;
-                vto.nestedrefs = FuncDeclarations.init;   // what refers to vd is not inlined with it
+                // what refers to vd is not inlined with it: the copy gets an empty list of its own,
+                // set bit by bit as it shares vd's list, which assigning would free
+                static immutable FuncDeclarations noRefs;
+                memcpy(cast(void*) &vto.nestedrefs, cast(const void*) &noRefs, FuncDeclarations.sizeof);
 
                 ids.from.push(vd);
                 ids.to.push(vto);
@@ -2257,13 +2260,23 @@ private FuncDeclaration attributeCastTarget(CastExp ce)
 }
 
 /***********************************************************
- * Whether fd refers to nested functions only because nested functions refer to
- * its variables, rather than for its contracts or what it overrides
+ * Whether fd refers to nested functions only because function literals of its
+ * own refer to its variables, rather than for its contracts, what it overrides,
+ * or functions given its variables as aliases: the literals, once inlined into
+ * it, read its variables directly, not through its frame
  */
 private bool onlyClosureVars(FuncDeclaration fd)
 {
-    return fd.closureVars.length && !fd.fdrequire && !fd.fdensure &&
-        !(fd.foverrides.length && fd.isVirtualMethod());
+    if (!fd.closureVars.length || fd.fdrequire || fd.fdensure ||
+        fd.foverrides.length && fd.isVirtualMethod())
+        return false;
+    foreach (v; fd.closureVars)
+        foreach (f; v.nestedrefs)
+        {
+            if (!f.isFuncLiteralDeclaration() || f.hasDualContext || f.toParent2() !is fd)
+                return false;
+        }
+    return true;
 }
 
 /***********************************************************
