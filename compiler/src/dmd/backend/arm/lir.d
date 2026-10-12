@@ -210,6 +210,7 @@ private __gshared
     Barray!(elem*) cseElems;    // CSEs evaluated, with their registers in cseRegs
     Barray!Reg cseRegs;
     Barray!Reg cseHis;          // the high halves of pair CSEs, else noReg
+    Barray!uint cseBlocks;      // the blocks they were evaluated in
     uint curBlock;
     uint condDepth;             // number of conditionally evaluated regions being selected
     bool usesFrame;             // the code refers to locals or parameters in memory
@@ -302,6 +303,7 @@ bool lirCodegen(ref CGstate cg)
     cseElems.setLength(0);
     cseRegs.setLength(0);
     cseHis.setLength(0);
+    cseBlocks.setLength(0);
     switchBlocks.setLength(0);
     usesFrame = false;
     condDepth = 0;
@@ -352,7 +354,8 @@ bool lirCodegen(ref CGstate cg)
             hoistInvariants();
         if (!env!"DMD_NEWCG_NOTHREAD")
             threadJumps();
-        fuseBoolBranches();
+        if (!env!"DMD_NEWCG_NOBOOLBR")
+            fuseBoolBranches();
         removeUnreachable();
         removeDead();
         fuseSignTests();
@@ -2408,13 +2411,19 @@ private void cseForget(size_t mark)
     cseElems.setLength(mark);
     cseRegs.setLength(mark);
     cseHis.setLength(mark);
+    cseBlocks.setLength(mark);
 }
 
+/* The register of CSE e evaluated before: a read of a variable shared by blocks
+ * only from its own block, as the block it was first read in need not run
+ * before the others, and reading the variable again is as good
+ */
 @trusted
 private Reg cseLookup(elem* e)
 {
+    const thisBlockOnly = isCrossBlockVar(e);
     foreach (i, x; cseElems[])
-        if (x is e)
+        if (x is e && (!thisBlockOnly || cseBlocks[i] == curBlock))
             return cseRegs[i];
     return noReg;
 }
@@ -2444,6 +2453,7 @@ private Reg gen(elem* e)
         cseElems.push(e);
         cseRegs.push(r);
         cseHis.push(noReg);
+        cseBlocks.push(curBlock);
     }
     return r;
 }
@@ -2545,8 +2555,9 @@ private Pair genPair(elem* e)
 {
     if (e.Ecount)
     {
+        const thisBlockOnly = isCrossBlockVar(e);
         foreach (i, x; cseElems[])
-            if (x is e)
+            if (x is e && (!thisBlockOnly || cseBlocks[i] == curBlock))
                 return Pair(cseRegs[i], cseHis[i]);
     }
     Pair p = genPairx(e);
@@ -2555,6 +2566,7 @@ private Pair genPair(elem* e)
         cseElems.push(e);
         cseRegs.push(p.lo);
         cseHis.push(p.hi);
+        cseBlocks.push(curBlock);
     }
     return p;
 }
