@@ -116,7 +116,11 @@ enum LOp : ubyte
     vzip2,          // d = the floats in lane 1 of a and of b
     vbsl,           // d = the bits of b where a has ones, else those of c
     tlv,            // d = the address of the thread local variable whose TLV descriptor is sym
+    atomic,         // the AtomicOp cond of sz bytes at [a]: b the value, c the expected one, d the result
 }
+
+/// The atomic operations, sequentially consistent, druntime's _d_aarch64_* functions are
+enum AtomicOp : ubyte { load, store, fetchAdd, exchange, cas, fence, pause }
 
 /// Flags of an instruction
 enum F : ubyte
@@ -3141,6 +3145,77 @@ private void blockLoop(Reg dst, Reg src, Reg v8, Reg n)
     placeLabel(lend);
 }
 
+/* Whether s is one of druntime's _d_aarch64_* atomic functions of np arguments,
+ * other than those of 16 bytes: which, and of what size
+ */
+@trusted
+private bool atomicCall(const Symbol* s, size_t np, out AtomicOp op, out uint size)
+{
+    if (!tyfunc(s.ty()))
+        return false;
+    const id = s.Sident.ptr[0 .. strlen(s.Sident.ptr)];
+    enum prefix = "_d_aarch64_";
+    if (id.length <= prefix.length || id[0 .. prefix.length] != prefix)
+        return false;
+    const rest = id[prefix.length .. $];
+    if (rest == "fence" || rest == "pause")
+    {
+        op = rest == "fence" ? AtomicOp.fence : AtomicOp.pause;
+        return np == 0;
+    }
+    const c = rest[$ - 1];
+    if (c != '1' && c != '2' && c != '4' && c != '8')
+        return false;
+    size = c - '0';
+    switch (rest[0 .. $ - 1])
+    {
+        case "load":     op = AtomicOp.load;     return np == 1;
+        case "store":    op = AtomicOp.store;    return np == 2;
+        case "fetchadd": op = AtomicOp.fetchAdd; return np == 2;
+        case "exchange": op = AtomicOp.exchange; return np == 2;
+        case "cas":      op = AtomicOp.cas;      return np == 3;
+        default:         return false;
+    }
+}
+
+/* The atomic operation op of size bytes on the arguments of its call: the address,
+ * then the value, or the expected and the desired values. Its result, or a
+ * register never defined for those with none
+ */
+@trusted
+private Reg genAtomic(AtomicOp op, uint size, elem*[] params)
+{
+    Reg[3] args;
+    foreach (k, p; params)
+        args[k] = gen(p);
+    Reg d = newVreg(RC.gp, size == 8 ? 8 : 4);
+    auto i = emitIns(LOp.atomic, cast(ubyte)size, noReg, args[0]);
+    i.cond = op;
+    final switch (op)
+    {
+        case AtomicOp.load:
+            i.d = d;
+            break;
+        case AtomicOp.store:
+            i.b = args[1];
+            break;
+        case AtomicOp.fetchAdd:
+        case AtomicOp.exchange:
+            i.d = d;
+            i.b = args[1];
+            break;
+        case AtomicOp.cas:
+            i.d = d;
+            i.c = args[1];      // expected
+            i.b = args[2];      // desired
+            break;
+        case AtomicOp.fence:
+        case AtomicOp.pause:
+            break;
+    }
+    return d;
+}
+
 /// The C library functions on memory done in place when their size is known
 private enum LibMem { none, memset, memcpy, memmove }
 
@@ -4003,15 +4078,29 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
         fillParameters(e.E2, params, n);
     }
 
-    // memset, memcpy and memmove of a few bytes, done in place
+    // memset, memcpy and memmove of a few bytes, done in place; params has the last argument first
     if (np == 3 && !pair && !agg && !hidden && e.E1.Eoper == OPvar)
         if (const k = libMemKind(e.E1.Vsym))
         {
-            elem* en = params[2].e;
+            elem* en = params[0].e;
             if (en.Eoper == OPconst && el_tolong(en) >= 0 && el_tolong(en) <= 64 &&
-                !el_sideeffect(params[0].e) && !el_sideeffect(params[1].e))
-                return genLibMem(k, params[0].e, params[1].e, cast(uint)el_tolong(en));
+                !el_sideeffect(params[2].e) && !el_sideeffect(params[1].e))
+                return genLibMem(k, params[2].e, params[1].e, cast(uint)el_tolong(en));
         }
+
+    // druntime's atomic operations, as the instructions they are
+    if (!pair && !agg && !hidden && e.E1.Eoper == OPvar)
+    {
+        AtomicOp op;
+        uint size;
+        if (atomicCall(e.E1.Vsym, np, op, size))
+        {
+            elem*[3] es;
+            foreach (k, ref p; params)
+                es[np - 1 - k] = p.e;     // in the order of the arguments
+            return genAtomic(op, size, es[0 .. np]);
+        }
+    }
 
     /* An aggregate argument the optimizer replaced with a plain value gets its
      * type back from the prototype, as cdfunc() does, as that decides how it is passed
@@ -5160,7 +5249,8 @@ private void numberValues()
             i.a = value(i.a);
             i.b = value(i.b);
             i.c = value(i.c);
-            if (i.op == LOp.st || i.op == LOp.stp || i.op == LOp.call || i.op == LOp.spsub || i.op == LOp.spadd)
+            if (i.op == LOp.st || i.op == LOp.stp || i.op == LOp.call || i.op == LOp.spsub || i.op == LOp.spadd ||
+                i.op == LOp.atomic)
                 ++epoch;        // what memory held may have changed
             const candidate = i.d && !isPhys(i.d) && ndefs[i.d - firstVreg] == 1 &&
                 !(i.flags & F.condDef) && (pureOp(*i) || i.op == LOp.ld && !(i.flags & F.volatile_)) &&
@@ -5293,7 +5383,7 @@ private void propagateCopies()
  */
 private bool writesMemory(ref const LIns i)
 {
-    return i.op == LOp.st || i.op == LOp.stp || i.op == LOp.call && !(i.flags & F.noreturn) ||
+    return i.op == LOp.st || i.op == LOp.stp || i.op == LOp.call && !(i.flags & F.noreturn) || i.op == LOp.atomic ||
            i.op == LOp.spsub || i.op == LOp.spadd;
 }
 
@@ -8719,7 +8809,7 @@ private void pairMemoryOps()
                     {
                         LIns* x = &ins[k];
                         if (x.op == LOp.label || x.op == LOp.br || x.op == LOp.bcond || x.op == LOp.cbz ||
-                            x.op == LOp.call || x.op == LOp.st || x.op == LOp.stp ||
+                            x.op == LOp.call || x.op == LOp.st || x.op == LOp.stp || x.op == LOp.atomic ||
                             x.op == LOp.spsub || x.op == LOp.spadd ||
                             !isLoad && (x.op == LOp.ld || x.op == LOp.ldp))
                         {
@@ -8761,7 +8851,8 @@ private void pairMemoryOps()
                     b.d = b.a = b.b = b.c = noReg;
                     break;
                 }
-                if (b.op == LOp.label || b.op == LOp.br || b.op == LOp.bcond || b.op == LOp.cbz || b.op == LOp.call)
+                if (b.op == LOp.label || b.op == LOp.br || b.op == LOp.bcond || b.op == LOp.cbz || b.op == LOp.call ||
+                    b.op == LOp.atomic)
                     break;
             }
         }
@@ -10205,6 +10296,43 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
             if (i.b)
                 w |= (pr(i.b) & 31) << 16;
             cdb.gen1(w);
+            break;
+        }
+
+        case LOp.atomic:
+        {
+            // LSE, through x16 where the result goes, so no operand is overwritten before it is read
+            const uint sz = (i.sz == 8 ? 3 : i.sz == 4 ? 2 : i.sz == 2 ? 1 : 0) << 30;
+            const uint rn = i.a ? pr(i.a) << 5 : 0;
+            final switch (cast(AtomicOp)i.cond)
+            {
+                case AtomicOp.load:
+                    def(pr(i.d));
+                    cdb.gen1(sz | 0x08DF_FC00 | rn | pr(i.d));                  // LDAR d,[a]
+                    break;
+                case AtomicOp.store:
+                    cdb.gen1(sz | 0x089F_FC00 | rn | pr(i.b));                  // STLR b,[a]
+                    break;
+                case AtomicOp.fetchAdd:
+                case AtomicOp.exchange:
+                    def(pr(i.d));
+                    // LDADDAL b,x16,[a] or SWPAL b,x16,[a]
+                    cdb.gen1(sz | (i.cond == AtomicOp.fetchAdd ? 0x38E0_0000 : 0x38E0_8000) | (pr(i.b) << 16) | rn | 16);
+                    cdb.gen1(INSTR.mov_register(1, 16, pr(i.d)));
+                    break;
+                case AtomicOp.cas:
+                    def(pr(i.d));
+                    cdb.gen1(INSTR.mov_register(1, pr(i.c), 16));
+                    cdb.gen1(sz | 0x08E0_FC00 | (16 << 16) | rn | pr(i.b));    // CASAL x16,b,[a]
+                    cdb.gen1(INSTR.mov_register(1, 16, pr(i.d)));
+                    break;
+                case AtomicOp.fence:
+                    cdb.gen1(0xD503_3BBF);                                      // DMB ISH
+                    break;
+                case AtomicOp.pause:
+                    cdb.gen1(0xD503_203F);                                      // YIELD
+                    break;
+            }
             break;
         }
 
