@@ -2058,7 +2058,9 @@ public:
                 /* what is too costly outside loops is inlined into loops up to a
                  * budget, as each inlined function is optimized again in the caller
                  */
-                const loopBudget = registersToSpare() ? 1200 : 700;
+                // more in deeper loops, which run more often
+                const depth = loopDepth < 3 ? loopDepth : 3;
+                const loopBudget = (registersToSpare() ? 1200 : 700) * depth;
                 if (!tooCostlyOutsideLoops(cost))
                     return true;
                 const c = expressionCost(cost);
