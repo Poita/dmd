@@ -1154,6 +1154,185 @@ public:
     {
     }
 
+    /// Whether the function being scanned is small enough for statements inlined into
+    /// it not to crowd out its register variables
+    bool smallCaller()
+    {
+        enum maxCallerLines = 150;
+        return registersToSpare() ||
+               parent.endloc.linnum >= parent.loc.linnum &&
+               parent.endloc.linnum - parent.loc.linnum <= maxCallerLines;
+    }
+
+    /* Calls in `exp` of functions with loops, which are inlined only as statements,
+     * are moved into temporaries declared before the statement, as
+     * `T __liftval = call;` with `exp` reading the temporary, where the statement
+     * inliner expands them. A call moves only from where it is always evaluated,
+     * when what is evaluated before it only reads values, its arguments only read
+     * values, and its function changes nothing but its own locals, so nothing it
+     * moves ahead of can tell. Returns the declarations of the temporaries, or null.
+     */
+    Statement liftCalls(ref Expression exp)
+    {
+        if (!exp || !smallCaller())
+            return null;
+        Statements lifted;
+        Expression*[] slots;    // where each lifted call was
+        CallExp[] calls;
+        bool plain = true;      // whether all evaluated so far only reads values
+
+        bool liftable(CallExp ce)
+        {
+            auto ve = ce.e1.isVarExp();
+            auto fd = ve ? ve.var.isFuncDeclaration() : null;
+            if (!fd || fd.isNested() || fd.needThis() || !ce.type)
+                return false;
+            if (ce.arguments)
+                foreach (arg; *ce.arguments)
+                    if (!isPlainRead(arg))
+                        return false;
+            auto t = ce.type.toBasetype();
+            if (!(t.isTypeBasic() && t.ty != Tvoid) && !t.isTypePointer())
+                return false;
+            return !canInline(fd, false, false, pass, eSink) && canInline(fd, false, true, pass, eSink) &&
+                   writesOnlyLocals(fd);
+        }
+
+        void lift(ref Expression e)
+        {
+            auto ce = e.isCallExp();
+            auto vd = new VarDeclaration(ce.loc, ce.type, Identifier.generateId("__liftval"), null);
+            vd.storage_class = STC.temp;
+            vd._linkage = LINK.d;
+            vd.parent = parent;
+            auto ve = new VarExp(ce.loc, vd);
+            ve.type = vd.type;
+            auto cons = new ConstructExp(ce.loc, ve, ce);
+            cons.type = vd.type;
+            vd._init = new ExpInitializer(ce.loc, cons);
+            auto de = new DeclarationExp(ce.loc, vd);
+            de.type = Type.tvoid;
+            lifted.push(new ExpStatement(ce.loc, de));
+            slots ~= &e;
+            calls ~= ce;
+            auto ve2 = new VarExp(ce.loc, vd);
+            ve2.type = vd.type;
+            e = ve2;
+        }
+
+        // walks e in the order it is evaluated, lifting calls while all before them is plain
+        void walk(ref Expression e)
+        {
+            if (!e || !plain)
+                return;
+            if (isPlainRead(e))
+                return;
+            if (auto ce = e.isCallExp())
+            {
+                if (liftable(ce))
+                    lift(e);
+                else
+                    plain = false;
+                return;
+            }
+            switch (e.op)
+            {
+                case EXP.assign, EXP.construct, EXP.blit:
+                    /* what is assigned and where are evaluated in either order:
+                     * a call is lifted from one side when the other only reads
+                     */
+                    auto ae = cast(AssignExp)e;
+                    if (isPlainRead(ae.e2))
+                        walk(ae.e1);
+                    else if (isPlainRead(ae.e1, true))
+                        walk(ae.e2);
+                    else
+                        plain = false;
+                    return;
+                case EXP.addAssign, EXP.minAssign, EXP.mulAssign, EXP.andAssign, EXP.orAssign,
+                     EXP.xorAssign, EXP.leftShiftAssign, EXP.rightShiftAssign,
+                     EXP.unsignedRightShiftAssign:
+                    auto be = e.isBinExp();
+                    auto t = be.e1.type ? be.e1.type.toBasetype() : null;
+                    if (t && (t.isTypeBasic() || t.isTypePointer()) && isPlainRead(be.e1))
+                        walk(be.e2);
+                    else
+                        plain = false;
+                    return;
+                case EXP.index:
+                    auto ie = e.isIndexExp();
+                    walk(ie.e1);
+                    walk(ie.e2);
+                    if (!ie.indexIsInBounds)
+                        plain = false;  // the bounds check may fail
+                    return;
+                case EXP.cast_:
+                    auto c = e.isCastExp();
+                    walk(c.e1);
+                    if (!isPlainRead(c))
+                    {
+                        auto t = c.type ? c.type.toBasetype() : null;
+                        auto f = c.e1.type ? c.e1.type.toBasetype() : null;
+                        if ((!t || !f || !(t.isTypeBasic() || t.isTypePointer()) ||
+                             !(f.isTypeBasic() || f.isTypePointer())) && !qualifierCast(c))
+                            plain = false;
+                    }
+                    return;
+                case EXP.negate, EXP.tilde, EXP.not:
+                    walk(e.isUnaExp().e1);
+                    return;
+                case EXP.add, EXP.min, EXP.mul, EXP.and, EXP.or, EXP.xor,
+                     EXP.leftShift, EXP.rightShift, EXP.unsignedRightShift,
+                     EXP.lessThan, EXP.lessOrEqual, EXP.greaterThan, EXP.greaterOrEqual,
+                     EXP.equal, EXP.notEqual, EXP.identity, EXP.notIdentity:
+                    auto be = e.isBinExp();
+                    auto t1 = be.e1.type ? be.e1.type.toBasetype() : null;
+                    auto t2 = be.e2.type ? be.e2.type.toBasetype() : null;
+                    if (!t1 || !t2 || !(t1.isTypeBasic() || t1.isTypePointer()) ||
+                        !(t2.isTypeBasic() || t2.isTypePointer()))
+                    {
+                        plain = false;
+                        return;
+                    }
+                    walk(be.e1);
+                    walk(be.e2);
+                    return;
+                case EXP.andAnd, EXP.orOr:
+                    // the right operand is evaluated only sometimes
+                    auto be = e.isBinExp();
+                    walk(be.e1);
+                    plain = plain && isPlainRead(be.e2);
+                    return;
+                case EXP.question:
+                    auto ce = e.isCondExp();
+                    walk(ce.econd);
+                    plain = plain && isPlainRead(ce.e1) && isPlainRead(ce.e2);
+                    return;
+                default:
+                    plain = false;
+                    return;
+            }
+        }
+
+        walk(exp);
+        if (!lifted.length)
+            return null;
+        // a call the statement inliner leaves is put back
+        Statements kept;
+        foreach (i, st; lifted[])
+        {
+            auto before = st;
+            inlineScan(st);
+            if (st is before)
+                *slots[i] = calls[i];
+            else
+                kept.push(st);
+        }
+        if (!kept.length)
+            return null;
+        return new CompoundStatement(exp.loc, kept.move());
+    }
+
     override void visit(ExpStatement s)
     {
         static if (LOG)
@@ -1214,10 +1393,7 @@ public:
                             return null;
                 return vd;
             }
-            enum maxCallerLines = 150;
-            const smallCaller = registersToSpare() ||
-                                parent.endloc.linnum >= parent.loc.linnum &&
-                                parent.endloc.linnum - parent.loc.linnum <= maxCallerLines;
+            const small = smallCaller();
             if (auto de = exp.isDeclarationExp())
             {
                 auto vd = de.declaration.isVarDeclaration();
@@ -1226,7 +1402,7 @@ public:
                 if (vd && vd._init && (ie = vd._init.isExpInitializer()) !is null &&
                     (ae = ie.exp.isConstructExp()) !is null && ae.e1.isVarExp() &&
                     ae.e1.isVarExp().var == vd && retVar(ae.e1, ae.e2) &&
-                    (smallCaller || givenLiteral(ae.e2.isCallExp())))
+                    (small || givenLiteral(ae.e2.isCallExp())))
                 {
                     auto call = ae.e2.isCallExp();
                     inlineScan(exp);
@@ -1246,7 +1422,7 @@ public:
             if (auto ae = exp.isAssignExp())
             {
                 if ((ae.op == EXP.assign || ae.op == EXP.construct) && retVar(ae.e1, ae.e2) &&
-                    (smallCaller || givenLiteral(ae.e2.isCallExp())))
+                    (small || givenLiteral(ae.e2.isCallExp())))
                 {
                     auto call = ae.e2.isCallExp();
                     inlineScan(exp);
@@ -1363,7 +1539,24 @@ public:
             return null;
         }
 
+        Statement lifted;
+        if (auto de = s.exp.isDeclarationExp())
+        {
+            auto vd = de.declaration.isVarDeclaration();
+            auto ie = vd && vd._init ? vd._init.isExpInitializer() : null;
+            auto ae = ie ? ie.exp.isConstructExp() : null;
+            if (ae && !ae.e2.isCallExp())
+                lifted = liftCalls(ae.e2);
+        }
+        else if (!s.exp.isCallExp())
+        {
+            auto ae = s.exp.op == EXP.assign || s.exp.op == EXP.construct ? cast(AssignExp)s.exp : null;
+            if (!ae || !ae.e2.isCallExp() || !ae.e1.isVarExp())
+                lifted = liftCalls(s.exp);
+        }
         sresult = inlineScanExpAsStatement(s.exp);
+        if (lifted)
+            sresult = new CompoundStatement(s.loc, lifted, sresult ? sresult : s);
     }
 
     override void visit(CompoundStatement s)
@@ -1432,9 +1625,12 @@ public:
 
     override void visit(IfStatement s)
     {
+        auto lifted = s.param ? null : liftCalls(s.condition);
         inlineScan(s.condition);
         inlineScan(s.ifbody);
         inlineScan(s.elsebody);
+        if (lifted)
+            sresult = new CompoundStatement(s.loc, lifted, s);
     }
 
     override void visit(SwitchStatement s)
@@ -1475,6 +1671,7 @@ public:
         if (!s.exp)
             return;
 
+        auto lifted = liftCalls(s.exp);
         Expression e0;
         Expression elast = Expression.extractLast(s.exp, e0);
         inlineScan(e0);
@@ -1495,6 +1692,8 @@ public:
         }
 
         s.exp = Expression.combine(e0, elast);
+        if (lifted)
+            sresult = new CompoundStatement(s.loc, lifted, s);
     }
 
     override void visit(SynchronizedStatement s)
@@ -2384,6 +2583,132 @@ private bool refersToNested(FuncDeclaration fd)
     scope v = new NestedFinder();
     fd.fbody.accept(v);
     return v.found;
+}
+
+/***********************************************************
+ * Whether e only reads values, without calls, side effects or any way to fault,
+ * so it may be evaluated after a call it comes before that changes nothing
+ */
+private bool isPlainRead(Expression e, bool boundsChecked = false)
+{
+    if (!e)
+        return true;
+    bool basic(Type t)
+    {
+        auto tb = t ? t.toBasetype() : null;
+        return tb && (tb.isTypeBasic() && tb.ty != Tvoid || tb.isTypePointer());
+    }
+    switch (e.op)
+    {
+        case EXP.int64, EXP.float64, EXP.null_, EXP.string_, EXP.symbolOffset:
+            return true;
+        case EXP.variable:
+            auto vd = e.isVarExp().var.isVarDeclaration();
+            return vd && !(vd.storage_class & STC.lazy_);
+        case EXP.dotVariable:
+            auto dve = e.isDotVarExp();
+            return dve.var.isVarDeclaration() && dve.e1.type &&
+                   dve.e1.type.toBasetype().isTypeStruct() && isPlainRead(dve.e1, boundsChecked);
+        case EXP.slice:
+            auto se = e.isSliceExp();
+            return !se.lwr && !se.upr && isPlainRead(se.e1, boundsChecked);
+        case EXP.arrayLength:
+            return isPlainRead(e.isArrayLengthExp().e1, boundsChecked);
+        case EXP.index:
+            auto ie = e.isIndexExp();
+            auto ta = ie.e1.type ? ie.e1.type.toBasetype() : null;
+            if (!ta || !(ta.isTypeSArray() || boundsChecked && ta.isTypeDArray()))
+                return false;
+            return (ie.indexIsInBounds || boundsChecked) &&
+                   isPlainRead(ie.e1, boundsChecked) && isPlainRead(ie.e2, boundsChecked);
+        case EXP.cast_:
+            auto ce = e.isCastExp();
+            return (basic(ce.type) && basic(ce.e1.type) || qualifierCast(ce)) && isPlainRead(ce.e1, boundsChecked);
+        case EXP.negate, EXP.tilde, EXP.not:
+            return basic(e.type) && isPlainRead(e.isUnaExp().e1, boundsChecked);
+        case EXP.add, EXP.min, EXP.mul, EXP.and, EXP.or, EXP.xor,
+             EXP.leftShift, EXP.rightShift, EXP.unsignedRightShift,
+             EXP.lessThan, EXP.lessOrEqual, EXP.greaterThan, EXP.greaterOrEqual,
+             EXP.equal, EXP.notEqual, EXP.identity, EXP.notIdentity:
+            auto be = e.isBinExp();
+            return basic(be.e1.type) && basic(be.e2.type) && isPlainRead(be.e1, boundsChecked) && isPlainRead(be.e2, boundsChecked);
+        default:
+            return false;
+    }
+}
+
+/// Whether ce converts an array or pointer to one of the same elements qualified differently
+private bool qualifierCast(CastExp ce)
+{
+    auto t = ce.type ? ce.type.toBasetype() : null;
+    auto f = ce.e1.type ? ce.e1.type.toBasetype() : null;
+    if (!t || !f || t.ty != f.ty || !(t.isTypeDArray() || t.isTypePointer()))
+        return false;
+    return t.nextOf().mutableOf().unSharedOf().equals(f.nextOf().mutableOf().unSharedOf());
+}
+
+/***********************************************************
+ * Whether fd changes nothing but its own local variables, calling nothing and
+ * allocating nothing, so a call of it may be moved before what it does not read
+ */
+private bool writesOnlyLocals(FuncDeclaration fd)
+{
+    import dmd.visitor : SemanticTimeTransitiveVisitor;
+    extern (C++) final class Writes : SemanticTimeTransitiveVisitor
+    {
+        alias visit = SemanticTimeTransitiveVisitor.visit;
+        FuncDeclaration fd;
+        bool found;
+        extern (D) this(FuncDeclaration fd) scope { this.fd = fd; }
+
+        // a variable of fd's own or a part of one, held in fd's frame
+        bool local(Expression e, bool bind)
+        {
+            if (auto ve = e.isVarExp())
+            {
+                auto vd = ve.var.isVarDeclaration();
+                return vd && !vd.isDataseg() && vd.toParent2() == fd &&
+                       !(vd.storage_class & (STC.out_ | STC.lazy_)) && (bind || !vd.isRef());
+            }
+            if (auto ie = e.isIndexExp())
+                return ie.e1.type && ie.e1.type.toBasetype().isTypeSArray() && local(ie.e1, false);
+            if (auto dve = e.isDotVarExp())
+                return dve.e1.type && dve.e1.type.toBasetype().isTypeStruct() && local(dve.e1, false);
+            return false;
+        }
+
+        override void visit(AssignExp e)
+        {
+            found |= !local(e.e1, e.op == EXP.construct || e.op == EXP.blit);
+            super.visit(e);
+        }
+        override void visit(BinAssignExp e) { found |= !local(e.e1, false); super.visit(e); }
+        override void visit(PreExp e) { found |= !local(e.e1, false); super.visit(e); }
+        override void visit(PostExp e) { found |= !local(e.e1, false); super.visit(e); }
+        override void visit(CallExp e) { found = true; }
+        override void visit(NewExp e) { found = true; }
+        override void visit(NewAnonClassExp e) { found = true; }
+        override void visit(FuncExp e) { found = true; }
+        override void visit(DelegateExp e) { found = true; }
+        override void visit(ArrayLiteralExp e) { found = true; }
+        override void visit(AssocArrayLiteralExp e) { found = true; }
+        override void visit(DeleteExp e) { found = true; }
+        override void visit(AsmStatement s) { found = true; }
+        override void visit(ThrowStatement s) { found = true; }
+        override void visit(DeclarationExp e)
+        {
+            auto vd = e.declaration.isVarDeclaration();
+            if (!vd || vd.isDataseg())
+                found = true;
+            else
+                super.visit(e);
+        }
+    }
+    if (!fd.fbody)
+        return false;
+    scope v = new Writes(fd);
+    fd.fbody.accept(v);
+    return !v.found;
 }
 
 /***********************************************************
