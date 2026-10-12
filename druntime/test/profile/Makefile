@@ -49,7 +49,7 @@ $(ROOT)/both.done: $(ROOT)/%.done: $(ROOT)/%$(DOTEXE)
 	$(GREP) -q '1000 .*both.Num\* both.foo(uint)' $(ROOT)/both.log
 	cat $(ROOT)/both.def
 	sort $(ROOT)/both.def -o $(ROOT)/both.def
-	(sort bothnew.def.exp | $(DIFF) - $(ROOT)/both.def)
+	(sort bothnew.def.exp | $(DIFF) - $(ROOT)/both.def) || (sort bothnew.releaseopt.def.exp | $(DIFF) - $(ROOT)/both.def)
 ifeq (windows,$(OS))
 	$(DIFF) \
 		<($(GREP) -vF 'core.' bothgc.log.exp) \

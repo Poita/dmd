@@ -12,7 +12,7 @@ void main()
     }
 }
 
-void f1()
+pragma(inline, false) void f1()
 {
     throw new Exception("exception");
 }
