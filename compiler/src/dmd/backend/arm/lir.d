@@ -1832,6 +1832,12 @@ private void genEffect(elem* e)
             }
             break;
     }
+    /* an assignment typed as an aggregate, of no aggregate type, of scalars of the
+     * same size, as of references, is the scalar assignment it is
+     */
+    if (e.Eoper == OPeq && tyaggregate(e.Ety) && !e.ET && !e.E1.ET && !e.E2.ET &&
+        scalarType(e.E1.Ety) && scalarType(e.E2.Ety) && tysize(e.E1.Ety) == tysize(e.E2.Ety))
+        e.Ety = e.E1.Ety;
     if (e.Eoper == OPmemcpy || e.Eoper == OPmemset)
         genMemOp(e);
     else if (e.Eoper == OPstreq || tyaggregate(e.Ety) || hfaAsInteger(e) ||
@@ -2869,8 +2875,26 @@ private tym_t chunkType(uint n)
 private AggVal genAggAssign(elem* e)
 {
     type* t = e.ET ? e.ET : e.E1.ET ? e.E1.ET : e.E2.ET;
+    // else the type of a variable assigned whole, or assigned from
+    foreach (x; [e.E1, e.E2])
+        if (!t && x.Eoper == OPvar && x.Voffset == 0 && tyaggregate(x.Vsym.Stype.Tty) &&
+            tybasic(x.Vsym.Stype.Tty) == tybasic(e.Ety))
+            t = x.Vsym.Stype;
     if (!t)
     {
+        if (env!"DMD_NEWCG_WHY")
+        {
+            import dmd.backend.debugprint : WReqn;
+            fprintf(stderr, "newcg-aggtype: %s %s\n", tym_str(e.Ety), funcsym_p.Sident.ptr);
+            foreach (x; [e.E1, e.E2])
+                if (x.Eoper == OPvar)
+                    fprintf(stderr, "    var %s ty %s sym %s off %d\n", x.Vsym.Sident.ptr, tym_str(x.Ety),
+                        tym_str(x.Vsym.Stype.Tty), cast(int)x.Voffset);
+            fflush(stderr);
+            WReqn(e);
+            printf("\n");
+            fflush(stdout);
+        }
         fail("aggregate type");
         return AggVal.init;
     }
