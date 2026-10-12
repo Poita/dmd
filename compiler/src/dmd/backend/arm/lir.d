@@ -315,6 +315,17 @@ bool lirCodegen(ref CGstate cg)
             b.Bdfoidx = savedDfoidx[i];
 
     assignVariables();
+    ehRegs[] = noReg;
+    bool hasTry;
+    foreach (b; blocks[])
+    {
+        if ((b.bc == BC.jcatch || b.bc == BC.lpad) && !ehRegs[0])
+        {
+            ehRegs[0] = newVreg(RC.gp, 8);
+            ehRegs[1] = newVreg(RC.gp, 8);
+        }
+        hasTry |= b.bc == BC.try_;
+    }
     select();
     if (!failed)
     {
@@ -372,6 +383,11 @@ bool lirCodegen(ref CGstate cg)
     pairMemoryOps();
     emit(cg);
     finishVariables();
+    if (hasTry)
+    {
+        import dmd.backend.code : EHtry;
+        cg.usednteh |= EHtry;       // so its try blocks get their entries in the EH table
+    }
     foreach (b; switchBlocks[])
         b.bc = BC.ifthen;           // done as comparisons, no jump table
     if (env!"DMD_NEWCG_LOG")
@@ -439,6 +455,10 @@ private bool supported(ref CGstate cg)
                 break;
             case SC.fastpar:
                 break;
+            case SC.pseudo:
+                if (varSupported(s))
+                    break;
+                goto default;
             default:
                 if (env!"DMD_NEWCG_WHY")
                     fprintf(stderr, "newcg-symclass: %s %d\n", s.Sident.ptr, s.Sclass);
@@ -466,14 +486,18 @@ private bool supported(ref CGstate cg)
                 if (!b.Belem || !scalarType(b.Belem.Ety) || tyfloating(b.Belem.Ety))
                     return false;
                 break;
+            case BC.try_:
+            case BC.finally_:
+            case BC.finRet:
+            case BC.jcatch:
+            case BC.lpad:
+                whyNot = "exception handling";
+                if (config.ehmethod != EHmethod.EH_DWARF)
+                    return false;
+                break;
             default:
                 whyNot = "block kind";
                 return false;
-        }
-        if (b.Btry)
-        {
-            whyNot = "try";
-            return false;
         }
         if (b.Belem && !supportedElem(b.Belem))
             return false;
@@ -697,6 +721,9 @@ private bool varSupported(const Symbol* s)
         case SC.locstat:
         case SC.comdef:
             return !(s.ty() & mTYthread);
+        case SC.pseudo:
+            // x0 and x1 as a landing pad is entered with them
+            return config.ehmethod == EHmethod.EH_DWARF && s.Sreglsw <= 1;
         default:
             return false;
     }
@@ -1323,6 +1350,21 @@ private void jumpToBlock(block* b, COND cond = COND.al)
  */
 private __gshared Barray!bool skipBlock;
 
+/* The values of x0 and x1 as a landing pad is entered with them: the exception
+ * object and the handler's index, copied at the start of each landing pad
+ */
+private __gshared Reg[2] ehRegs;
+
+/* The landing pad of the try block t: its catch block, or the landing pad of its
+ * finally block
+ */
+@trusted
+private block* landingPadOf(block* t)
+{
+    block* h = t.Bsucc[1];
+    return h.bc == BC.jcatch ? h : h.Bsucc[0];
+}
+
 /* The cheap value of an arm of a select: no side effects or faults, few operations
  */
 @trusted
@@ -1621,8 +1663,42 @@ private void select()
         if (b.Belem)
             collectAssigned(b.Belem);
         block* next = bi + 1 < blocks.length ? blocks[bi + 1] : null;
+        if (b.bc == BC.jcatch || b.bc == BC.lpad)
+        {
+            // what x0 and x1 hold as the unwinder enters, before anything else
+            emitIns(LOp.copy, 8, ehRegs[0], phys(0));
+            emitIns(LOp.copy, 8, ehRegs[1], phys(1));
+        }
         switch (b.bc)
         {
+            /* the blocks of exception handling: each goes on to its block explicitly,
+             * as their successors are more than where they go
+             */
+            case BC.try_:
+                if (b.Belem)
+                    genEffect(b.Belem);
+                jumpToBlock(b.Bsucc[0]);
+                break;
+
+            case BC.finally_:
+                if (b.Belem)
+                    genEffect(b.Belem);
+                jumpToBlock(b.Bsucc[1]);
+                break;
+
+            case BC.lpad:
+            case BC.jcatch:
+                if (b.Belem)
+                    genEffect(b.Belem);
+                jumpToBlock(b.Bsucc[0]);
+                break;
+
+            case BC.finRet:
+                // never reached: what the flag of the finally can be is handled before it
+                if (b.Belem)
+                    genEffect(b.Belem);
+                break;
+
             case BC.goto_:
                 if (b.Belem)
                     genEffect(b.Belem);
@@ -3658,6 +3734,16 @@ private Reg genx(elem* e)
 
         case OPvar:
         {
+            if (e.Vsym.Sclass == SC.pseudo)
+            {
+                // x0 or x1 as the landing pad was entered with
+                if (!ehRegs[0] || e.Voffset)
+                {
+                    fail("register read outside a landing pad");
+                    return newVreg(rc, sz);
+                }
+                return asClass(ehRegs[e.Vsym.Sreglsw], rc, sz);
+            }
             if (Reg r = hfaReadAsInteger(e))
                 return r;
             if (Reg r = varRegOf(e))
@@ -5186,10 +5272,15 @@ private void buildSegments()
         {
             if (si + 1 < ns && segBlock[si + 1] == bi)
                 segSucc.push(cast(uint)(si + 1));
+            else if (blocks[bi].bc == BC.finRet && !blocks[bi].Bsucc.length && bi + 1 < nb)
+                segSucc.push(blockSeg[bi + 1]);     // as the old code generator lays it out
             else
                 foreach (s; blocks[bi].Bsucc[])
                     segSucc.push(blockSeg[s.Bdfoidx]);
         }
+        // where an exception thrown by what the segment calls goes
+        if (block* t = blocks[bi].Btry)
+            segSucc.push(blockSeg[landingPadOf(t).Bdfoidx]);
     }
     segSuccStart[ns] = cast(uint)segSucc.length;
 
@@ -9990,6 +10081,10 @@ private void emit(ref CGstate cg)
     {
         CodeBuilder cdb;
         cdb.ctor();
+        // the unwinder enters a landing pad with SP as at the call that threw, which may be
+        // below its place for arguments on the stack: MOV SP,X29, the frame having no more
+        if (b.bc == BC.jcatch || b.bc == BC.lpad)
+            cdb.gen1(0x9100_03BF);
         foreach (n; blockStart[bi] .. blockStart[bi + 1])
         {
             LIns* i = &ins[n];
@@ -10853,10 +10948,25 @@ private void dumpTrees()
 {
     import dmd.backend.debugprint : WReqn;
     printf("=== %s (not generated)\n", funcsym_p.Sident.ptr);
+    // the kind, successors and enclosing try of each block too
+    static int indexOf(const block* x)
+    {
+        int k;
+        for (block* b = bo.startblock; b; b = b.Bnext, ++k)
+            if (b is x)
+                return k;
+        return -1;
+    }
     int n;
     for (block* b = bo.startblock; b; b = b.Bnext)
     {
-        printf("B%d:\n", n++);
+        import dmd.backend.debugprint : bc_str;
+        printf("B%d: %s ->", n++, bc_str(b.bc));
+        foreach (s; b.Bsucc[])
+            printf(" B%d", indexOf(s));
+        if (b.Btry)
+            printf(" try B%d", indexOf(b.Btry));
+        printf("\n");
         if (b.Belem)
         {
             printf("  ");
