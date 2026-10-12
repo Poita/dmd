@@ -9050,8 +9050,10 @@ private void expandTlvs()
             else
             {
                 ins[n] = LIns.init;     // a nop
-                inserts.push(Insert(at, t, false));
-                inserts.push(Insert(at, c, false));
+                // above the block's first instruction it stays in the block, on every way in
+                const leads = at == blockStart[bi];
+                inserts.push(Insert(at, t, leads));
+                inserts.push(Insert(at, c, leads));
             }
         }
     }
