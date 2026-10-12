@@ -3115,6 +3115,93 @@ private void blockLoop(Reg dst, Reg src, Reg v8, Reg n)
     placeLabel(lend);
 }
 
+/// The C library functions on memory done in place when their size is known
+private enum LibMem { none, memset, memcpy, memmove }
+
+/* Which of the C library's memset, memcpy and memmove s is, if any: only with C
+ * linkage is a function's name just that
+ */
+@trusted
+private LibMem libMemKind(const Symbol* s)
+{
+    if (!tyfunc(s.ty()))
+        return LibMem.none;
+    const id = s.Sident.ptr[0 .. strlen(s.Sident.ptr)];
+    return id == "memset" ? LibMem.memset : id == "memcpy" ? LibMem.memcpy :
+           id == "memmove" ? LibMem.memmove : LibMem.none;
+}
+
+/* memset(d, v, n), memcpy(d, s, n) or memmove(d, s, n) for n bytes known: the
+ * stores themselves, and d, the result. memmove loads all before it stores
+ */
+@trusted
+private Reg genLibMem(LibMem k, elem* ed, elem* e2, uint n)
+{
+    Reg d = gen(ed);
+    Mem md;
+    md.base = d;
+    if (k == LibMem.memset)
+    {
+        // the byte repeated in 8
+        Reg v8 = newVreg(RC.gp, 8);
+        if (e2.Eoper == OPconst)
+        {
+            ulong v = el_tolong(e2) & 0xFF;
+            emitIns(LOp.movi, 8, v8, noReg, noReg, cast(long)(v * 0x0101_0101_0101_0101UL));
+        }
+        else
+        {
+            Reg b = newVreg(RC.gp, 8);
+            emitIns(LOp.andi, 8, b, extendFrom(gen(e2), 8, false, 4), noReg, 0xFF);
+            Reg k8 = newVreg(RC.gp, 8);
+            emitIns(LOp.movi, 8, k8, noReg, noReg, 0x0101_0101_0101_0101);
+            emitIns(LOp.mul, 8, v8, b, k8);
+        }
+        uint off = 0;
+        while (off < n)
+        {
+            const left = n - off;
+            const c = left >= 8 ? 8 : left >= 4 ? 4 : left >= 2 ? 2 : 1;
+            Mem m = md;
+            m.offset = off;
+            store(v8, m, chunkType(c));
+            off += c;
+        }
+        return d;
+    }
+    Mem ms;
+    ms.base = gen(e2);
+    if (k == LibMem.memcpy)
+    {
+        copyMem(md, ms, n);
+        return d;
+    }
+    Reg[8] parts;
+    uint[8] sizes;
+    uint count, off;
+    while (off < n)
+    {
+        const left = n - off;
+        const c = left >= 8 ? 8 : left >= 4 ? 4 : left >= 2 ? 2 : 1;
+        Mem m = ms;
+        m.offset = off;
+        parts[count] = newVreg(RC.gp, c);
+        sizes[count] = c;
+        load(parts[count], m, chunkType(c));
+        ++count;
+        off += c;
+    }
+    off = 0;
+    foreach (j; 0 .. count)
+    {
+        Mem m = md;
+        m.offset = off;
+        store(parts[j], m, chunkType(sizes[j]));
+        off += sizes[j];
+    }
+    return d;
+}
+
 /* A call of the C library function f with integer arguments args
  */
 @trusted
@@ -3882,6 +3969,16 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
         int n = 0;
         fillParameters(e.E2, params, n);
     }
+
+    // memset, memcpy and memmove of a few bytes, done in place
+    if (np == 3 && !pair && !agg && !hidden && e.E1.Eoper == OPvar)
+        if (const k = libMemKind(e.E1.Vsym))
+        {
+            elem* en = params[2].e;
+            if (en.Eoper == OPconst && el_tolong(en) >= 0 && el_tolong(en) <= 64 &&
+                !el_sideeffect(params[0].e) && !el_sideeffect(params[1].e))
+                return genLibMem(k, params[0].e, params[1].e, cast(uint)el_tolong(en));
+        }
 
     /* An aggregate argument the optimizer replaced with a plain value gets its
      * type back from the prototype, as cdfunc() does, as that decides how it is passed
