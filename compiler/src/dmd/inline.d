@@ -1842,6 +1842,11 @@ public:
                     return null;
             }
 
+            // a function called through a pointer to it cast to add attributes, as
+            // (cast(F) &f)() calls f as if pure
+            if (auto ce = e.isCastExp())
+                return attributeCastTarget(ce);
+
             // a literal called directly, as where a delegate parameter was inlined
             if (auto fe = e.isFuncExp())
                 return fe.fd;
@@ -2208,6 +2213,47 @@ bool restEndsWithReturn(ref Statements statements, size_t i)
         if (!st)
             return false;
     return statements[$ - 1].endsWithReturnStatement() !is null;
+}
+
+/***********************************************************
+ * The function ce casts a pointer to, when the type cast to differs from the
+ * function's only in attributes, as `(cast(F) &f)` that calls `f` as if it were
+ * `pure` or `nothrow`; else null
+ */
+private FuncDeclaration attributeCastTarget(CastExp ce)
+{
+    FuncDeclaration f;
+    if (auto se = ce.e1.isSymOffExp())
+    {
+        if (se.offset == 0)
+            f = se.var.isFuncDeclaration();
+    }
+    else if (auto ae = ce.e1.isAddrExp())
+    {
+        if (auto ve = ae.e1.isVarExp())
+            f = ve.var.isFuncDeclaration();
+    }
+    if (!f || f.needThis() || !f.type || !ce.to)
+        return null;
+    auto tp = ce.to.toBasetype().isTypePointer();
+    if (!tp)
+        return null;
+    auto t2 = tp.next.isTypeFunction();
+    auto t1 = f.type.isTypeFunction();
+    if (!t1 || !t2 || t1.linkage != t2.linkage || t1.isRef != t2.isRef ||
+        t1.parameterList.varargs != t2.parameterList.varargs ||
+        t1.parameterList.length != t2.parameterList.length ||
+        !t1.next || !t2.next || !t1.next.equals(t2.next))
+        return null;
+    foreach (i; 0 .. t1.parameterList.length)
+    {
+        auto p1 = t1.parameterList[i];
+        auto p2 = t2.parameterList[i];
+        if (!p1.type.equals(p2.type) ||
+            (p1.storageClass & (STC.ref_ | STC.out_ | STC.lazy_)) != (p2.storageClass & (STC.ref_ | STC.out_ | STC.lazy_)))
+            return null;
+    }
+    return f;
 }
 
 /***********************************************************
