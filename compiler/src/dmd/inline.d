@@ -2244,6 +2244,19 @@ private bool refersToNested(FuncDeclaration fd)
             if (auto f = e.var.isFuncDeclaration())
                 found |= f.isNested();
         }
+        // a member function with a second context, as from an alias of a local
+        override void visit(DotVarExp e)
+        {
+            if (auto f = e.var.isFuncDeclaration())
+                found |= f.isNested() || f.hasDualContext;
+            super.visit(e);
+        }
+        override void visit(CallExp e)
+        {
+            if (e.f)
+                found |= e.f.isNested() || e.f.hasDualContext;
+            super.visit(e);
+        }
         override void visit(DeclarationExp e)
         {
             if (e.declaration.isFuncDeclaration())
