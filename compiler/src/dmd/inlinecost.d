@@ -89,6 +89,7 @@ int inlineCostFunction(FuncDeclaration fd, bool hasThis, bool statementsToo = fa
 {
     scope InlineCostVisitor icv = new InlineCostVisitor(hasThis);
     icv.gotoReturns = statementsToo;
+    icv.literal = fd.isFuncLiteralDeclaration() !is null;
     // only for the nested functions and literals that callbacks are written as
     icv.earlyReturns = fd.isNested() || fd.isFuncLiteralDeclaration();
     fd.fbody.accept(icv);
@@ -163,6 +164,7 @@ public:
     // if a return ending an if's body may leave the rest of a void function as its else
     bool earlyReturns;
     bool gotoReturns;   // whether returns may be anywhere, inlined as statements going to the end
+    bool literal;       // whether the function is a function literal
 
     int nested;
     int cost;           // zero start for subsequent AST
@@ -179,6 +181,7 @@ public:
         hasThis = icv.hasThis;
         earlyReturns = icv.earlyReturns;
         gotoReturns = icv.gotoReturns;
+        literal = icv.literal;
     }
 
     override void visit(Statement s)
@@ -544,10 +547,16 @@ public:
             ++cost;
         }
 
-        // aggregates are accepted under certain circumstances
+        /* aggregates are accepted under certain circumstances: not in a function literal,
+         * which is generated, and what its aggregates need with it, only where it is
+         * referred to, as it is not once its calls are inlined
+         */
         if (isInlinableNestedAggregate(e))
         {
-            cost++;
+            if (literal)
+                cost = COST_MAX;
+            else
+                cost++;
             return;
         }
 

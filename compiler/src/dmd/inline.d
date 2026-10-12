@@ -872,16 +872,9 @@ public:
                 return;
             }
 
-            /* The aggregates allowed in inlineable funcs are not copied, but declared
-             * where they are inlined too, so what is generated for them is there when
-             * nothing calls the function any more, as a function literal whose calls
-             * are all inlined, which is generated only where it is referred to
-             */
+            // Prevent the copy of the aggregates allowed in inlineable funcs
             if (isInlinableNestedAggregate(e))
-            {
-                result = e.copy();
                 return;
-            }
 
             /* This needs work, like DeclarationExp.toElem(), if we are
              * to handle TemplateMixin's. For now, we just don't inline them.
