@@ -86,7 +86,8 @@ __gshared long extendTime;
 __gshared long otherTime;
 __gshared long lockTime;
 
-ulong bytesAllocated;   // thread local counter
+/// The thread local counter of the bytes allocated, kept with the thread's other GC state
+ref ulong bytesAllocated() nothrow @nogc @property @safe { return ConservativeGC.threadState.bytesAllocated; }
 
 private
 {
@@ -162,7 +163,15 @@ class ConservativeGC : GC
     Gcx *gcx;                   // implementation
 
     static gcLock = shared(AlignedSpinLock)(SpinLock.Contention.brief);
-    static bool _inFinalizer;
+    /// What the GC keeps for each thread, in one thread local block, so its accesses
+    /// in one function share one address
+    static struct ThreadState
+    {
+        bool inFinalizer;
+        ulong bytesAllocated;
+    }
+    static ThreadState threadState;
+    static ref bool _inFinalizer() nothrow @nogc @property @safe { return threadState.inFinalizer; }
     __gshared bool isPrecise = false;
 
     /*
@@ -2228,9 +2237,40 @@ struct Gcx
         alloc_size = binsize[bin];
 
         void* p = bucket[bin];
-        if (p)
-            goto L_hasBin;
+        if (!p)
+            p = fillBucket(bin);
+        // Return next item from free list
+        bucket[bin] = undefinedRead((cast(List*)p).next);
+        auto pool = undefinedRead((cast(List*)p).pool);
 
+        auto biti = (p - pool.baseAddr) >> pool.shiftBy;
+        assert(pool.freebits.test(biti));
+        if (collectInProgress)
+            pool.mark.setLocked(biti); // be sure that the child is aware of the page being used
+        pool.freebits.clear(biti);
+        if (bits & ~BlkAttr.ALIGNMENT_MASK)     // the alignment is not kept
+            pool.setBits(biti, bits);
+        //debug(PRINTF) printf("\tmalloc => %p\n", p);
+        invalidate(p[0 .. alloc_size], 0xF0, true);
+
+        if (ConservativeGC.isPrecise)
+        {
+            debug(SENTINEL)
+                pool.setPointerBitmapSmall(sentinel_add(p), size - SENTINEL_EXTRA, size - SENTINEL_EXTRA, bits, ti);
+            else
+                pool.setPointerBitmapSmall(p, size, alloc_size, bits, ti);
+        }
+        return p;
+    }
+
+    /* The free list of bin, empty, filled from a recovered page, a new page, a new
+     * pool or a collection; a function of its own, so the common case of a free
+     * block at hand keeps its variables in registers
+     */
+    void* fillBucket(Bins bin) nothrow
+    {
+        version (DigitalMars) pragma(inline, false);
+        void* p;
         if (recoverPool[bin])
             recoverNextPage(bin);
 
@@ -2273,28 +2313,6 @@ struct Gcx
                 onOutOfMemoryError();
         }
         assert(p !is null);
-    L_hasBin:
-        // Return next item from free list
-        bucket[bin] = undefinedRead((cast(List*)p).next);
-        auto pool = undefinedRead((cast(List*)p).pool);
-
-        auto biti = (p - pool.baseAddr) >> pool.shiftBy;
-        assert(pool.freebits.test(biti));
-        if (collectInProgress)
-            pool.mark.setLocked(biti); // be sure that the child is aware of the page being used
-        pool.freebits.clear(biti);
-        if (bits & ~BlkAttr.ALIGNMENT_MASK)     // the alignment is not kept
-            pool.setBits(biti, bits);
-        //debug(PRINTF) printf("\tmalloc => %p\n", p);
-        invalidate(p[0 .. alloc_size], 0xF0, true);
-
-        if (ConservativeGC.isPrecise)
-        {
-            debug(SENTINEL)
-                pool.setPointerBitmapSmall(sentinel_add(p), size - SENTINEL_EXTRA, size - SENTINEL_EXTRA, bits, ti);
-            else
-                pool.setPointerBitmapSmall(p, size, alloc_size, bits, ti);
-        }
         return p;
     }
 
@@ -5581,15 +5599,17 @@ void undefinedWrite(T)(ref T var, T value) nothrow
         var = value;
 }
 
-/// Zero the n bytes at p, past what was asked for of a block, as a few words when
-/// they are, the commonest case of small blocks
+/// Zero the n bytes at p, past what was asked for of a block that is not yet written,
+/// as a few words when they end at a word, the commonest case of small blocks: from
+/// the word p is in, whose bytes before p are the caller's to write anyway
 pragma(inline, true)
 private void zeroTail(void* p, size_t n) nothrow @nogc
 {
-    if (n <= 64 && !((cast(size_t)p | n) & 7))
+    const end = cast(size_t)p + n;
+    if (n <= 64 && !(end & 7))
     {
-        foreach (i; 0 .. n / 8)
-            (cast(ulong*)p)[i] = 0;
+        for (auto w = cast(ulong*)(cast(size_t)p & ~cast(size_t)7); cast(size_t)w < end; ++w)
+            *w = 0;
     }
     else
         memset(p, 0, n);
@@ -5632,4 +5652,19 @@ private void[] setupMetadata(void[] block, uint bits, size_t padding, size_t use
     }
 
     return block.ptr[0 .. block.length - padding];
+}
+
+// the bytes of a scanned block past those asked for are zero, whatever was there
+unittest
+{
+    import core.memory : GC;
+    foreach (size; [1, 7, 9, 12, 36, 63, 100, 300])
+    {
+        auto q = cast(ubyte*) GC.malloc(size);
+        q[0 .. GC.sizeOf(q)] = 0xFF;
+        GC.free(q);
+        auto p = cast(ubyte*) GC.malloc(size);
+        foreach (i; size .. GC.sizeOf(p))
+            assert(p[i] == 0);
+    }
 }
