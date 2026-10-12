@@ -9001,7 +9001,7 @@ private void expandTlvs()
 }
 
 /// A loop of segments: its header, and all the segments reaching a back edge to it
-struct Loop { uint header; uint size; uint[] body; }
+struct Loop { uint header; uint size; uint[] body; uint idom; /* the header's immediate dominator */ }
 
 /* The predecessors of each segment, and the loops, smallest first; buildSegments() has run
  */
@@ -9161,6 +9161,7 @@ private void findLoops(ref Barray!uint predStart, ref Barray!uint preds, ref Bar
             }
             Loop lp;
             lp.header = cast(uint)h;
+            lp.idom = idom[h];
             lp.size = cast(uint)body.length;
             lp.body = (cast(uint*)mem_malloc(body.length * uint.sizeof))[0 .. body.length];
             lp.body[] = body[];
@@ -9250,8 +9251,18 @@ private bool hoistInvariants()
         if (env!"DMD_NEWCG_LICM")
             fprintf(stderr, "newcg-licm: %s loop header %d size %d pre %d bad %d\n", funcsym_p.Sident.ptr,
                 lp.header, lp.size, pre, bad);
+        /* Without a preheader, what needs nothing computed before it goes at the end of
+         * the header's immediate dominator, which every way into the loop goes through:
+         * what is between them may store, or define what is read
+         */
+        bool viaDominator;
         if (bad || pre == uint.max)
-            continue;
+        {
+            pre = lp.idom;
+            if (pre == uint.max || inLoop[pre] || env!"DMD_NEWCG_NOLICMDOM")
+                continue;
+            viaDominator = true;
+        }
         /* After the preheader's last instruction, or before its branch, which may be
          * the test skipping the loop: what is moved changes no flags and cannot fault
          */
@@ -9303,7 +9314,8 @@ private bool hoistInvariants()
             }
         bool movableLoad(ref const LIns i)
         {
-            if (i.op != LOp.ld || loopWrites || i.flags & (F.volatile_ | F.condDef) || i.b || i.sym || !i.a)
+            if (i.op != LOp.ld || loopWrites || viaDominator || i.flags & (F.volatile_ | F.condDef) || i.b ||
+                i.sym || !i.a)
                 return false;
             foreach (r; witnessed[])
                 if (r == i.a)
@@ -9326,7 +9338,7 @@ private bool hoistInvariants()
                     bool inv = true;
                     void check(Reg r)
                     {
-                        if (isPhys(r) || defInLoop[r - firstVreg])
+                        if (isPhys(r) || defInLoop[r - firstVreg] || viaDominator)
                             inv = false;
                     }
                     forUses(*i, &check);
