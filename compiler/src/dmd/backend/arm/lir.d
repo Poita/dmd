@@ -948,10 +948,24 @@ private void assignAggregates()
     bool any;
     foreach (k, s; globsym[])
     {
-        // a pair passed in two integer registers is one too
-        const pairParam = s.Sclass == SC.fastpar && pairType(s.Stype.Tty) &&
-            s.Spreg != NOREG && s.Spreg2 != NOREG && s.Spreg < 32 && s.Spreg2 < 32;
-        if (s.Sclass != SC.auto_ && s.Sclass != SC.register && !pairParam ||
+        // a pair, or an aggregate, passed in one or two integer registers is one too
+        bool regParam;
+        if (s.Sclass == SC.fastpar && s.Spreg != NOREG && s.Spreg < 32)
+        {
+            const twoRegs = s.Spreg2 != NOREG && s.Spreg2 < 32;
+            if (pairType(s.Stype.Tty))
+                regParam = twoRegs;
+            else if (aggType[k] is s.Stype)
+            {
+                const pa = aarch64Aggregate(s.Stype);
+                regParam = pa.kind == AggregateABI.Kind.gpr &&
+                    (pa.nregs == 2 ? twoRegs : pa.nregs == 1 && s.Spreg2 == NOREG);
+            }
+        }
+        if (env!"DMD_NEWCG_VARS" && (s.Sclass == SC.fastpar || s.Sclass == SC.parameter))
+            fprintf(stderr, "newcg-aggparam: %s class %d regs %d %d agg %d reg %d\n", s.Sident.ptr, s.Sclass,
+                s.Spreg, s.Spreg2, aggType[k] !is null, regParam);
+        if (s.Sclass != SC.auto_ && s.Sclass != SC.register && !regParam ||
             s.ty() & (mTYvolatile | mTYshared) || s.Sflags & SFLdead)
             continue;
         AggregateABI a;
@@ -1201,7 +1215,7 @@ private void finishVariables()
         s.Sregmsw = NOREG;
         s.Sregm = mask(preg);
     }
-    // pair parameters held in registers are copied from where they are passed
+    // pair and aggregate parameters held in registers are copied from where they are passed
     foreach (ref av; aggs[])
     {
         Symbol* s = av.sym;
@@ -1210,7 +1224,7 @@ private void finishVariables()
         s.Sfl = FL.reg;
         s.Sreglsw = s.Spreg;
         s.Sregmsw = s.Spreg2;
-        s.Sregm = mask(s.Spreg) | mask(s.Spreg2);
+        s.Sregm = mask(s.Spreg) | (s.Spreg2 != NOREG ? mask(s.Spreg2) : 0);
     }
 }
 
@@ -1578,9 +1592,12 @@ private void select()
         if (s.Sclass != SC.fastpar)
             continue;
         emitIns(LOp.copy, 8, av.slots[0], phys(s.Spreg));
-        emitIns(LOp.copy, 8, av.slots[1], phys(s.Spreg2));
         vi(av.slots[0]).hint = phys(s.Spreg);
-        vi(av.slots[1]).hint = phys(s.Spreg2);
+        if (s.Spreg2 != NOREG)
+        {
+            emitIns(LOp.copy, 8, av.slots[1], phys(s.Spreg2));
+            vi(av.slots[1]).hint = phys(s.Spreg2);
+        }
     }
     paramEnd = cast(uint)ins.length;
     hoisted.setLength(0);
