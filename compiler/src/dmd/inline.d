@@ -2545,14 +2545,14 @@ private Statement gotoLabel(Loc loc, LabelDsymbol ld)
  */
 private bool returnsBeforeEnd(FuncDeclaration fd)
 {
-    import dmd.visitor : SemanticTimeTransitiveVisitor;
-    extern (C++) final class Returns : SemanticTimeTransitiveVisitor
+    import dmd.visitor.statement_rewrite_walker : StatementRewriteWalker;
+    // the function's own statements, not those of what it declares
+    extern (C++) final class Returns : StatementRewriteWalker
     {
-        alias visit = SemanticTimeTransitiveVisitor.visit;
+        alias visit = StatementRewriteWalker.visit;
         int count;
         ReturnStatement last;
         override void visit(ReturnStatement s) { ++count; last = s; }
-        override void visit(Expression e) {}
     }
     if (!fd.fbody)
         return false;
@@ -2566,14 +2566,13 @@ private bool returnsBeforeEnd(FuncDeclaration fd)
 /// Whether s has a break or continue anywhere in it
 private bool hasBreakOrContinue(Statement s)
 {
-    import dmd.visitor : SemanticTimeTransitiveVisitor;
-    extern (C++) final class Leaves : SemanticTimeTransitiveVisitor
+    import dmd.visitor.statement_rewrite_walker : StatementRewriteWalker;
+    extern (C++) final class Leaves : StatementRewriteWalker
     {
-        alias visit = SemanticTimeTransitiveVisitor.visit;
+        alias visit = StatementRewriteWalker.visit;
         bool found;
         override void visit(BreakStatement s) { found = true; }
         override void visit(ContinueStatement s) { found = true; }
-        override void visit(Expression e) {}
     }
     scope v = new Leaves();
     s.accept(v);
@@ -2700,6 +2699,8 @@ private bool refersToNested(FuncDeclaration fd)
 
         override void visit(FuncExp e) { found = true; }
         override void visit(DelegateExp e) { found = true; }
+        override void visit(TemplateDeclaration d) { found = true; }
+        override void visit(ScopeExp e) { found = true; }
         override void visit(VarExp e)
         {
             if (auto f = e.var.isFuncDeclaration())
@@ -2725,10 +2726,12 @@ private bool refersToNested(FuncDeclaration fd)
         }
         override void visit(DeclarationExp e)
         {
-            if (e.declaration.isFuncDeclaration())
-                found = true;
-            else
+            // what is declared but variables, as functions, structs and templates, may refer to the frame
+            auto d = e.declaration;
+            if (d.isVarDeclaration())
                 super.visit(e);
+            else if (!d.isAliasDeclaration() && !d.isEnumDeclaration())
+                found = true;
         }
     }
     if (!fd.fbody)
@@ -2847,6 +2850,9 @@ private bool writesOnlyLocals(FuncDeclaration fd)
         override void visit(AssocArrayLiteralExp e) { found = true; }
         override void visit(DeleteExp e) { found = true; }
         override void visit(AsmStatement s) { found = true; }
+        // what a template or a symbol used as an expression does is not looked into
+        override void visit(TemplateDeclaration d) { found = true; }
+        override void visit(ScopeExp e) { found = true; }
         override void visit(ThrowStatement s) { found = true; }
         override void visit(DeclarationExp e)
         {
