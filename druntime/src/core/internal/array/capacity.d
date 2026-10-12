@@ -255,7 +255,7 @@ private size_t _d_arraysetlengthT_(Tarr : T[], T)(return ref scope Tarr arr, siz
     import core.checkedint : mulu;
     import core.exception : onFinalizeError, onOutOfMemoryError;
     import core.stdc.string : memcpy, memset;
-    import core.internal.traits : hasElaborateCopyConstructor, hasIndirections, Unqual;
+    import core.internal.traits : hasElaborateCopyConstructor, Unqual;
     import core.lifetime : emplace;
     import core.memory;
     import core.internal.lifetime : __doPostblit;
@@ -290,10 +290,10 @@ private size_t _d_arraysetlengthT_(Tarr : T[], T)(return ref scope Tarr arr, siz
 
     debug(PRINTF) printf("newsize = %zx\n", newsize);
 
-    // what holds no pointers need not be scanned
-    enum uint gcAttrs = BlkAttr.APPENDABLE | GC.convertAlignmentToBlkAttr(T.alignof)
-        | (is(T == struct) && __traits(hasMember, T, "xdtor") ? BlkAttr.FINALIZE : 0)
-        | (hasIndirections!T ? 0 : BlkAttr.NO_SCAN);
+    import core.internal.array.utils : __typeAttrs;
+    // as for T, as NO_SCAN for what holds no pointers, or as the block moved from has them
+    enum uint gcAttrs = BlkAttr.APPENDABLE | __typeAttrs!T()
+        | (is(T == struct) && __traits(hasMember, T, "xdtor") ? BlkAttr.FINALIZE : 0);
 
     if (!arr.ptr)
     {
@@ -337,10 +337,11 @@ private size_t _d_arraysetlengthT_(Tarr : T[], T)(return ref scope Tarr arr, siz
 
     if (!gc_expandArrayUsed(newdata[0 .. oldsize], newsize, isShared))
     {
+        const attrs = BlkAttr.APPENDABLE | __typeAttrs!T(cast(void*) arr.ptr);
         version (D_TypeInfo)
-            newdata = GC.malloc(newsize, gcAttrs, typeid(T));
+            newdata = GC.malloc(newsize, attrs, typeid(T));
         else
-            newdata = GC.malloc(newsize, gcAttrs, null);
+            newdata = GC.malloc(newsize, attrs, null);
         if (!newdata)
         {
             onOutOfMemoryError();
