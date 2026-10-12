@@ -112,6 +112,8 @@ private final class InlineDoState
     // inline result
     bool foundReturn;
     bool propagateNRVO;
+    LabelDsymbol retLabel;      // where a return goes to, inlined as statements
+    LabelDsymbol[void*] labels; // the labels made for the inlined function's labels
 
     this(Dsymbol parent, FuncDeclaration fd) scope
     {
@@ -366,6 +368,27 @@ public:
         ids.foundReturn = true;
 
         auto exp = doInlineAs!Expression(s.exp, ids);
+        static if (asStatements)
+        {
+            // a return before the end of the function goes to the end of what is inlined
+            if (ids.retLabel)
+            {
+                auto a = Statements();
+                if (exp)
+                {
+                    if (ids.eret)
+                    {
+                        auto ce = new ConstructExp(s.loc, ids.eret.copy(), exp);
+                        ce.type = ids.eret.type;
+                        exp = ce;
+                    }
+                    a.push(new ExpStatement(s.loc, exp));
+                }
+                a.push(gotoLabel(s.loc, ids.retLabel));
+                result = new CompoundStatement(s.loc, a.move());
+                return;
+            }
+        }
         if (!exp) // https://issues.dlang.org/show_bug.cgi?id=14560
                   // 'return' must not leave in the expand result
             return;
@@ -466,9 +489,42 @@ public:
             auto sincr = doInlineAs!Expression(s.increment, ids);
             auto sbody = doInlineAs!Statement(s._body, ids);
             result = new ForStatement(s.loc, sinit, scond, sincr, sbody, s.endloc);
+            // a return in the body, made a goto, leaves what follows the loop reachable
+            ids.foundReturn = false;
         }
         else
             result = null;  // cannot be inlined as an Expression
+    }
+
+    // the labels made for returns, in a function inlined in turn
+    override void visit(LabelStatement s)
+    {
+        static if (asStatements)
+        {
+            auto ld = copiedLabel(s);
+            ld.statement.statement = doInlineAs!Statement(s.statement, ids);
+            result = ld.statement;
+        }
+        else
+            result = null;  // cannot be inlined as an Expression
+    }
+
+    override void visit(GotoStatement s)
+    {
+        static if (asStatements)
+            result = gotoLabel(s.loc, copiedLabel(s.label.statement));
+        else
+            result = null;  // cannot be inlined as an Expression
+    }
+
+    // the label of the inlined code for label statement s of the function
+    LabelDsymbol copiedLabel(LabelStatement s)
+    {
+        if (auto p = cast(void*)s in ids.labels)
+            return *p;
+        auto ld = returnLabel(s.loc, ids.parent.isFuncDeclaration());
+        ids.labels[cast(void*)s] = ld;
+        return ld;
     }
 
     override void visit(BreakStatement s)
@@ -1167,10 +1223,12 @@ public:
     /* Calls in `exp` of functions with loops, which are inlined only as statements,
      * are moved into temporaries declared before the statement, as
      * `T __liftval = call;` with `exp` reading the temporary, where the statement
-     * inliner expands them. A call moves only from where it is always evaluated,
-     * when what is evaluated before it only reads values, its arguments only read
-     * values, and its function changes nothing but its own locals, so nothing it
-     * moves ahead of can tell. Returns the declarations of the temporaries, or null.
+     * inliner expands them. A call moves only from where it is always evaluated:
+     * one evaluated before anything but constants and the calls moved before it
+     * keeps its order with all else; any other only when what is evaluated before
+     * it only reads values, its arguments only read values, and its function
+     * changes nothing but its own locals, so nothing it moves ahead of can tell.
+     * Returns the declarations of the temporaries, or null.
      */
     Statement liftCalls(ref Expression exp)
     {
@@ -1180,6 +1238,7 @@ public:
         Expression*[] slots;    // where each lifted call was
         CallExp[] calls;
         bool plain = true;      // whether all evaluated so far only reads values
+        bool read;              // whether anything but constants and lifted calls is evaluated so far
 
         bool liftable(CallExp ce)
         {
@@ -1187,15 +1246,18 @@ public:
             auto fd = ve ? ve.var.isFuncDeclaration() : null;
             if (!fd || fd.isNested() || fd.needThis() || !ce.type)
                 return false;
+            auto t = ce.type.toBasetype();
+            if (!(t.isTypeBasic() && t.ty != Tvoid) && !t.isTypePointer())
+                return false;
+            if (!canInline(fd, false, true, pass, eSink) || canInline(fd, false, false, pass, eSink))
+                return false;
+            if (!read)
+                return true;
             if (ce.arguments)
                 foreach (arg; *ce.arguments)
                     if (!isPlainRead(arg))
                         return false;
-            auto t = ce.type.toBasetype();
-            if (!(t.isTypeBasic() && t.ty != Tvoid) && !t.isTypePointer())
-                return false;
-            return !canInline(fd, false, false, pass, eSink) && canInline(fd, false, true, pass, eSink) &&
-                   writesOnlyLocals(fd);
+            return writesOnlyLocals(fd);
         }
 
         void lift(ref Expression e)
@@ -1220,13 +1282,22 @@ public:
             e = ve2;
         }
 
+        static bool constant(Expression e)
+        {
+            return e.op == EXP.int64 || e.op == EXP.float64 || e.op == EXP.null_ ||
+                   e.op == EXP.string_ || e.op == EXP.symbolOffset;
+        }
+
         // walks e in the order it is evaluated, lifting calls while all before them is plain
         void walk(ref Expression e)
         {
             if (!e || !plain)
                 return;
             if (isPlainRead(e))
+            {
+                read |= !constant(e);
                 return;
+            }
             if (auto ce = e.isCallExp())
             {
                 if (liftable(ce))
@@ -1243,9 +1314,16 @@ public:
                      */
                     auto ae = cast(AssignExp)e;
                     if (isPlainRead(ae.e2))
+                    {
+                        read |= !constant(ae.e2);
                         walk(ae.e1);
+                    }
                     else if (isPlainRead(ae.e1, true))
+                    {
+                        // where a variable is is fixed, where an element is may change
+                        read |= !ae.e1.isVarExp();
                         walk(ae.e2);
+                    }
                     else
                         plain = false;
                     return;
@@ -1255,7 +1333,10 @@ public:
                     auto be = e.isBinExp();
                     auto t = be.e1.type ? be.e1.type.toBasetype() : null;
                     if (t && (t.isTypeBasic() || t.isTypePointer()) && isPlainRead(be.e1))
+                    {
+                        read = true;    // the value changed is read first
                         walk(be.e2);
+                    }
                     else
                         plain = false;
                     return;
@@ -2428,6 +2509,55 @@ bool restEndsWithReturn(ref Statements statements, size_t i)
 }
 
 /***********************************************************
+ * A label of its own in function fd, for the returns of an inlined function to go to
+ */
+private LabelDsymbol returnLabel(Loc loc, FuncDeclaration fd)
+{
+    auto id = Identifier.generateId("__inlineret");
+    auto ld = fd.searchLabel(id, loc);
+    ld.statement = new LabelStatement(loc, id, null);
+    return ld;
+}
+
+/// Whether id names a label returnLabel() makes
+package(dmd) bool isReturnLabel(Identifier id)
+{
+    import core.stdc.string : strncmp;
+    return id && strncmp(id.toChars(), "__inlineret", 11) == 0;
+}
+
+private Statement gotoLabel(Loc loc, LabelDsymbol ld)
+{
+    auto g = new GotoStatement(loc, ld.ident);
+    g.label = ld;
+    return g;
+}
+
+/***********************************************************
+ * Whether fd returns from anywhere but its last statement, so inlined as
+ * statements its returns go to the end
+ */
+private bool returnsBeforeEnd(FuncDeclaration fd)
+{
+    import dmd.visitor : SemanticTimeTransitiveVisitor;
+    extern (C++) final class Returns : SemanticTimeTransitiveVisitor
+    {
+        alias visit = SemanticTimeTransitiveVisitor.visit;
+        int count;
+        ReturnStatement last;
+        override void visit(ReturnStatement s) { ++count; last = s; }
+        override void visit(Expression e) {}
+    }
+    if (!fd.fbody)
+        return false;
+    scope v = new Returns();
+    fd.fbody.accept(v);
+    if (v.count == 0)
+        return false;
+    return v.count > 1 || fd.fbody.endsWithReturnStatement() !is v.last;
+}
+
+/***********************************************************
  * Whether e refers to the variable v anywhere in it
  */
 private bool refersToVar(Expression e, VarDeclaration v)
@@ -2886,21 +3016,10 @@ private bool canInline(FuncDeclaration fd, bool hasThis, bool statementsToo, PAS
         goto Lno;
     }
 
-    // cannot inline functions as statement if they have multiple
-    //  return statements
-    if (fd.hasMultipleReturnExp && statementsToo)
-    {
-        static if (CANINLINE_LOG)
-        {
-            printf("\t5: no %s\n", fd.toChars());
-        }
-        goto Lno;
-    }
-
     {
         scope v = new InlineScanVisitorDsymbol(pass, eSink);
         fd.accept(v);
-        cost = inlineCostFunction(fd, hasThis);
+        cost = inlineCostFunction(fd, hasThis, statementsToo);
         inlineCosts[cast(void*)fd] = cost;
     }
     // its variables are referred to only by nested functions whose calls are inlined
@@ -3182,10 +3301,14 @@ private void expandInline(CallExp ecall, FuncDeclaration fd, FuncDeclaration par
         if (eparams)
             as2.push(new ExpStatement(callLoc, eparams));
 
+        if (returnsBeforeEnd(fd))
+            ids.retLabel = returnLabel(callLoc, parent);
         fd.inlineNest++;
         Statement s = doInlineAs!Statement(fd.fbody, ids);
         fd.inlineNest--;
         as2.push(s);
+        if (ids.retLabel)
+            as2.push(ids.retLabel.statement);
 
         if (as2 != &as)
         {

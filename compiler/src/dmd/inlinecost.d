@@ -85,9 +85,10 @@ bool tooCostlyOutsideLoops(int cost) pure nothrow @safe
  * Returns:
  *      cost of inlining fd
  */
-int inlineCostFunction(FuncDeclaration fd, bool hasThis)
+int inlineCostFunction(FuncDeclaration fd, bool hasThis, bool statementsToo = false)
 {
     scope InlineCostVisitor icv = new InlineCostVisitor(hasThis);
+    icv.gotoReturns = statementsToo;
     // only for the nested functions and literals that callbacks are written as
     icv.earlyReturns = fd.isNested() || fd.isFuncLiteralDeclaration();
     fd.fbody.accept(icv);
@@ -161,6 +162,7 @@ public:
     immutable bool hasThis;
     // if a return ending an if's body may leave the rest of a void function as its else
     bool earlyReturns;
+    bool gotoReturns;   // whether returns may be anywhere, inlined as statements going to the end
 
     int nested;
     int cost;           // zero start for subsequent AST
@@ -176,6 +178,7 @@ public:
         nested = icv.nested;
         hasThis = icv.hasThis;
         earlyReturns = icv.earlyReturns;
+        gotoReturns = icv.gotoReturns;
     }
 
     override void visit(Statement s)
@@ -312,8 +315,8 @@ public:
 
     override void visit(ReturnStatement s)
     {
-        // Can't handle return statements nested in if's
-        if (nested)
+        // Can't handle return statements nested in if's, but as gotos
+        if (nested && !gotoReturns)
         {
             cost = COST_MAX;
         }
@@ -325,6 +328,29 @@ public:
 
     override void visit(ImportStatement s)
     {
+    }
+
+    // the label and gotos made for the returns of a function inlined as statements
+    override void visit(LabelStatement s)
+    {
+        import dmd.inline : isReturnLabel;
+        if (!gotoReturns || !isReturnLabel(s.ident))
+        {
+            cost = COST_MAX;
+            return;
+        }
+        cost++;
+        if (s.statement)
+            s.statement.accept(this);
+    }
+
+    override void visit(GotoStatement s)
+    {
+        import dmd.inline : isReturnLabel;
+        if (!gotoReturns || !isReturnLabel(s.ident))
+            cost = COST_MAX;
+        else
+            cost++;
     }
 
     override void visit(ForStatement s)

@@ -48,6 +48,27 @@ int fill(int[] a)
     return cast(int)a.length;
 }
 
+// changes globals: moves only from where nothing is evaluated before it
+int advance(ref int[] stack, int by)
+{
+    int moved;
+    foreach (i; 0 .. by)
+        if (stack.length)
+        {
+            moved += stack[$ - 1];
+            stack = stack[0 .. $ - 1];
+            ++counter;
+        }
+    return moved;
+}
+
+int advance2(ref int at)
+{
+    foreach (i; 0 .. 1)
+        ++at;
+    return 7;
+}
+
 int classify(ubyte[] p) { return table[permIndex(p)] * 70 + permIndex(p[0 .. 2]); }
 
 void main()
@@ -83,6 +104,28 @@ void main()
     int[] a = [1, 2, 3];
     int s = a[0] + fill(a) + a[1];
     assert(s == 1 + 3 + 7);
+
+    // first in a condition or return, changing what follows reads
+    int[] st = [1, 2, 3, 4];
+    counter = 0;
+    int got;
+    foreach (k; 0 .. 3)
+        if (advance(st, 1) + counter > 3)
+            ++got;
+    assert(got == 3 && counter == 3 && st == [1]);
+    counter = 5;
+    int lead = counter + advance(st, 1) + counter;
+    assert(lead == 5 + 1 + 6 && st.length == 0);
+
+    // what an assignment reads or where it stores, before a call changing them
+    int[] st2 = [10, 20, 30];
+    int tot = 100;
+    tot += advance(st2, 1) + tot;
+    assert(tot == 100 + 30 + 100);
+    int[4] slots;
+    int at = 1;
+    slots[at] = advance2(at);
+    assert(slots[1] == 7 && at == 2);
 
     // in && and ?: arms, only when they are evaluated
     counter = 0;
