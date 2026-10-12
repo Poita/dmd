@@ -352,6 +352,7 @@ bool lirCodegen(ref CGstate cg)
             hoistInvariants();
         if (!env!"DMD_NEWCG_NOTHREAD")
             threadJumps();
+        fuseBoolBranches();
         removeUnreachable();
         removeDead();
         fuseSignTests();
@@ -8376,6 +8377,87 @@ private void vectorizeRegion(ref Slp s, uint rs, uint re)
             ins[nn].b = noReg;
         }
         attempt(x0, x1, n, n, n0 > n1 ? n0 : n1, 0, n, uint.max, &sum);
+    }
+}
+
+/* A branch on a bool made from the flags, as on the result of an inlined function
+ * returning a comparison: CSET, then masks of 1, extensions, copies or negations
+ * of it, then CBZ/CBNZ, is a branch on the flags themselves, when nothing in
+ * between changes them. The CSET and what follows it are then left to removeDead()
+ */
+@trusted
+private void fuseBoolBranches()
+{
+    static bool setsFlags(LOp op)
+    {
+        return op == LOp.cmp || op == LOp.cmpi || op == LOp.tsti || op == LOp.fcmp || op == LOp.fcmpz ||
+            op == LOp.call || op == LOp.ccmp || op == LOp.ccmpi || op == LOp.tlv;
+    }
+    buildSegments();
+    const ns = segStart.length - 1;
+    // the registers holding the bool of a condition of the flags as they are now
+    Reg[8] br;
+    COND[8] bc;
+    uint nb;
+    int find(Reg r) { foreach (k; 0 .. nb) if (br[k] == r) return cast(int)k; return -1; }
+    void forget(Reg r)
+    {
+        const k = find(r);
+        if (k >= 0)
+        {
+            br[k] = br[nb - 1];
+            bc[k] = bc[nb - 1];
+            --nb;
+        }
+    }
+    void add(Reg r, COND c)
+    {
+        forget(r);
+        if (nb < br.length)
+        {
+            br[nb] = r;
+            bc[nb] = c;
+            ++nb;
+        }
+    }
+    foreach (si; 0 .. ns)
+    {
+        nb = 0;
+        foreach (n; segStart[si] .. segEnd(si))
+        {
+            LIns* i = &ins[n];
+            if (i.op == LOp.cbz && !i.imm && i.a && !isPhys(i.a))
+            {
+                const k = find(i.a);
+                if (k >= 0)
+                {
+                    // CBNZ: taken when the condition holds; CBZ: when it does not
+                    const c = i.cond == COND.ne ? bc[k] : cast(COND)(bc[k] ^ 1);
+                    i.op = LOp.bcond;
+                    i.cond = c;
+                    i.a = noReg;
+                    i.sz = 0;
+                }
+                continue;
+            }
+            if (setsFlags(i.op))
+            {
+                nb = 0;
+                continue;
+            }
+            if (!i.d || isPhys(i.d))
+                continue;
+            int k = -1;
+            if (i.op == LOp.cset)
+                add(i.d, cast(COND)i.cond);
+            else if (i.a && !isPhys(i.a) && (k = find(i.a)) >= 0 &&
+                     (i.op == LOp.copy || i.op == LOp.andi && i.imm == 1 || i.op == LOp.zext))
+                add(i.d, bc[k]);
+            else if (i.a && !isPhys(i.a) && (k = find(i.a)) >= 0 && i.op == LOp.eori && i.imm == 1)
+                add(i.d, cast(COND)(bc[k] ^ 1));
+            else
+                forget(i.d);
+        }
     }
 }
 
