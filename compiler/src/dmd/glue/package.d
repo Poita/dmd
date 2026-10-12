@@ -2106,6 +2106,8 @@ private void findUnusedNested(FuncDeclaration fd)
         if (cast(void*)f in templateArgFuncs())
             refer(f);
     // what the functions nested in fd that are referred to refer to
+    void drain()
+    {
     while (work.length)
     {
         auto f = work.pop();
@@ -2119,11 +2121,28 @@ private void findUnusedNested(FuncDeclaration fd)
         if (f.fbody && inside)
         {
             if (f.hasInlineAsm)
+            {
+                simple = false;
                 return;
+            }
             scanning = f;
             scan(f.fbody);
         }
     }
+    }
+    drain();
+    /* a literal put in a variable that is not used is generated all the same, though
+     * never called: what it calls is generated too, while what it reads is not read
+     */
+    foreach (v, f; literalVars)
+        if (!(v in usedVars) && f.fbody && !(cast(void*)f in referred))
+        {
+            if (f.hasInlineAsm)
+                return;
+            scanning = null;
+            scan(f.fbody);
+        }
+    drain();
     if (!simple)
         return;
     foreach (f; declared)
