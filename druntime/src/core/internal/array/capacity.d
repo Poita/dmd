@@ -255,7 +255,7 @@ private size_t _d_arraysetlengthT_(Tarr : T[], T)(return ref scope Tarr arr, siz
     import core.checkedint : mulu;
     import core.exception : onFinalizeError, onOutOfMemoryError;
     import core.stdc.string : memcpy, memset;
-    import core.internal.traits : hasElaborateCopyConstructor, Unqual;
+    import core.internal.traits : hasElaborateCopyConstructor, hasIndirections, Unqual;
     import core.lifetime : emplace;
     import core.memory;
     import core.internal.lifetime : __doPostblit;
@@ -290,8 +290,10 @@ private size_t _d_arraysetlengthT_(Tarr : T[], T)(return ref scope Tarr arr, siz
 
     debug(PRINTF) printf("newsize = %zx\n", newsize);
 
+    // what holds no pointers need not be scanned
     enum uint gcAttrs = BlkAttr.APPENDABLE | GC.convertAlignmentToBlkAttr(T.alignof)
-        | (is(T == struct) && __traits(hasMember, T, "xdtor") ? BlkAttr.FINALIZE : 0);
+        | (is(T == struct) && __traits(hasMember, T, "xdtor") ? BlkAttr.FINALIZE : 0)
+        | (hasIndirections!T ? 0 : BlkAttr.NO_SCAN);
 
     if (!arr.ptr)
     {
@@ -404,4 +406,25 @@ private size_t _d_arraysetlengthT_(Tarr : T[], T)(return ref scope Tarr arr, siz
     // the backing storage directly to verify initialization.
     foreach (s; (() @trusted => *cast(S[]*) &arr2)())
         assert(s == S.init);
+}
+
+// arrays of what holds no pointers are not scanned, whether new or grown
+@system unittest
+{
+    import core.memory : GC;
+
+    static struct NoPointers { int a; double b; }
+    ubyte[] small;
+    _d_arraysetlengthT!(typeof(small))(small, 50);
+    assert(GC.query(small.ptr).attr & GC.BlkAttr.NO_SCAN);
+    _d_arraysetlengthT!(typeof(small))(small, 5000);
+    assert(GC.query(small.ptr).attr & GC.BlkAttr.NO_SCAN);
+
+    NoPointers[] structs;
+    _d_arraysetlengthT!(typeof(structs))(structs, 400);
+    assert(GC.query(structs.ptr).attr & GC.BlkAttr.NO_SCAN);
+
+    int*[] pointers;
+    _d_arraysetlengthT!(typeof(pointers))(pointers, 3000);
+    assert(!(GC.query(pointers.ptr).attr & GC.BlkAttr.NO_SCAN));
 }
