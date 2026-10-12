@@ -2544,7 +2544,46 @@ void cdmsw(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
 // cdfar16
 // cdbtst
 // cdbt
-// cdbscan
+/************************
+ * OPbsf and OPbsr operators: the index of the lowest or highest bit set
+ */
+
+@trusted
+void cdbscan(ref CGstate cg, ref CodeBuilder cdb, elem* e, ref regm_t pretregs)
+{
+    //printf("cdbscan()\n");
+    if (!pretregs)
+    {
+        codelem(cg,cdb,e.E1,pretregs,false);
+        return;
+    }
+    const tyml = tybasic(e.E1.Ety);
+    const sz = _tysize[tyml];
+    assert(sz == 4 || sz == 8);
+    const uint sf = sz == 8;
+
+    regm_t retregs1 = cg.allregs;
+    codelem(cg,cdb,e.E1,retregs1,false);
+    const Rn = findreg(retregs1);
+
+    regm_t retregs = pretregs & cg.allregs;
+    if (retregs == 0)
+        retregs = INSTR.ALLREGS & cg.allregs;
+    const Rd = allocreg(cdb, retregs, TYint);
+
+    if (e.Eoper == OPbsf)
+    {
+        cdb.gen1(INSTR.dp_1src(sf, 0, 0, 0, Rn, Rd));       // RBIT Rd,Rn
+        cdb.gen1(INSTR.dp_1src(sf, 0, 0, 4, Rd, Rd));       // CLZ  Rd,Rd
+    }
+    else
+    {
+        cdb.gen1(INSTR.dp_1src(sf, 0, 0, 4, Rn, Rd));       // CLZ  Rd,Rn
+        // EOR Wd,Wd,#(bits - 1): bits - 1 - the leading zeros
+        cdb.gen1(INSTR.log_imm(0, 2, 0, 0, sf ? 5 : 4, Rd, Rd));
+    }
+    fixresult(cg,cdb,e,retregs,pretregs);
+}
 
 /************************
  * OPpopcnt operator

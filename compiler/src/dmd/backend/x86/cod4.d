@@ -4576,9 +4576,13 @@ void cdbt(ref CGstate cg, ref CodeBuilder cdb,elem* e, ref regm_t pretregs)
 @trusted
 void cdbscan(ref CGstate cg, ref CodeBuilder cdb, elem* e, ref regm_t pretregs)
 {
+    if (cg.AArch64)
+    {
+        import dmd.backend.arm.cod4 : cdbscan;
+        return cdbscan(cg, cdb, e, pretregs);
+    }
     //printf("cdbscan()\n");
     //elem_print(e);
-    assert(!cg.AArch64);
     if (!pretregs)
     {
         codelem(cg,cdb,e.E1,pretregs,false);

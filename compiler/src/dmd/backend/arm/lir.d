@@ -117,6 +117,10 @@ enum LOp : ubyte
     vbsl,           // d = the bits of b where a has ones, else those of c
     tlv,            // d = the address of the thread local variable whose TLV descriptor is sym
     atomic,         // the AtomicOp cond of sz bytes at [a]: b the value, c the expected one, d the result
+    rbit,           // d = the bits of a reversed
+    clz,            // d = the number of zero bits above the highest one of a
+    rev,            // d = the bytes of a reversed, sz 2, 4 or 8
+    popcnt,         // d = the number of bits set in a
 }
 
 /// The atomic operations, sequentially consistent, druntime's _d_aarch64_* functions are
@@ -651,6 +655,7 @@ private bool supportedElem(const(elem)* e)
             case OPstrpar:
             case OPframeptr:
             case OPhalt:
+            case OPbsf: case OPbsr: case OPbswap: case OPpopcnt:
                 if (OTunary(op))
                 {
                     e = e.E1;
@@ -3860,6 +3865,48 @@ private Reg genx(elem* e)
             Reg a = gen(e.E1);
             Reg d = newVreg(rc, sz);
             emitIns(LOp.mvn, sz <= 4 ? 4 : 8, d, a);
+            return d;
+        }
+
+        case OPbsf:
+        case OPbsr:
+        {
+            // RBIT then CLZ: the trailing zeros; CLZ then EOR: bits - 1 - the leading zeros
+            const asz = tysize(e.E1.Ety) == 8 ? 8 : 4;
+            Reg a = gen(e.E1);
+            Reg d = newVreg(RC.gp, 4);
+            if (op == OPbsf)
+            {
+                Reg t = newVreg(RC.gp, asz);
+                emitIns(LOp.rbit, asz, t, a);
+                Reg c = newVreg(RC.gp, asz);
+                emitIns(LOp.clz, asz, c, t);
+                emitIns(LOp.copy, 4, d, c);
+            }
+            else
+            {
+                Reg c = newVreg(RC.gp, asz);
+                emitIns(LOp.clz, asz, c, a);
+                emitIns(LOp.eori, 4, d, c, noReg, asz * 8 - 1);
+            }
+            return d;
+        }
+
+        case OPbswap:
+        {
+            const asz = tysize(e.E1.Ety);
+            Reg a = gen(e.E1);
+            Reg d = newVreg(RC.gp, asz <= 4 ? 4 : 8);
+            emitIns(LOp.rev, asz, d, a);
+            return d;
+        }
+
+        case OPpopcnt:
+        {
+            const asz = tysize(e.E1.Ety) == 8 ? 8 : 4;
+            Reg a = asz == 4 ? extendFrom(gen(e.E1), 32, false, 4) : gen(e.E1);
+            Reg d = newVreg(RC.gp, 4);
+            emitIns(LOp.popcnt, asz, d, a);
             return d;
         }
 
@@ -8637,6 +8684,7 @@ private bool pureOp(ref const LIns i)
         case LOp.scvtf, LOp.ucvtf, LOp.fcvtzs, LOp.fcvtzu, LOp.fcvtms, LOp.fcvt:
         case LOp.lea:
         case LOp.vfadd: .. case LOp.vbsl:
+        case LOp.rbit, LOp.clz, LOp.rev, LOp.popcnt:
         case LOp.tlv:       // the same address throughout a function on one thread
             return true;
         case LOp.copy:
@@ -10705,6 +10753,34 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
             if (i.b)
                 w |= (pr(i.b) & 31) << 16;
             cdb.gen1(w);
+            break;
+        }
+
+        case LOp.rbit:
+        case LOp.clz:
+        case LOp.rev:
+        {
+            const d = pr(i.d), a = pr(i.a);
+            def(d);
+            // RBIT, CLZ, or REV16/REV/REV64
+            const uint opcode = i.op == LOp.rbit ? 0 : i.op == LOp.clz ? 4 : i.sz == 2 ? 1 : i.sz == 4 ? 2 : 3;
+            cdb.gen1(INSTR.dp_1src(sf, 0, 0, opcode, cast(ubyte)a, cast(ubyte)d));
+            break;
+        }
+
+        case LOp.popcnt:
+        {
+            // FMOV D29,Xa (S29,Wa), CNT V29.8B, ADDV B29, FMOV Wd,S29: v29 is never allocated
+            const d = pr(i.d), a = pr(i.a);
+            def(d);
+            enum ubyte V = 29;
+            if (i.sz == 8)
+                cdb.gen1(INSTR.fmov_float_gen(1, 1, 0, 7, cast(ubyte)a, V));
+            else
+                cdb.gen1(INSTR.fmov_float_gen(0, 0, 0, 7, cast(ubyte)a, V));
+            cdb.gen1(INSTR.cnt_advsimd(0, 0, V, V));
+            cdb.gen1(INSTR.addv_advsimd(0, 0, V, V));
+            cdb.gen1(INSTR.fmov_float_gen(0, 0, 0, 6, V, cast(ubyte)d));
             break;
         }
 
