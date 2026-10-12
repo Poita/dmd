@@ -156,8 +156,8 @@ void loadFromEA(ref code cs, reg_t reg, uint szw, uint szr)
         {
             with (Extend) final switch (cs.Sextend & 7)
             {
-                case UXTB:      cs.Iop = INSTR.log_imm(sf,0,0,0,0x7,cs.reg,reg); break; // AND sf,x0,x0,#0xFF
-                case UXTH:      cs.Iop = INSTR.log_imm(sf,0,0,0,0xF,cs.reg,reg); break; // AND sf,x0,x0,#0xFFFF
+                case UXTB:      cs.Iop = INSTR.log_imm(sf,0,sf,0,0x7,cs.reg,reg); break; // AND sf,x0,x0,#0xFF (N is 1 for a 64 bit element)
+                case UXTH:      cs.Iop = INSTR.log_imm(sf,0,sf,0,0xF,cs.reg,reg); break; // AND sf,x0,x0,#0xFFFF
                 case SXTB:      cs.Iop = INSTR.sxtb_sbfm(sf,cs.reg,reg);         break; // SXTB sf,x0,w0
                 case SXTH:      cs.Iop = INSTR.sxth_sbfm(sf,cs.reg,reg);         break; // SXTH sf,x0,w0
                 case SXTW:      cs.Iop = INSTR.sxtw_sbfm(cs.reg,reg);            break; // SXTW sf,x0,w0
@@ -218,8 +218,8 @@ unittest
         return cs.Iop;
     }
 
-    assert(test(Extend.UXTB, 0, 0, 8, 1) == 0x92001C00); // AND x0,x0,#0xFF
-    assert(test(Extend.UXTH, 0, 0, 8, 2) == 0x92003C00); // AND x0,x0,#0xFFFF
+    assert(test(Extend.UXTB, 0, 0, 8, 1) == 0x92401C00); // AND x0,x0,#0xFF
+    assert(test(Extend.UXTH, 0, 0, 8, 2) == 0x92403C00); // AND x0,x0,#0xFFFF
     assert(test(Extend.UXTW, 0, 0, 4, 2) == 0x2A0003E0); // MOV w0,w0
 }
 
