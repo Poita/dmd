@@ -211,6 +211,7 @@ private __gshared
     Barray!Reg cseRegs;
     Barray!Reg cseHis;          // the high halves of pair CSEs, else noReg
     Barray!uint cseBlocks;      // the blocks they were evaluated in
+    Barray!int blockIdom;       // the immediate dominator of each block, -1 if not reached
     uint curBlock;
     uint condDepth;             // number of conditionally evaluated regions being selected
     bool usesFrame;             // the code refers to locals or parameters in memory
@@ -257,8 +258,9 @@ private bool enabledFor(const(char)* name)
     }
     if (!newCodegenEnabled())
         return false;
-    // a filter starting with ^ is a prefix, else any part of the name
-    if (filter && (*filter == '^' ? strncmp(name, filter + 1, strlen(filter + 1)) != 0 : !strstr(name, filter)))
+    // a filter starting with ^ is a prefix, with - one that is not to be done, else any part of the name
+    if (filter && (*filter == '^' ? strncmp(name, filter + 1, strlen(filter + 1)) != 0 :
+                   *filter == '-' ? strstr(name, filter + 1) !is null : !strstr(name, filter)))
         return false;
     // DMD_NEWCG_MAX limits it to that many functions, for bisecting
     __gshared long limit = -2;
@@ -321,6 +323,7 @@ bool lirCodegen(ref CGstate cg)
             b.Bdfoidx = savedDfoidx[i];
 
     assignVariables();
+    computeBlockDominators();
     ehRegs[] = noReg;
     bool hasTry;
     foreach (b; blocks[])
@@ -2415,17 +2418,135 @@ private void cseForget(size_t mark)
 }
 
 /* The register of CSE e evaluated before: a read of a variable shared by blocks
- * only from its own block, as the block it was first read in need not run
- * before the others, and reading the variable again is as good
+ * only from a block that dominates this one, as one that does not need not have
+ * run before it, and reading the variable again there is as good
  */
 @trusted
 private Reg cseLookup(elem* e)
 {
-    const thisBlockOnly = isCrossBlockVar(e);
+    const shared_ = isCrossBlockVar(e);
     foreach (i, x; cseElems[])
-        if (x is e && (!thisBlockOnly || cseBlocks[i] == curBlock))
+        if (x is e && (!shared_ || blockDominates(cseBlocks[i], curBlock)))
             return cseRegs[i];
     return noReg;
+}
+
+/* The immediate dominators of the blocks, by Cooper, Harvey and Kennedy's iteration
+ * over them in reverse postorder
+ */
+@trusted
+private void computeBlockDominators()
+{
+    const nb = blocks.length;
+    blockIdom.setLength(nb);
+    blockIdom[][] = -1;
+    if (!nb)
+        return;
+    // reverse postorder from the first block
+    Barray!uint rpo, order, stack, next;
+    scope (exit) { rpo.dtor(); order.dtor(); stack.dtor(); next.dtor(); }
+    order.setLength(nb);
+    order[][] = uint.max;
+    next.setLength(nb);
+    next[][] = 0;
+    Barray!bool seen;
+    scope (exit) seen.dtor();
+    seen.setLength(nb);
+    seen[][] = false;
+    Barray!uint post;
+    scope (exit) post.dtor();
+    stack.push(0);
+    seen[0] = true;
+    while (stack.length)
+    {
+        const b = stack[stack.length - 1];
+        auto succ = blocks[b].Bsucc[];
+        if (next[b] < succ.length)
+        {
+            const t = succ[next[b]++].Bdfoidx;
+            if (!seen[t])
+            {
+                seen[t] = true;
+                stack.push(t);
+            }
+            continue;
+        }
+        stack.setLength(stack.length - 1);
+        post.push(b);
+    }
+    foreach_reverse (b; post[])
+    {
+        order[b] = cast(uint)rpo.length;
+        rpo.push(b);
+    }
+    // the predecessors reached
+    Barray!uint predStart, preds;
+    scope (exit) { predStart.dtor(); preds.dtor(); }
+    predStart.setLength(nb + 1);
+    predStart[][] = 0;
+    foreach (b; rpo[])
+        foreach (t; blocks[b].Bsucc[])
+            ++predStart[t.Bdfoidx + 1];
+    foreach (k; 1 .. nb + 1)
+        predStart[k] += predStart[k - 1];
+    preds.setLength(predStart[nb]);
+    Barray!uint fill;
+    scope (exit) fill.dtor();
+    fill.setLength(nb);
+    fill[][] = 0;
+    foreach (b; rpo[])
+        foreach (t; blocks[b].Bsucc[])
+        {
+            const ti = t.Bdfoidx;
+            preds[predStart[ti] + fill[ti]++] = b;
+        }
+    int intersect(int a, int b)
+    {
+        while (a != b)
+        {
+            while (order[a] > order[b])
+                a = blockIdom[a];
+            while (order[b] > order[a])
+                b = blockIdom[b];
+        }
+        return a;
+    }
+    blockIdom[0] = 0;
+    bool changed = true;
+    while (changed)
+    {
+        changed = false;
+        foreach (b; rpo[1 .. $])
+        {
+            int d = -1;
+            foreach (p; preds[predStart[b] .. predStart[b + 1]])
+                if (blockIdom[p] >= 0)
+                    d = d < 0 ? cast(int)p : intersect(cast(int)p, d);
+            if (d != blockIdom[b])
+            {
+                blockIdom[b] = d;
+                changed = true;
+            }
+        }
+    }
+}
+
+/* Whether block a dominates block b: a is b, or on every path to b from the start
+ */
+@trusted
+private bool blockDominates(uint a, uint b)
+{
+    if (a == b)
+        return true;
+    if (b >= blockIdom.length || blockIdom[b] < 0)
+        return false;
+    for (uint x = b; x != 0; )
+    {
+        x = cast(uint)blockIdom[x];
+        if (x == a)
+            return true;
+    }
+    return a == 0;
 }
 
 /* Evaluate e into a register
@@ -2555,9 +2676,9 @@ private Pair genPair(elem* e)
 {
     if (e.Ecount)
     {
-        const thisBlockOnly = isCrossBlockVar(e);
+        const shared_ = isCrossBlockVar(e);
         foreach (i, x; cseElems[])
-            if (x is e && (!thisBlockOnly || cseBlocks[i] == curBlock))
+            if (x is e && (!shared_ || blockDominates(cseBlocks[i], curBlock)))
                 return Pair(cseRegs[i], cseHis[i]);
     }
     Pair p = genPairx(e);
