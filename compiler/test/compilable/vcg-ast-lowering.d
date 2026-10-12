@@ -144,6 +144,12 @@ _d_cast!(C, Object)
 {
 	pure nothrow @nogc @trusted void* _d_cast(Object o)
 	{
+		if (o is null)
+			return null;
+		TypeInfo_Class oc = typeid(o);
+		TypeInfo_Class c = typeid(C);
+		if (oc is c)
+			return cast(void*)o;
 		return core.internal.cast_._d_class_cast!(C)(o);
 	}
 
