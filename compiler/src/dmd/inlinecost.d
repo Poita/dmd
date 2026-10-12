@@ -375,7 +375,8 @@ public:
     }
 
     /* A break or continue of a loop of the function, as it is not labeled, leaves the
-     * same loop wherever the function is inlined
+     * same loop wherever the function is inlined. It has no Expression form, so the
+     * function can be inlined only as statements.
      */
     override void visit(BreakStatement s)
     {
@@ -383,7 +384,7 @@ public:
             cost = COST_MAX;
         else
         {
-            cost++;
+            cost += STATEMENT_COST + 1;
             leavesLoops = true;
         }
     }
@@ -394,7 +395,7 @@ public:
             cost = COST_MAX;
         else
         {
-            cost++;
+            cost += STATEMENT_COST + 1;
             leavesLoops = true;
         }
     }
