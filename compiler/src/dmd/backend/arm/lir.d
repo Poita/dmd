@@ -2112,7 +2112,16 @@ private bool absCompare(elem* e, out elem* x, out elem* s)
 @trusted
 private void valueCond(elem* e, bool jumpIfTrue, scope void delegate(COND) nothrow jump)
 {
-    Reg r = gen(e);
+    Reg r;
+    if (pairType(e.Ety))
+    {
+        // a slice or delegate is nonzero if either half is
+        Pair p = genPair(e);
+        r = newVreg(RC.gp, 8);
+        emitIns(LOp.orr, 8, r, p.lo, p.hi);
+    }
+    else
+        r = gen(e);
     const cond = jumpIfTrue ? COND.ne : COND.eq;
     if (tyfloating(e.Ety))
     {
@@ -3485,7 +3494,14 @@ private Reg genx(elem* e)
     {
         import dmd.backend.debugprint : oper_str;
         if (env!"DMD_NEWCG_WHY")
+        {
+            import dmd.backend.debugprint : WReqn;
             fprintf(stderr, "newcg-pairscalar: %s %s\n", oper_str(op), funcsym_p.Sident.ptr);
+            fflush(stderr);
+            WReqn(e);
+            printf("\n");
+            fflush(stdout);
+        }
         fail("pair as scalar");
         return newVreg(RC.gp, 8);
     }
