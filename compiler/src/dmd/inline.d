@@ -1202,6 +1202,16 @@ public:
                     return null;
                 if (!e2.type || !equivalent(e2.type.toBasetype(), t))
                     return null;
+                /* nor a v the call refers to, as by ref or as this: what it returns is built
+                 * in v, so it would change v while it still reads it
+                 */
+                auto ce = e2.isCallExp();
+                if (refersToVar(ce.e1, vd))
+                    return null;
+                if (ce.arguments)
+                    foreach (arg; *ce.arguments)
+                        if (refersToVar(arg, vd))
+                            return null;
                 return vd;
             }
             enum maxCallerLines = 150;
@@ -1819,7 +1829,7 @@ public:
                 hasThis = parent == fd.toParent2();
             }
 
-            if (canInline(fd, hasThis, asStates, pass, eSink) && withinBudget(fd))
+            if (canInline(fd, hasThis, asStates, pass, eSink) && withinBudget(fd) && inlineAllowed(fd, parent, e.loc))
             {
                 expandInline(e, fd, parent, eret, explicitThis, asStates, propagateNRVO,
                              eresult, sresult, again);
@@ -2216,6 +2226,51 @@ bool restEndsWithReturn(ref Statements statements, size_t i)
         if (!st)
             return false;
     return statements[$ - 1].endsWithReturnStatement() !is null;
+}
+
+/***********************************************************
+ * Whether e refers to the variable v anywhere in it
+ */
+private bool refersToVar(Expression e, VarDeclaration v)
+{
+    extern (C++) final class Finder : StoppableVisitor
+    {
+        alias visit = typeof(super).visit;
+        VarDeclaration v;
+        extern (D) this(VarDeclaration v) @safe { this.v = v; }
+        override void visit(Expression e) {}
+        override void visit(VarExp e) { if (e.var is v) stop = true; }
+        override void visit(SymOffExp e) { if (e.var is v) stop = true; }
+    }
+    if (!e)
+        return false;
+    scope f = new Finder(v);
+    return walkPostorder(e, f);
+}
+
+/***********************************************************
+ * Whether the next expansion may be done: all of them, or with DMD_INLINE_MAX=n
+ * set, the first n, to find one that goes wrong by bisection; DMD_INLINE_LOG lists
+ * them with their numbers
+ */
+private bool inlineAllowed(FuncDeclaration fd, FuncDeclaration parent, Loc loc)
+{
+    import core.stdc.stdlib : getenv, atoi;
+    __gshared int max = -2;
+    __gshared int count;
+    __gshared bool log;
+    if (max == -2)
+    {
+        auto m = getenv("DMD_INLINE_MAX");
+        max = m ? atoi(m) : -1;
+        log = getenv("DMD_INLINE_LOG") !is null;
+    }
+    if (max >= 0 && count >= max)
+        return false;
+    if (log)
+        printf("inline %d: %s into %s at %s\n", count, fd.toPrettyChars(), parent.toPrettyChars(), loc.toChars());
+    ++count;
+    return true;
 }
 
 /***********************************************************
