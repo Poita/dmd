@@ -2877,7 +2877,19 @@ private AggVal genAgg(elem* e)
             if (auto av = aggOf(e.Vsym))
             {
                 v.kind = AggVal.Kind.slots;
-                v.r = av.slots;
+                if (!e.Voffset)
+                {
+                    v.r = av.slots;
+                    return v;
+                }
+                // the later fields of one held in integer registers, from the register at the offset
+                if (av.abi.kind != AggregateABI.Kind.gpr || e.Voffset % 8 || e.Voffset / 8 >= av.abi.nregs)
+                {
+                    fail("part of an aggregate variable as an aggregate");
+                    return v;
+                }
+                foreach (k; cast(uint)(e.Voffset / 8) .. av.abi.nregs)
+                    v.r[k - e.Voffset / 8] = av.slots[k];
                 return v;
             }
             if (Reg r = varReg(e.Vsym))
