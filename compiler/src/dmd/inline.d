@@ -1596,9 +1596,9 @@ public:
 
     override void visit(CastExp e)
     {
-        if (auto lowering = e.lowering)
+        if (e.lowering)
         {
-            inlineScan(lowering);
+            inlineScan(e.lowering);
         }
         else
         {
@@ -1614,9 +1614,9 @@ public:
 
     override void visit(CatExp e)
     {
-        if (auto lowering = e.lowering)
+        if (e.lowering)
         {
-            inlineScan(lowering);
+            inlineScan(e.lowering);
             return;
         }
 
@@ -1626,8 +1626,8 @@ public:
 
     override void visit(CatAssignExp e)
     {
-        if (auto lowering = e.lowering)
-            inlineScan(lowering);
+        if (e.lowering)
+            inlineScan(e.lowering);
         else
             visit(cast(BinExp) e);
     }
@@ -1640,9 +1640,9 @@ public:
 
     override void visit(EqualExp e)
     {
-        if (auto lowering = e.lowering)
+        if (e.lowering)
         {
-            inlineScan(lowering);
+            inlineScan(e.lowering);
         }
         else
         {
@@ -1704,8 +1704,8 @@ public:
 
     override void visit(ConstructExp e)
     {
-        if (auto lowering = e.lowering)
-            inlineScan(lowering);
+        if (e.lowering)
+            inlineScan(e.lowering);
         else
             visit(cast(AssignExp) e);
     }
