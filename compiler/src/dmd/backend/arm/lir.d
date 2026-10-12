@@ -115,6 +115,7 @@ enum LOp : ubyte
     vfcmeqz, vfcmgez, vfcmgtz, vfcmltz, vfcmlez,    // d = all ones in each lane where a op 0, else zeros
     vzip2,          // d = the floats in lane 1 of a and of b
     vbsl,           // d = the bits of b where a has ones, else those of c
+    tlv,            // d = the address of the thread local variable whose TLV descriptor is sym
 }
 
 /// Flags of an instruction
@@ -347,6 +348,14 @@ bool lirCodegen(ref CGstate cg)
     }
     if (env!"DMD_NEWCG_VERIFY")
         verify();
+    expandTlvs();
+    if (failed)
+    {
+        if (env!"DMD_NEWCG_WHY")
+            fprintf(stderr, "newcg-why: tlv:%s %s\n", whyNot, funcsym_p.Sident.ptr);
+        undoVariables();
+        return false;
+    }
     estimateFrequencies();
     computeLiveness();
     allocate();
@@ -715,6 +724,27 @@ private bool supportedCallee(const(elem)* e1)
     if (e1.Eoper == OPind)
         return supportedElem(e1.E1);
     return false;
+}
+
+/* The TLV descriptor e calls the thunk of, as el_var() makes the address of a
+ * thread local variable on Mach-O: (*desc.thunk)(&desc), or null
+ */
+@trusted
+private Symbol* tlvCall(const(elem)* e)
+{
+    if (e.Eoper != OPcall || e.E1.Eoper != OPind)
+        return null;
+    // the function is the thunk read from the start of the descriptor
+    const(elem)* f = e.E1.E1;
+    if (f.Eoper == OPind)
+        f = f.E1;
+    if (f.Eoper == OPadd && f.E2.Eoper == OPconst && el_tolong(cast(elem*)f.E2) == 0)
+        f = f.E1;
+    const a = e.E2;
+    if (f.Eoper != OPrelconst || f.Voffset || a.Eoper != OPrelconst || a.Voffset || a.Vsym !is f.Vsym ||
+        !tlvDescriptor(f.Vsym))
+        return null;
+    return cast(Symbol*)f.Vsym;
 }
 
 /* Whether s is the TLV descriptor of a thread local variable on Mach-O, whose
@@ -3815,6 +3845,14 @@ private void insertHoisted()
 @trusted
 private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden = null)
 {
+    if (!pair && !agg && !hidden)
+        if (Symbol* s = tlvCall(e))
+        {
+            Reg d = newVreg(RC.gp, 8);
+            auto i = emitIns(LOp.tlv, 8, d);
+            i.sym = s;
+            return d;
+        }
     if (pair)
         *pair = Pair(newVreg(RC.gp, 8), newVreg(RC.gp, 8));     // also the result if this fails
     AggregateABI resAbi;
@@ -7974,12 +8012,104 @@ private bool pureOp(ref const LIns i)
         case LOp.scvtf, LOp.ucvtf, LOp.fcvtzs, LOp.fcvtzu, LOp.fcvtms, LOp.fcvt:
         case LOp.lea:
         case LOp.vfadd: .. case LOp.vbsl:
+        case LOp.tlv:       // the same address throughout a function on one thread
             return true;
         case LOp.copy:
             return !isPhys(i.a) && !env!"DMD_NEWCG_LICMNOCOPY";
         default:
             return false;
     }
+}
+
+/* Make each tlv the call of the thunk it is: a definition of x0, copied to its
+ * register. The thunk destroys only x0, x16, x17 and x30 of the registers, but
+ * may change the flags, so one where they are live goes before what sets them
+ */
+@trusted
+private void expandTlvs()
+{
+    static bool readsFlags(LOp op)
+    {
+        return op == LOp.bcond || op == LOp.cset || op == LOp.csel || op == LOp.fcsel ||
+            op == LOp.ccmp || op == LOp.ccmpi;
+    }
+    static bool setsFlags(LOp op)
+    {
+        return op == LOp.cmp || op == LOp.cmpi || op == LOp.tsti || op == LOp.fcmp || op == LOp.fcmpz ||
+            op == LOp.call || op == LOp.tlv;
+    }
+    static bool touchesX0(ref LIns i)
+    {
+        bool t = i.d == phys(0) || i.op == LOp.call;
+        void use(Reg r) { t |= r == phys(0); }
+        forUses(i, &use);
+        return t;
+    }
+    Barray!Insert inserts;
+    scope (exit) inserts.dtor();
+    foreach (bi; 0 .. blocks.length)
+    {
+        const end = blockStart[bi + 1];
+        foreach (n; blockStart[bi] .. end)
+        {
+            if (ins[n].op != LOp.tlv || isPhys(ins[n].d))
+                continue;
+            // whether a later instruction reads the flags set before this one
+            bool live;
+            foreach (k; n + 1 .. end)
+            {
+                if (readsFlags(ins[k].op))
+                {
+                    live = true;
+                    break;
+                }
+                // another thunk call destroys the flags, but sets none that are read
+                if (setsFlags(ins[k].op) && ins[k].op != LOp.tlv)
+                    break;
+            }
+            uint at = cast(uint)n;
+            if (live)
+            {
+                at = uint.max;
+                foreach_reverse (k; blockStart[bi] .. n)
+                {
+                    if (touchesX0(ins[k]) || ins[k].op == LOp.label)
+                        break;
+                    if (setsFlags(ins[k].op))
+                    {
+                        at = cast(uint)k;
+                        break;
+                    }
+                }
+                if (at == uint.max)
+                {
+                    fail("flags live across a thread local's address");
+                    return;
+                }
+            }
+            LIns t = ins[n];
+            const d = t.d;
+            t.d = phys(0);
+            LIns c;
+            c.op = LOp.copy;
+            c.sz = 8;
+            c.d = d;
+            c.a = phys(0);
+            hintCopy(d, phys(0));
+            if (at == n)
+            {
+                ins[n] = t;
+                inserts.push(Insert(cast(uint)n + 1, c, false));
+            }
+            else
+            {
+                ins[n] = LIns.init;     // a nop
+                inserts.push(Insert(at, t, false));
+                inserts.push(Insert(at, c, false));
+            }
+        }
+    }
+    applyInserts(inserts);
 }
 
 /// A loop of segments: its header, and all the segments reaching a back edge to it
@@ -9945,6 +10075,20 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
             if (i.b)
                 w |= (pr(i.b) & 31) << 16;
             cdb.gen1(w);
+            break;
+        }
+
+        case LOp.tlv:
+        {
+            // ADRP/LDR x0 = &desc, LDR x16,[x0], BLR x16
+            cgp.calledafunc = 1;
+            LIns t = i;
+            t.op = LOp.lea;
+            t.imm = 0;
+            emitOne(cdb, t, labelCode, used);
+            cdb.gen1(INSTR.ldr_imm_gen(1, 16, 0, 0));
+            cdb.gen1(INSTR.blr(16));
+            used |= mask(0);
             break;
         }
 
