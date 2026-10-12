@@ -46,6 +46,40 @@ ref Tarr _d_arrayappendcTX(Tarr : T[], T)(return ref scope Tarr px, size_t n) @t
 
 private ref Tarr _d_arrayappendcTX_(Tarr : T[], T)(return ref scope Tarr px, size_t n, bool isshared) @trusted
 {
+    pragma(inline, true);
+    version (D_TypeInfo)
+    {
+        import core.internal.gc.blkcache : __appendCachedInPlace;
+        // the thread's own cache, used as in pure code as the GC's own calls are
+        alias InPlace = bool function(void[], size_t) pure nothrow @nogc @trusted;
+
+        /* appending to the array appended to last, which ends where its block's
+         * used part does, as is common: in place, without a call. Written as an if
+         * of expressions, so it is inlined where it is used
+         */
+        if (!isshared && n &&
+            (cast(InPlace) &__appendCachedInPlace)((cast(void*) px.ptr)[0 .. px.length * T.sizeof],
+                (px.length + n) * T.sizeof))
+            px = px.ptr[0 .. px.length + n];
+        else
+            px = _d_arrayappendcTXSlowValue(px, n, isshared);   // px's address not taken, so it can stay in registers
+        return px;
+    }
+    else
+        assert(0, "Cannot append to array if compiling without support for runtime type information!");
+}
+
+/* `_d_arrayappendcTXSlow` taking and giving the array by value */
+private Tarr _d_arrayappendcTXSlowValue(Tarr : T[], T)(Tarr px, size_t n, bool isshared) @trusted
+{
+    version (DigitalMars) pragma(inline, false);
+    _d_arrayappendcTXSlow(px, n, isshared);
+    return px;
+}
+
+/* `_d_arrayappendcTX_` but for the case it does in place */
+private ref Tarr _d_arrayappendcTXSlow(Tarr : T[], T)(return ref scope Tarr px, size_t n, bool isshared) @trusted
+{
     version (DigitalMars) pragma(inline, false);
     version (D_TypeInfo)
     {
@@ -330,4 +364,31 @@ ref Tarr _d_arrayappendT(Tarr : T[], T)(return ref scope Tarr x, scope Tarr y) @
     assert(inner_dtor_cnt == 4);
     assert(outer_postblit_cnt == 1);
     assert(outer_dtor_cnt == 1);
+}
+
+// appends in place to the array that ends where its block's used part does, and
+// never over what another array of the block appended
+@system unittest
+{
+    foreach (n; [1, 7, 60, 300, 5000])
+    {
+        int[] a;
+        foreach (i; 0 .. n)
+            _d_arrayappendcTX(a, 1)[$ - 1] = i;
+        foreach (i, x; a)
+            assert(x == i);
+
+        int[] b = a;
+        _d_arrayappendcTX(b, 1)[$ - 1] = -1;    // in place, after a
+        _d_arrayappendcTX(a, 1)[$ - 1] = -2;    // must not overwrite b's last
+        assert(b[$ - 1] == -1 && a[$ - 1] == -2);
+        assert(a.ptr !is b.ptr);
+        assert(b[0 .. n] == a[0 .. n]);
+
+        ubyte[] c = new ubyte[](n);
+        auto d = c[0 .. n / 2];
+        _d_arrayappendcTX(d, 1)[$ - 1] = 0xAA;  // d ends inside c, so it moves
+        assert(d.ptr !is c.ptr || n / 2 == n);
+        assert(c[n / 2 .. $].length == 0 || c[n / 2] == 0);
+    }
 }

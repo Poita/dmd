@@ -144,6 +144,28 @@ unittest
         so any use of the returned BlkInfo should copy it and then check the
         base ptr of the copy before actually using it.
   */
+/**
+ * Set the used length of the block of `slice` to `newUsed` bytes in place, when
+ * the block is the cache entry found or put in last and the array ends where its
+ * used part does, as when one array is appended to again and again
+ * Returns: whether it was set
+ */
+pragma(inline, true)
+bool __appendCachedInPlace(void[] slice, size_t newUsed) nothrow @nogc @trusted
+{
+    import core.internal.gc.blockmeta : __expandUsedInPlace;
+    auto state = &__blkcacheState;
+    BlkInfo* ptr = state.storage;
+    if (ptr is null)
+        return false;
+    static if (N_CACHE_BLOCKS != 1)
+        ptr += state.nextBlkIdx;
+    auto base = ptr.base;
+    if (!base || base > slice.ptr || cast(size_t)(slice.ptr - base) >= ptr.size)
+        return false;
+    return __expandUsedInPlace(ptr, slice, newUsed);
+}
+
 BlkInfo *__getBlkInfo(void *interior) nothrow @nogc
 {
     auto state = &__blkcacheState;

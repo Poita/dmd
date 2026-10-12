@@ -21,6 +21,59 @@ enum : size_t
     MAXMEDSIZE = (PAGESIZE / 2) - MEDPAD
 }
 
+/**
+ * Set the used length of the block `info` holds an array in, when the array
+ * `slice` ends where the used part of the block does and `newUsed` bytes of it
+ * fit, as `__setArrayAllocLength` does: the case of appending to one array again
+ * and again, done without a call. Not for shared arrays.
+ * Returns: whether the length was set
+ */
+pragma(inline, true)
+bool __expandUsedInPlace(scope const(BlkInfo)* info, void[] slice, size_t newUsed) pure nothrow @nogc @trusted
+{
+    auto base = info.base;
+    immutable size = info.size;
+    immutable attr = info.attr;
+    if (!(attr & BlkAttr.APPENDABLE) || newUsed < slice.length)
+        return false;
+    if (size <= PAGESIZE / 2)
+    {
+        // the array is at the base, its length at the end, before any TypeInfo
+        immutable offset = slice.ptr - base;
+        immutable used = newUsed + offset;
+        immutable existing = slice.length + offset;
+        immutable typeInfoSize = (attr & BlkAttr.STRUCTFINAL) ? size_t.sizeof : 0;
+        if (size <= 256)
+        {
+            auto length = cast(ubyte*)(base + size - typeInfoSize - SMALLPAD);
+            if (used <= size - SMALLPAD - typeInfoSize && *length == cast(ubyte) existing)
+            {
+                *length = cast(ubyte) used;
+                return true;
+            }
+            return false;
+        }
+        auto length = cast(ushort*)(base + size - typeInfoSize - MEDPAD);
+        if (used <= size - MEDPAD - typeInfoSize && *length == existing)
+        {
+            *length = cast(ushort) used;
+            return true;
+        }
+        return false;
+    }
+    // the array is after a prefix, its length at the base
+    immutable offset = slice.ptr - (base + LARGEPREFIX(cast(void*) base));
+    immutable used = newUsed + offset;
+    immutable existing = slice.length + offset;
+    auto length = cast(size_t*) base;
+    if (used + LARGEPAD(cast(void*) base) <= size && *length == existing)
+    {
+        *length = used;
+        return true;
+    }
+    return false;
+}
+
 struct LargeArrayHeader
 {
     size_t size;

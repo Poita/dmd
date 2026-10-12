@@ -1511,60 +1511,10 @@ class ConservativeGC : GC
 
         if (!atomic)
         {
-            /* The cached block of the array, as when one array is appended to again
-             * and again: its used length is checked and set here, as
-             * __setArrayAllocLength does, when the array ends where the used part
-             * of the block does and what is added fits; anything else is left to
-             * the general case below
-             */
+            // the cached block of the array, as when one array is appended to again and again
             if (auto bic = __getBlkInfo(slice.ptr))
-            {
-                auto base = bic.base;
-                immutable size = bic.size;
-                immutable attr = bic.attr;
-                if (attr & BlkAttr.APPENDABLE)
-                {
-                    if (size <= PAGESIZE / 2)
-                    {
-                        // the array is at the base, its length at the end, before any TypeInfo
-                        immutable offset = slice.ptr - base;
-                        immutable used = newUsed + offset;
-                        immutable existing = slice.length + offset;
-                        immutable typeInfoSize = (attr & BlkAttr.STRUCTFINAL) ? size_t.sizeof : 0;
-                        if (size <= 256)
-                        {
-                            auto length = cast(ubyte*)(base + size - typeInfoSize - SMALLPAD);
-                            if (used <= size - SMALLPAD - typeInfoSize && *length == cast(ubyte) existing)
-                            {
-                                *length = cast(ubyte) used;
-                                return true;
-                            }
-                        }
-                        else
-                        {
-                            auto length = cast(ushort*)(base + size - typeInfoSize - MEDPAD);
-                            if (used <= size - MEDPAD - typeInfoSize && *length == existing)
-                            {
-                                *length = cast(ushort) used;
-                                return true;
-                            }
-                        }
-                    }
-                    else
-                    {
-                        // the array is after a prefix, its length at the base
-                        immutable offset = slice.ptr - (base + LARGEPREFIX(base));
-                        immutable used = newUsed + offset;
-                        immutable existing = slice.length + offset;
-                        auto length = cast(size_t*) base;
-                        if (used + LARGEPAD(base) <= size && *length == existing)
-                        {
-                            *length = used;
-                            return true;
-                        }
-                    }
-                }
-            }
+                if (__expandUsedInPlace(bic, slice, newUsed))
+                    return true;
         }
 
         return expandArrayUsedAnyhow(slice, newUsed, atomic);
