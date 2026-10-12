@@ -213,6 +213,9 @@ private __gshared
     Barray!uint cseBlocks;      // the blocks they were evaluated in
     Barray!int blockIdom;       // the immediate dominator of each block, -1 if not reached
     uint curBlock;
+    Barray!(Symbol*) tlvSyms;   // the thread locals whose addresses were taken on every path through
+    Barray!Reg tlvRegs;         // their blocks, in these registers,
+    Barray!uint tlvBlocks;      // in these blocks
     uint condDepth;             // number of conditionally evaluated regions being selected
     bool usesFrame;             // the code refers to locals or parameters in memory
 }
@@ -306,6 +309,9 @@ bool lirCodegen(ref CGstate cg)
     cseRegs.setLength(0);
     cseHis.setLength(0);
     cseBlocks.setLength(0);
+    tlvSyms.setLength(0);
+    tlvRegs.setLength(0);
+    tlvBlocks.setLength(0);
     switchBlocks.setLength(0);
     usesFrame = false;
     switchesFibers = callsFiberSwitch();
@@ -4349,9 +4355,22 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
     if (!pair && !agg && !hidden)
         if (Symbol* s = tlvCall(e))
         {
+            /* the address taken in a block that dominates this one, where it is taken
+             * on every path through, unless the function switches fibers
+             */
+            if (!switchesFibers)
+                foreach (k, t; tlvSyms[])
+                    if (t is s && blockDominates(tlvBlocks[k], curBlock))
+                        return tlvRegs[k];
             Reg d = newVreg(RC.gp, 8);
             auto i = emitIns(LOp.tlv, 8, d);
             i.sym = s;
+            if (!condDepth)
+            {
+                tlvSyms.push(s);
+                tlvRegs.push(d);
+                tlvBlocks.push(curBlock);
+            }
             return d;
         }
     if (pair)
