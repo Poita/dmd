@@ -2811,9 +2811,11 @@ struct Gcx
             }
             else
             {
+                // popped into a copy, so rng's address is not taken and it can stay in registers
+                ScanRange!precise popped = void;
                 static if (parallel)
                 {
-                    if (!scanStackPopLocked(rng))
+                    if (!scanStackPopLocked(popped))
                         break; // nothing more to do
                 }
                 else
@@ -2822,8 +2824,9 @@ struct Gcx
                         break; // nothing more to do
 
                     // pop range from global stack and recurse
-                    scanStack!precise.pop(rng);
+                    scanStack!precise.pop(popped);
                 }
+                rng = popped;
             }
             // printf("  pop [%p..%p] (%#zx)\n", p1, p2, cast(size_t)p2 - cast(size_t)p1);
             goto LcontRange;
