@@ -335,6 +335,8 @@ bool lirCodegen(ref CGstate cg)
         // the vectors made may be of values the same throughout a loop
         if (!env!"DMD_NEWCG_NOSLP" && vectorize() && !env!"DMD_NEWCG_NOLICM")
             hoistInvariants();
+        if (!env!"DMD_NEWCG_NOTHREAD")
+            threadJumps();
         removeUnreachable();
         removeDead();
         fuseSignTests();
@@ -8239,6 +8241,294 @@ private void vectorizeRegion(ref Slp s, uint rs, uint re)
     }
 }
 
+/******************************* Jump threading ******************************/
+
+/* Whether the test of the value v of a register, by cbz i, or tsti/cmpi t and then
+ * the bcond i, jumps: 1 or 0, or -1 if that is not known
+ */
+private int testOutcome(ref const LIns i, const(LIns)* t, ulong v)
+{
+    if (i.op == LOp.cbz)
+    {
+        if (i.sz == 4)
+            v &= 0xFFFF_FFFF;
+        bool hit = i.imm ? ((v >> (i.imm - 1)) & 1) != 0 : v != 0;
+        return (i.cond == COND.ne) == hit;
+    }
+    if (i.op != LOp.bcond || !t)
+        return -1;
+    const bits = t.sz == 4 ? 32 : 64;
+    const ulong m = bits == 32 ? 0xFFFF_FFFF : ulong.max;
+    ulong r;
+    bool c, vf;
+    if (t.op == LOp.tsti)
+        r = v & cast(ulong)t.imm & m;
+    else if (t.op == LOp.cmpi)
+    {
+        const a = v & m;
+        const b = cast(ulong)t.imm & m;
+        r = (a - b) & m;
+        c = a >= b;                     // no borrow
+        const sa = bits == 32 ? cast(long)cast(int)a : cast(long)a;
+        const sb = bits == 32 ? cast(long)cast(int)b : cast(long)b;
+        const sr = bits == 32 ? cast(long)cast(int)r : cast(long)r;
+        vf = (sa < 0) != (sb < 0) && (sr < 0) != (sa < 0);
+    }
+    else
+        return -1;
+    const z = r == 0;
+    const n = ((r >> (bits - 1)) & 1) != 0;
+    bool taken;
+    switch (i.cond)
+    {
+        case COND.eq: taken = z; break;
+        case COND.ne: taken = !z; break;
+        case COND.cs: taken = c; break;
+        case COND.cc: taken = !c; break;
+        case COND.mi: taken = n; break;
+        case COND.pl: taken = !n; break;
+        case COND.hi: taken = c && !z; break;
+        case COND.ls: taken = !c || z; break;
+        case COND.ge: taken = n == vf; break;
+        case COND.lt: taken = n != vf; break;
+        case COND.gt: taken = !z && n == vf; break;
+        case COND.le: taken = z || n != vf; break;
+        default: return -1;
+    }
+    return taken;
+}
+
+/* Branches on values known where they are set, as of the results of inlined
+ * functions with several returns: a segment's test of a constant it set is a
+ * jump or nothing, and a segment that goes on to one that only moves values and
+ * then tests one it knows takes those moves and goes straight where the test goes
+ */
+@trusted
+private void threadJumps()
+{
+    foreach (round; 0 .. 4)
+    {
+        buildSegments();
+        const ns = segStart.length - 1;
+        // the constants the registers hold at the end of the instructions so far
+        Reg[16] kr;
+        ulong[16] kv;
+        uint nk;
+        int find(Reg r) { foreach (k; 0 .. nk) if (kr[k] == r) return cast(int)k; return -1; }
+        void forget(Reg r)
+        {
+            const k = find(r);
+            if (k >= 0)
+            {
+                kr[k] = kr[nk - 1];
+                kv[k] = kv[nk - 1];
+                --nk;
+            }
+        }
+        void know(Reg r, ulong v)
+        {
+            forget(r);
+            if (nk < kr.length)
+            {
+                kr[nk] = r;
+                kv[nk] = v;
+                ++nk;
+            }
+        }
+        // track instruction i: what it defines is known only if a constant or a copy of one
+        bool track(ref const LIns i)
+        {
+            if (!i.d || isPhys(i.d) || rcOf(i.d) != RC.gp)
+            {
+                if (i.d)
+                    forget(i.d);
+                return false;
+            }
+            if (i.op == LOp.movi)
+            {
+                know(i.d, i.sz == 4 ? cast(uint)i.imm : cast(ulong)i.imm);
+                return true;
+            }
+            if (i.op == LOp.copy && i.a && !isPhys(i.a))
+            {
+                const k = find(i.a);
+                if (k >= 0)
+                {
+                    know(i.d, i.sz == 4 ? kv[k] & 0xFFFF_FFFF : kv[k]);
+                    return true;
+                }
+            }
+            forget(i.d);
+            return false;
+        }
+        Barray!Insert inserts;
+        scope (exit) inserts.dtor();
+        Barray!bool changedSeg;
+        scope (exit) changedSeg.dtor();
+        changedSeg.setLength(ns);
+        changedSeg[][] = false;
+        bool any;
+        foreach (si; 0 .. ns)
+        {
+            const end = segEnd(si);
+            nk = 0;
+            foreach (n; segStart[si] .. end)
+                track(ins[n]);
+            if (end <= segStart[si])
+                continue;
+            LIns* last = &ins[end - 1];
+
+            // a test in the segment of a constant set before it
+            if ((last.op == LOp.cbz || last.op == LOp.bcond) && !changedSeg[si])
+            {
+                const(LIns)* t = null;
+                Reg r = last.a;
+                if (last.op == LOp.bcond)
+                {
+                    if (end - 1 <= segStart[si])
+                        continue;
+                    t = &ins[end - 2];
+                    if (t.op != LOp.tsti && t.op != LOp.cmpi)
+                        continue;
+                    r = t.a;
+                }
+                // what is known at the test: forget what the test and branch define
+                const k = find(r);
+                if (k < 0 || isPhys(r))
+                    continue;
+                const o = testOutcome(*last, t, kv[k]);
+                if (o < 0)
+                    continue;
+                if (t)
+                    ins[end - 2] = LIns.init;
+                if (o)
+                {
+                    last.op = LOp.br;
+                    last.cond = COND.al;
+                    last.a = noReg;
+                    last.imm = 0;
+                }
+                else
+                    *last = LIns.init;
+                any = true;
+                continue;
+            }
+
+            // a segment going on to one that moves values and tests one known here
+            uint target;
+            uint brAt = uint.max;
+            if (last.op == LOp.br)
+            {
+                target = last.flags & F.toLabel ? labelSeg[last.target] : blockSeg[last.target];
+                brAt = end - 1;
+            }
+            else if (last.op == LOp.bcond || last.op == LOp.cbz || last.op == LOp.brk ||
+                     last.op == LOp.call && last.flags & F.noreturn)
+                continue;
+            else
+                target = cast(uint)(si + 1);
+            if (target >= ns || target == si || changedSeg[si])
+                continue;
+            if (blocks[segBlock[target]].bc == BC.switch_ && segStart[target] == blockStart[segBlock[target]])
+                continue;
+            const tend = segEnd(target);
+            uint m = segStart[target];
+            while (m < tend && ins[m].op == LOp.label)
+                ++m;
+            const movesFrom = m;
+            bool ok = true;
+            uint moves;
+            for (; m < tend; ++m)
+            {
+                const LIns* x = &ins[m];
+                if (x.op == LOp.cbz || x.op == LOp.tsti || x.op == LOp.cmpi)
+                    break;
+                if ((x.op != LOp.copy && x.op != LOp.movi) || !x.d || isPhys(x.d) || x.a && isPhys(x.a) ||
+                    ++moves > 4)
+                {
+                    ok = false;
+                    break;
+                }
+                track(*x);
+            }
+            if (!ok || m >= tend)
+                continue;
+            const(LIns)* t = null;
+            const(LIns)* test = &ins[m];
+            if (test.op != LOp.cbz)
+            {
+                if (m + 2 != tend || ins[m + 1].op != LOp.bcond)
+                    continue;
+                t = test;
+                test = &ins[m + 1];
+            }
+            else if (m + 1 != tend)
+                continue;
+            const k = find(t ? t.a : test.a);
+            if (k < 0)
+                continue;
+            const o = testOutcome(*test, t, kv[k]);
+            if (o < 0)
+                continue;
+            /* where the test goes: its target, or where the target segment falls
+             * through to. Labels are of one block's code, so one in another block
+             * is not jumped to
+             */
+            const sb = segBlock[si];
+            LIns br;
+            br.op = LOp.br;
+            br.cond = COND.al;
+            if (o)
+            {
+                if (test.flags & F.toLabel && segBlock[labelSeg[test.target]] != sb)
+                    continue;
+                br.target = test.target;
+                br.flags = test.flags & F.toLabel;
+            }
+            else
+            {
+                const next = target + 1;
+                if (next >= ns)
+                    continue;
+                const ns0 = segStart[next];
+                if (blockSeg[segBlock[next]] == next && ns0 == blockStart[segBlock[next]])
+                    br.target = segBlock[next];
+                else if (segBlock[next] != sb)
+                    continue;
+                else if (ins[ns0].op == LOp.label && ns0 < segEnd(next))
+                {
+                    br.target = ins[ns0].target;
+                    br.flags = F.toLabel;
+                }
+                else
+                {
+                    // a label put where the target segment falls through to
+                    const l = newLabel();
+                    LIns lab;
+                    lab.op = LOp.label;
+                    lab.target = l;
+                    inserts.push(Insert(ns0, lab, false));
+                    br.target = l;
+                    br.flags = F.toLabel;
+                    changedSeg[next] = true;
+                }
+            }
+            // the moves of the target segment, then the jump, at the end of this one
+            if (brAt != uint.max)
+                ins[brAt] = LIns.init;
+            foreach (q; movesFrom .. m)
+                inserts.push(Insert(end, ins[q], false));
+            inserts.push(Insert(end, br, false));
+            changedSeg[si] = true;
+            changedSeg[target] = true;
+            any = true;
+        }
+        applyInserts(inserts);
+        if (!any)
+            break;
+    }
+}
+
 /******************************* Loop invariants ******************************/
 
 /* Whether the result of i depends only on its operands, and computing it
@@ -10454,6 +10744,7 @@ private void dump()
         foreach (r; v.ranges[]) printf(" [%d,%d)", r.from, r.to);
         printf("\n");
     }
+    fflush(stdout);
 }
 
 @trusted private const(char)* lopName(LOp op)
