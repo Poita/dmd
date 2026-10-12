@@ -308,6 +308,7 @@ bool lirCodegen(ref CGstate cg)
     cseBlocks.setLength(0);
     switchBlocks.setLength(0);
     usesFrame = false;
+    switchesFibers = callsFiberSwitch();
     condDepth = 0;
 
     for (block* b = bo.startblock; b; b = b.Bnext)
@@ -8900,12 +8901,53 @@ private void threadJumps()
 
 /******************************* Loop invariants ******************************/
 
+
+/* Whether the function switches fibers itself, as where Fiber.yield or Fiber.call is
+ * inlined: a fiber may go on running on another thread, so a thread local address
+ * taken before the switch is not the one after it. Elsewhere a thread local address
+ * is the same throughout the function.
+ */
+private __gshared bool switchesFibers;
+
+@trusted
+private bool callsFiberSwitch()
+{
+    import core.stdc.string : strcmp;
+    bool found;
+    void walk(const(elem)* e)
+    {
+        while (e && !found)
+        {
+            if ((e.Eoper == OPcall || e.Eoper == OPucall) && e.E1.Eoper == OPvar &&
+                strcmp(e.E1.Vsym.Sident.ptr, "fiber_switchContext") == 0)
+            {
+                found = true;
+                return;
+            }
+            if (OTbinary(e.Eoper))
+            {
+                walk(e.E2);
+                e = e.E1;
+            }
+            else if (OTunary(e.Eoper))
+                e = e.E1;
+            else
+                return;
+        }
+    }
+    for (block* b = bo.startblock; b && !found; b = b.Bnext)
+        walk(b.Belem);
+    return found;
+}
+
 /* Whether the result of i depends only on its operands, and computing it
  * where it was not computed before can do no harm
  */
 @trusted
 private bool pureOp(ref const LIns i)
 {
+    if (i.op == LOp.tlv)
+        return !switchesFibers;
     switch (i.op)
     {
         case LOp.add: .. case LOp.rorv:
@@ -8916,7 +8958,7 @@ private bool pureOp(ref const LIns i)
         case LOp.lea:
         case LOp.vfadd: .. case LOp.vbsl:
         case LOp.rbit, LOp.clz, LOp.rev, LOp.popcnt:
-        case LOp.tlv:       // the same address throughout a function on one thread
+        case LOp.tlv:
             return true;
         case LOp.copy:
             return !isPhys(i.a) && !env!"DMD_NEWCG_LICMNOCOPY";
