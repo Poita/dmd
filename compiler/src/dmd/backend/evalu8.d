@@ -1278,8 +1278,17 @@ static if (0)
         }
         if (cast(targ_ullong) i2 > targ_ullong.sizeof * 8)
             i2 = targ_ullong.sizeof * 8;
-        // Always signed
-        e.Vllong = l1 >> i2;
+        /* Always signed, of the size of the operand: one of an unsigned type, as a
+         * signed variable painted to the unsigned type it combines with, is not
+         * sign extended by el_tolong()
+         */
+        switch (tysize(tym))
+        {
+            case 1:     e.Vllong = cast(byte)l1 >> i2;     break;
+            case 2:     e.Vllong = cast(short)l1 >> i2;    break;
+            case 4:     e.Vllong = cast(int)l1 >> i2;      break;
+            default:    e.Vllong = l1 >> i2;               break;
+        }
         break;
 
     case OPpair:
