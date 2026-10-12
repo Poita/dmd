@@ -785,6 +785,7 @@ public:
                 vto.parent = ids.parent;
                 vto.csym = null;
                 vto.nrvo = ids.propagateNRVO && varIsNRVO;
+                vto.nestedrefs = FuncDeclarations.init;   // what refers to vd is not inlined with it
 
                 ids.from.push(vd);
                 ids.to.push(vto);
@@ -2210,6 +2211,55 @@ bool restEndsWithReturn(ref Statements statements, size_t i)
 }
 
 /***********************************************************
+ * Whether fd refers to nested functions only because nested functions refer to
+ * its variables, rather than for its contracts or what it overrides
+ */
+private bool onlyClosureVars(FuncDeclaration fd)
+{
+    return fd.closureVars.length && !fd.fdrequire && !fd.fdensure &&
+        !(fd.foverrides.length && fd.isVirtualMethod());
+}
+
+/***********************************************************
+ * Whether the body of fd still has a function literal, a delegate or a nested
+ * function in it, once the calls in it that can be have been inlined
+ */
+private bool refersToNested(FuncDeclaration fd)
+{
+    import dmd.visitor : SemanticTimeTransitiveVisitor;
+    extern (C++) final class NestedFinder : SemanticTimeTransitiveVisitor
+    {
+        alias visit = SemanticTimeTransitiveVisitor.visit;
+        bool found;
+
+        override void visit(FuncExp e) { found = true; }
+        override void visit(DelegateExp e) { found = true; }
+        override void visit(VarExp e)
+        {
+            if (auto f = e.var.isFuncDeclaration())
+                found |= f.isNested();
+        }
+        override void visit(SymOffExp e)
+        {
+            if (auto f = e.var.isFuncDeclaration())
+                found |= f.isNested();
+        }
+        override void visit(DeclarationExp e)
+        {
+            if (e.declaration.isFuncDeclaration())
+                found = true;
+            else
+                super.visit(e);
+        }
+    }
+    if (!fd.fbody)
+        return false;
+    scope v = new NestedFinder();
+    fd.fbody.accept(v);
+    return v.found;
+}
+
+/***********************************************************
  * Test that `fd` can be inlined.
  *
  * Params:
@@ -2374,7 +2424,7 @@ private bool canInline(FuncDeclaration fd, bool hasThis, bool statementsToo, PAS
          fd.toParent().isFuncDeclaration().needThis()) ||
          (fd.isSynchronized() ||
           fd.isImportedSymbol() ||
-          fd.hasNestedFrameRefs() ||
+          fd.hasNestedFrameRefs() && !onlyClosureVars(fd) ||
           (fd.isVirtual() && !fd.isFinalFunc())))
     {
         static if (CANINLINE_LOG)
@@ -2401,6 +2451,9 @@ private bool canInline(FuncDeclaration fd, bool hasThis, bool statementsToo, PAS
         cost = inlineCostFunction(fd, hasThis);
         inlineCosts[cast(void*)fd] = cost;
     }
+    // its variables are referred to only by nested functions whose calls are inlined
+    if (fd.closureVars.length && refersToNested(fd))
+        goto Lno;
     static if (CANINLINE_LOG)
     {
         printf("\tcost = %d for %s\n", cost, fd.toChars());
