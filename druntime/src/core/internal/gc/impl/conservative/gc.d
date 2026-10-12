@@ -507,7 +507,7 @@ class ConservativeGC : GC
 
         if (!(bits & BlkAttr.NO_SCAN))
         {
-            memset(ret.ptr + size, 0, ret.length - size);
+            zeroTail(ret.ptr + size, ret.length - size);
         }
 
         return ret.ptr;
@@ -560,7 +560,7 @@ class ConservativeGC : GC
 
         if (!(bits & BlkAttr.NO_SCAN))
         {
-            memset(retval.base + size, 0, retval.size - size);
+            zeroTail(retval.base + size, retval.size - size);
         }
 
         retval.attr = bits;
@@ -2283,7 +2283,7 @@ struct Gcx
         if (collectInProgress)
             pool.mark.setLocked(biti); // be sure that the child is aware of the page being used
         pool.freebits.clear(biti);
-        if (bits)
+        if (bits & ~BlkAttr.ALIGNMENT_MASK)     // the alignment is not kept
             pool.setBits(biti, bits);
         //debug(PRINTF) printf("\tmalloc => %p\n", p);
         invalidate(p[0 .. alloc_size], 0xF0, true);
@@ -5579,6 +5579,20 @@ void undefinedWrite(T)(ref T var, T value) nothrow
     }
     else
         var = value;
+}
+
+/// Zero the n bytes at p, past what was asked for of a block, as a few words when
+/// they are, the commonest case of small blocks
+pragma(inline, true)
+private void zeroTail(void* p, size_t n) nothrow @nogc
+{
+    if (n <= 64 && !((cast(size_t)p | n) & 7))
+    {
+        foreach (i; 0 .. n / 8)
+            (cast(ulong*)p)[i] = 0;
+    }
+    else
+        memset(p, 0, n);
 }
 
 private void adjustAttrs(ref uint attrs, const TypeInfo ti) nothrow
