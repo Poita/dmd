@@ -2065,6 +2065,16 @@ class TypeInfo_Struct : TypeInfo
         if (mangledName is null) // e.g., opaque structs
             return null;
 
+        /* What the cache allocates may be traced, as with -profile=gc, by asking for the
+         * names of the types allocated, which comes back here: then the name is the
+         * mangled one, which needs no allocation
+         */
+        static bool naming; // per thread
+        if (naming)
+            return mangledName;
+        naming = true;
+        scope (exit) naming = false;
+
         const key = cast(const void*) this; // faster lookup than TypeInfo_Struct, at the cost of potential duplicates per binary
         static string[typeof(key)] demangledNamesCache; // per thread
 
