@@ -285,6 +285,8 @@ public:
             as.reserve(s.statements.length);
         }
 
+        // a break or continue may leave an iteration ending with a return for what follows it
+        const leaves = hasBreakOrContinue(s);
         foreach (sx; s.statements)
         {
             if (!sx)
@@ -296,7 +298,11 @@ public:
                 result = combineInlineSequence(result, r);
 
             if (ids.foundReturn)
-                break;
+            {
+                if (!leaves)
+                    break;
+                ids.foundReturn = false;
+            }
         }
 
         static if (asStatements)
@@ -2555,6 +2561,23 @@ private bool returnsBeforeEnd(FuncDeclaration fd)
     if (v.count == 0)
         return false;
     return v.count > 1 || fd.fbody.endsWithReturnStatement() !is v.last;
+}
+
+/// Whether s has a break or continue anywhere in it
+private bool hasBreakOrContinue(Statement s)
+{
+    import dmd.visitor : SemanticTimeTransitiveVisitor;
+    extern (C++) final class Leaves : SemanticTimeTransitiveVisitor
+    {
+        alias visit = SemanticTimeTransitiveVisitor.visit;
+        bool found;
+        override void visit(BreakStatement s) { found = true; }
+        override void visit(ContinueStatement s) { found = true; }
+        override void visit(Expression e) {}
+    }
+    scope v = new Leaves();
+    s.accept(v);
+    return v.found;
 }
 
 /***********************************************************
