@@ -1134,6 +1134,10 @@ void reconcileCommands(ref Param params, ref Target target, ErrorSink eSink)
     if (target.isAArch64 && driverParams.ibt)
         eSink.error(Loc.initial, "`-fIBT` is only supported for x86 targets");
 
+    // optimizing inlines functions too, as other compilers do at their levels of optimization
+    if (driverParams.optimize)
+        params.useInline = true;
+
     if (target.os & (Target.OS.linux | Target.OS.FreeBSD | Target.OS.OpenBSD | Target.OS.Solaris | Target.OS.DragonFlyBSD | Target.OS.Hurd))
     {
         if (driverParams.lib && driverParams.dll)
