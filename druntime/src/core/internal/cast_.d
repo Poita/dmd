@@ -159,7 +159,17 @@ void* _d_cast(To, From)(From o) @trusted
         }
         else static if (is (To : From))
         {
-            return _d_class_cast!To(o);
+            // an object of the class itself is the common case, checked in place
+            if (o is null)
+                return null;
+            auto oc = typeid(cast() o);
+            auto c = typeid(To);
+            if (oc is c)
+                return cast(void*) o;
+            static if (__traits(isFinalClass, To))
+                return areClassInfosEqual(oc, c) ? cast(void*) o : null;   // no subclass to look for
+            else
+                return _d_class_cast!To(o);
         }
         else
         {
