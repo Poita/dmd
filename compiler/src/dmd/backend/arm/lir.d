@@ -22,7 +22,7 @@ import core.stdc.string;
 
 import dmd.backend.barray;
 import dmd.backend.mem : mem_malloc, mem_free;
-import dmd.backend.blockopt : bo;
+import dmd.backend.blockopt : bo, compdfo, block_calloc;
 import dmd.backend.cc;
 import dmd.backend.cdef;
 import dmd.backend.code;
@@ -135,6 +135,7 @@ enum F : ubyte
     condDef = 4,    // a definition that is made on only some paths through its block
     scaled  = 8,    // ld/st: the index register is shifted left by the log2 of the size
     toX     = 16,   // ld: a signed load extends to 64 bits rather than 32
+    tail    = 16,   // call: in place of returning, the caller's frame released before it
     shifted = 32,   // add/sub/and/orr/eor: b is shifted by imm, LSL, LSR or ASR as cond is 0, 1 or 2
     noreturn = 64,  // call: of a function that does not return, so it destroys nothing that matters
     volatile_ = 128, // ld: of memory that may change by itself, so not merged with another
@@ -314,10 +315,13 @@ bool lirCodegen(ref CGstate cg)
     tlvRegs.setLength(0);
     tlvBlocks.setLength(0);
     switchBlocks.setLength(0);
+    noLocalAddress.setLength(0);
     usesFrame = false;
     switchesFibers = callsFiberSwitch();
     condDepth = 0;
 
+    if (splitReturnConds())
+        compdfo(bo.dfo, bo.startblock);     // for code generation without virtual registers too
     for (block* b = bo.startblock; b; b = b.Bnext)
         blocks.push(b);
     savedDfoidx.setLength(blocks.length);
@@ -343,6 +347,8 @@ bool lirCodegen(ref CGstate cg)
         }
         hasTry |= b.bc == BC.try_;
     }
+    findNoLocalAddress(hasTry);
+    returnCallsInPlace();
     select();
     if (!failed)
     {
@@ -1746,7 +1752,15 @@ private void select()
             case BC.ret:
             case BC.exit:
                 if (b.Belem)
+                {
+                    if (b.bc == BC.ret && tailCallable(b, b.Belem, true))
+                    {
+                        bool tail = true;
+                        genTail(b.Belem, tail);
+                        break;
+                    }
                     genEffect(b.Belem);
+                }
                 break;
 
             case BC.switch_:
@@ -1779,7 +1793,10 @@ private void select()
                     }
                     break;
                 }
-                Reg r = gen(e);
+                bool tail = tailCallable(b, e, false);
+                Reg r = tail ? genTail(e, tail) : gen(e);
+                if (tail)
+                    break;      // the result of the call is the result
                 if (tyfloating(ty))
                 {
                     emitIns(LOp.copy, tysize(ty), phys(32), r);
@@ -3663,6 +3680,208 @@ private void emitLibCall(Symbol* f, Reg[] args)
     c.sym = f;
 }
 
+/* For each block, by its index, whether no path to it from the function's entry
+ * takes the address of a local, so that nothing can refer to the frame there
+ */
+__gshared Barray!bool noLocalAddress;
+
+/* Whether e computes the address of something in the frame
+ */
+@trusted
+private bool takesLocalAddress(elem* e)
+{
+    while (true)
+    {
+        switch (e.Eoper)
+        {
+            case OPrelconst:
+                return !isStatic(e.Vsym);
+            case OPframeptr:
+            case OPstrthis:
+            case OPva_start:
+                return true;
+            default:
+                break;
+        }
+        if (OTleaf(e.Eoper))
+            return false;
+        if (OTbinary(e.Eoper))
+        {
+            if (takesLocalAddress(e.E2))
+                return true;
+        }
+        e = e.E1;
+    }
+}
+
+@trusted
+private void findNoLocalAddress(bool hasTry)
+{
+    noLocalAddress.setLength(blocks.length);
+    // when optimizing, as the frames of the callers go from stack traces; Mach-O relocates a B as it does a BL
+    const allowed = config.flags4 & CFG4optimized && config.objfmt == OBJ_MACH && !hasTry && !(cgp.usednteh & NTEHjmonitor) &&
+        !(config.flags & CFGtrace) && !variadic(funcsym_p.Stype);
+    noLocalAddress[][] = allowed;
+    if (!allowed)
+        return;
+    // the blocks that take an address, then everything reached from them
+    Barray!(block*) work;
+    scope (exit) work.dtor();
+    foreach (b; blocks[])
+        if (b.Belem && takesLocalAddress(b.Belem))
+            work.push(b);
+    while (work.length)
+    {
+        block* b = work[work.length - 1];
+        work.setLength(work.length - 1);
+        foreach (bs; b.Bsucc[])
+            if (noLocalAddress[bs.Bdfoidx])
+            {
+                noLocalAddress[bs.Bdfoidx] = false;
+                work.push(bs);
+            }
+    }
+}
+
+/* Split a block that returns c ? x : y, where x or y is a call that may be made in
+ * place of returning, into one testing c and one returning each, returning whether
+ * any is
+ */
+@trusted
+private bool splitReturnConds()
+{
+    if (!(config.flags4 & CFG4optimized) || config.objfmt != OBJ_MACH)
+        return false;
+    const tyf = tybasic(funcsym_p.Stype.Tnext.Tty);
+    static bool directCall(elem* e, tym_t tyf)
+    {
+        while (e.Eoper == OPcomma)
+            e = e.E2;
+        return (e.Eoper == OPcall || e.Eoper == OPucall) && !e.Ecount && !(e.Nflags & NFLhidden) &&
+            e.E1.Eoper == OPvar && tyfunc(e.E1.Vsym.ty()) && tybasic(e.Ety) == tyf;
+    }
+    bool split;
+    for (block* b = bo.startblock; b; b = b.Bnext)
+    {
+        if (b.bc != BC.retexp || !b.Belem || b.Btry || !scalarType(tyf) || pairType(tyf))
+            continue;
+        // what is evaluated before the condition, and the condition, take no address
+        elem** pe = &b.Belem;
+        bool takes;
+        while ((*pe).Eoper == OPcomma)
+        {
+            takes |= takesLocalAddress((*pe).E1);
+            pe = &(*pe).E2;
+        }
+        elem* e = *pe;
+        if (takes || e.Eoper != OPcond || e.Ecount || e.E2.Ecount || takesLocalAddress(e.E1) ||
+            !(directCall(e.E2.E1, tyf) || directCall(e.E2.E2, tyf)))
+            continue;
+        block* b1 = block_calloc(bo);
+        block* b2 = block_calloc(bo);
+        b1.Belem = e.E2.E1;
+        b2.Belem = e.E2.E2;
+        e.E2.E1 = null;
+        e.E2.E2 = null;
+        *pe = e.E1;
+        e.E1 = null;
+        el_free(e);
+        block*[2] nb = [b1, b2];
+        foreach (n; nb)
+        {
+            n.bc = BC.retexp;
+            n.Bsrcpos = b.Bsrcpos;
+            n.Bpred.push(b);
+            b.Bsucc.push(n);
+        }
+        b.bc = BC.iftrue;
+        b2.Bnext = b.Bnext;
+        b1.Bnext = b2;
+        b.Bnext = b1;
+        split = true;
+    }
+    return split;
+}
+
+/* The optimizer has the returns of a function share a block, which returns a
+ * variable the others assign and jump to it. A block that assigns it a call that
+ * can be made in place of returning returns the call instead
+ */
+@trusted
+private void returnCallsInPlace()
+{
+    foreach (b; blocks[])
+    {
+        if (b.bc != BC.goto_ || !b.Belem || b.Btry || !noLocalAddress[b.Bdfoidx])
+            continue;
+        block* r = b.Bsucc[0];
+        if (r.bc != BC.retexp || !r.Belem || r.Belem.Eoper != OPvar || r.Btry)
+            continue;
+        // the assignment, last in b
+        elem** pa = &b.Belem;
+        while ((*pa).Eoper == OPcomma)
+            pa = &(*pa).E2;
+        elem* a = *pa;
+        if (a.Eoper != OPeq || a.Ecount || a.E1.Eoper != OPvar || a.E1.Vsym != r.Belem.Vsym ||
+            a.E1.Voffset != r.Belem.Voffset || tybasic(a.E1.Ety) != tybasic(r.Belem.Ety))
+            continue;
+        elem* call = a.E2;
+        *pa = call;
+        if (!tailCallable(b, b.Belem, false))
+        {
+            *pa = a;
+            continue;
+        }
+        a.E2 = null;
+        el_free(a);
+        b.bc = BC.retexp;
+        foreach (i, p; r.Bpred[])
+            if (p is b)
+            {
+                r.Bpred.remove(i);
+                break;
+            }
+        b.Bsucc.setLength(0);
+    }
+}
+
+/* Whether e, the value returned by block b (or its effect, if isVoid), can be a call
+ * that releases the frame and jumps to the function called, which returns in its
+ * place: a direct call of a scalar of the type the function returns, which no local
+ * can be referred to after, and with nothing left to do
+ */
+@trusted
+private bool tailCallable(block* b, elem* e, bool isVoid)
+{
+    if (!noLocalAddress[b.Bdfoidx] || takesLocalAddress(e) || b.Btry)
+        return false;
+    while (e.Eoper == OPcomma)
+        e = e.E2;
+    if ((e.Eoper != OPcall && e.Eoper != OPucall) || e.Ecount || e.Nflags & NFLhidden ||
+        e.E1.Eoper != OPvar || !tyfunc(e.E1.Vsym.ty()))
+        return false;
+    const tyr = tybasic(e.Ety);
+    if (tyr == TYnoreturn)
+        return false;
+    if (isVoid)
+        return tybasic(funcsym_p.Stype.Tnext.Tty) == TYvoid;
+    return tyr == tybasic(funcsym_p.Stype.Tnext.Tty) && scalarType(tyr) && !pairType(tyr);
+}
+
+/* Generate e, ending in a call tailCallable() accepts, as a call in place of returning
+ * if tail stays true, otherwise as an ordinary call, returning its value
+ */
+@trusted
+private Reg genTail(elem* e, ref bool tail)
+{
+    while (e.Eoper == OPcomma)
+    {
+        genEffect(e.E1);
+        e = e.E2;
+    }
+    return genCall(e, null, null, null, &tail);
+}
+
 /* The quotient and remainder of OPremquo e
  */
 @trusted
@@ -4459,7 +4678,7 @@ private void insertHoisted()
 /* The call e, returning the register of its result, or in pair a 16 byte result
  */
 @trusted
-private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden = null)
+private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden = null, bool* tail = null)
 {
     if (!pair && !agg && !hidden)
         if (Symbol* s = tlvCall(e))
@@ -4628,6 +4847,8 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
     }
     numpara = (numpara + 7) & ~7;
     const stackArgs = numpara ? (numpara + 15) & ~15 : 0;
+    if (tail && stackArgs)
+        *tail = false;      // the arguments would be in the frame released
     if (stackArgs >= 4096)
     {
         fail("call stack args");
@@ -4760,6 +4981,13 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
 
     auto c = emitIns(LOp.call, 0, noReg, target, noReg, cast(long)argRegs);
     c.sym = sf;
+    if (tail && *tail)
+    {
+        c.flags |= F.tail;
+        if (!sf || sf == funcsym_p || !sf.Sfunc || !(sf.Sfunc.Fflags & Fnothrow))
+            funcsym_p.Sfunc.Fflags &= ~Fnothrow;
+        return noReg;
+    }
     if (tybasic(e.Ety) == TYnoreturn || sf && sf.Sflags & SFLexit)
         c.flags |= F.noreturn;      // as the runtime's array bounds errors
     if (stackArgs)
@@ -11459,6 +11687,8 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
                     fl = s.Sfl;
                 cdb.gencs1(INSTR.branch_imm(1, 0), 0, fl, s);      // BL s
                 code_orflag(cdb.last(), CF.selfrel | CF.off | CF.selfrel26);
+                if (i.flags & F.tail)
+                    code_orflag(cdb.last(), CF.tailcall);
             }
             else
                 cdb.gen1(INSTR.blr(pr(i.a)));                     // BLR a

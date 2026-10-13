@@ -1030,6 +1030,24 @@ void epilog(ref CGstate cg, block* b)
     tym_t tyf = funcsym_p.ty();
     tym_t tym = tybasic(tyf);
     bool farfunc = tyfarfunc(tym) != 0;
+
+    /* A call that ends the block in place of returning becomes a branch after
+     * the epilog, the function called returning to this one's caller
+     */
+    code* tailcall;
+    if (b.Bcode)
+    {
+        code** pc = &b.Bcode;
+        while (code_next(*pc))
+            pc = &(*pc).next;
+        if ((*pc).Iflags & CF.tailcall)
+        {
+            tailcall = *pc;
+            *pc = null;
+            tailcall.Iop &= ~(1 << 31);     // BL to B
+        }
+    }
+
     if (!(b.Bflags & BFL.epilog))       // if no epilog code
         goto Lret;                      // just generate RET
     regx = (b.bc == BC.ret) ? AX : CX;
@@ -1177,7 +1195,10 @@ Lret:
             cg.Para.offset == 0)                      // or nothing pushed on the stack anyway
         {
             if (log) printf("epilog: RET\n");
-            cdbx.gen1(INSTR.ret);       // RET
+            if (tailcall)
+                cdbx.append(tailcall);  // B
+            else
+                cdbx.gen1(INSTR.ret);       // RET
         }
         else
         {   // Stack is always aligned on register size boundary

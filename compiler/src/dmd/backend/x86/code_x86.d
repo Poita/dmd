@@ -306,6 +306,7 @@ enum CF : uint
     add       = 0x1000_0000,
     fixup     = 0x2000_0000,   // needs a fixup
     selfrel26 = 0x4000_0000,   // 26 bit self-relative fixup for BL instruction (BRANCHY26)
+    tailcall  = 0x8000_0000,   // a BL in place of returning, which the epilog makes a B after it
 }
 
 struct code
