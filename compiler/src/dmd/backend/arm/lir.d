@@ -3948,8 +3948,9 @@ private bool tailCallable(block* b, elem* e, bool isVoid)
     if ((e.Eoper != OPcall && e.Eoper != OPucall) || e.Ecount || e.Nflags & NFLhidden ||
         e.E1.Eoper != OPvar || !tyfunc(e.E1.Vsym.ty()))
         return false;
+    // a function that does not return gains nothing, and its caller would go from stack traces
     const tyr = tybasic(e.Ety);
-    if (tyr == TYnoreturn)
+    if (tyr == TYnoreturn || e.E1.Vsym.Sflags & SFLexit)
         return false;
     if (isVoid)
         return tybasic(funcsym_p.Stype.Tnext.Tty) == TYvoid;
