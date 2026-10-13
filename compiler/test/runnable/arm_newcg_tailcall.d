@@ -92,6 +92,14 @@ pragma(inline, false) long right(long n, int k)
     return left(n - 1, k + 2);
 }
 
+// a returned call the code generator expands in place, which is no call to make
+shared ubyte level = 3;
+pragma(inline, false) ubyte loadLevel()
+{
+    import core.atomic : atomicLoad, MemoryOrder;
+    return atomicLoad!(MemoryOrder.acq)(level);
+}
+
 // reads what p points to after using a frame of its own
 pragma(inline, false) int peek(int* p, int k)
 {
@@ -118,6 +126,7 @@ void main()
     assert(ping(10_000_000, 0) == 15_000_000);
     assert(pong(-1, 0) == 5);
     assert(left(10_000_000, 0) != 0);
+    assert(loadLevel() == 3);
     foreach (n; 0 .. 100)
         assert(keep(n) == n * 3 + 9);
 }

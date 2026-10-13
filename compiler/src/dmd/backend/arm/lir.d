@@ -3780,6 +3780,59 @@ private void findNoLocalAddress(bool hasTry)
     }
 }
 
+/* A change to the blocks made for code generation, undone after it so that what
+ * is kept of the function, as for inlining, is as the optimizer left it
+ */
+struct BlockChange
+{
+    enum Kind : ubyte { returnCall, splitCond }
+    Kind kind;
+    block* b, r, b1, b2;
+    elem** pe;      // where in b's tree e was
+    elem* e;        // the assignment of the call, or the conditional
+}
+
+__gshared Barray!BlockChange blockChanges;
+
+/* Undo the changes to the blocks of the function code was just generated for
+ */
+@trusted
+void lirUndoBlockChanges()
+{
+    if (!blockChanges.length)
+        return;
+    foreach_reverse (ref u; blockChanges[])
+    {
+        final switch (u.kind)
+        {
+            case BlockChange.Kind.returnCall:
+                *u.pe = u.e;
+                u.b.bc = BC.goto_;
+                u.b.Bsucc.push(u.r);
+                u.r.Bpred.push(u.b);
+                break;
+
+            case BlockChange.Kind.splitCond:
+                u.e.E1 = *u.pe;
+                u.e.E2.E1 = u.b1.Belem;
+                u.e.E2.E2 = u.b2.Belem;
+                *u.pe = u.e;
+                u.b.bc = BC.retexp;
+                u.b.Bsucc.setLength(0);
+                u.b.Bnext = u.b2.Bnext;
+                block*[2] nb = [u.b1, u.b2];
+                foreach (n; nb)
+                {
+                    n.Belem = null;
+                    n.Bpred.setLength(0);
+                }
+                break;
+        }
+    }
+    blockChanges.setLength(0);
+    compdfo(bo.dfo, bo.startblock);
+}
+
 /* Split a block that returns c ? x : y, where x or y is a call that may be made in
  * place of returning, into one testing c and one returning each, returning whether
  * any is
@@ -3818,11 +3871,9 @@ private bool splitReturnConds()
         block* b2 = block_calloc(bo);
         b1.Belem = e.E2.E1;
         b2.Belem = e.E2.E2;
-        e.E2.E1 = null;
-        e.E2.E2 = null;
         *pe = e.E1;
-        e.E1 = null;
-        el_free(e);
+        BlockChange u = { kind: BlockChange.Kind.splitCond, b: b, b1: b1, b2: b2, pe: pe, e: e };
+        blockChanges.push(u);
         block*[2] nb = [b1, b2];
         foreach (n; nb)
         {
@@ -3869,8 +3920,6 @@ private void returnCallsInPlace()
             *pa = a;
             continue;
         }
-        a.E2 = null;
-        el_free(a);
         b.bc = BC.retexp;
         foreach (i, p; r.Bpred[])
             if (p is b)
@@ -3879,6 +3928,8 @@ private void returnCallsInPlace()
                 break;
             }
         b.Bsucc.setLength(0);
+        BlockChange u = { kind: BlockChange.Kind.returnCall, b: b, r: r, pe: pa, e: a };
+        blockChanges.push(u);
     }
 }
 
@@ -4720,6 +4771,10 @@ private void insertHoisted()
 @trusted
 private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden = null, bool* tail = null)
 {
+    // tail is set again only where the call is made in place of returning
+    const wantTail = tail && *tail;
+    if (tail)
+        *tail = false;
     if (!pair && !agg && !hidden)
         if (Symbol* s = tlvCall(e))
         {
@@ -4887,8 +4942,7 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
     }
     numpara = (numpara + 7) & ~7;
     const stackArgs = numpara ? (numpara + 15) & ~15 : 0;
-    if (tail && stackArgs)
-        *tail = false;      // the arguments would be in the frame released
+    // with arguments on the stack, they would be in the frame released
     if (stackArgs >= 4096)
     {
         fail("call stack args");
@@ -5021,8 +5075,9 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
 
     auto c = emitIns(LOp.call, 0, noReg, target, noReg, cast(long)argRegs);
     c.sym = sf;
-    if (tail && *tail)
+    if (wantTail && !stackArgs)
     {
+        *tail = true;
         c.flags |= F.tail;
         if (!sf || sf == funcsym_p || !sf.Sfunc || !(sf.Sfunc.Fflags & Fnothrow))
             funcsym_p.Sfunc.Fflags &= ~Fnothrow;

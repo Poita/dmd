@@ -1048,6 +1048,10 @@ void writefunc2(Symbol* sfunc, ref GlobalOptimizer go, ref BlockOpt bo)
     //printf("codgen()\n");
     codgen(sfunc);                  // generate code
     //printf("after codgen for %s Coffset %x\n",sfunc.Sident.ptr,Offset(cseg));
+    {
+        import dmd.backend.arm.lir : lirUndoBlockChanges;
+        lirUndoBlockChanges();      // what is kept of the blocks is as the optimizer left them
+    }
     sfunc.Sfunc.Fstartblock = bo.startblock;
     bool saveForInlining = canInlineFunction(sfunc);
     if (saveForInlining)
