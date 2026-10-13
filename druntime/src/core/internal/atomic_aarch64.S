@@ -117,6 +117,32 @@ CSYM(_d_aarch64_fetchadd8):
         ldaddal x1, x0, [x0]
         ret
 
+/* T fetchor(T* p, T value), returns the previous value */
+        .text
+        .global CSYM(_d_aarch64_fetchor1)
+        .p2align  2
+CSYM(_d_aarch64_fetchor1):
+        ldsetalb w1, w0, [x0]
+        ret
+        .text
+        .global CSYM(_d_aarch64_fetchor2)
+        .p2align  2
+CSYM(_d_aarch64_fetchor2):
+        ldsetalh w1, w0, [x0]
+        ret
+        .text
+        .global CSYM(_d_aarch64_fetchor4)
+        .p2align  2
+CSYM(_d_aarch64_fetchor4):
+        ldsetal w1, w0, [x0]
+        ret
+        .text
+        .global CSYM(_d_aarch64_fetchor8)
+        .p2align  2
+CSYM(_d_aarch64_fetchor8):
+        ldsetal x1, x0, [x0]
+        ret
+
 /* T exchange(T* p, T value), returns the previous value */
         .text
         .global CSYM(_d_aarch64_exchange1)

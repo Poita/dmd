@@ -10,6 +10,10 @@ module core.internal.gc.bits;
 import core.internal.gc.os;
 
 import core.bitop;
+
+// an atomic or of a word, giving what it was: core.internal.atomic's, as one instruction
+version (DigitalMars) version (AArch64)
+    private extern (C) ulong _d_aarch64_fetchor8(void* p, ulong value) pure nothrow @nogc @trusted;
 import core.exception : onOutOfMemoryError;
 import core.stdc.stdlib : calloc, free;
 import core.stdc.string : memcpy, memset;
@@ -131,6 +135,12 @@ struct GCBits
                 bts qword ptr[RAX], RDX;
                 sbb RAX,RAX;
             }
+        }
+        else version (AArch64)
+        {
+            const pos = i >> BITS_SHIFT;
+            const mask = BITS_1 << (i & BITS_MASK);
+            return (_d_aarch64_fetchor8(cast(void*)(data + pos), mask) & mask) != 0;
         }
         else
         {

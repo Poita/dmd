@@ -124,7 +124,7 @@ enum LOp : ubyte
 }
 
 /// The atomic operations, sequentially consistent, druntime's _d_aarch64_* functions are
-enum AtomicOp : ubyte { load, store, fetchAdd, exchange, cas, fence, pause }
+enum AtomicOp : ubyte { load, store, fetchAdd, exchange, cas, fence, pause, fetchOr }
 
 /// Flags of an instruction
 enum F : ubyte
@@ -3432,6 +3432,7 @@ private bool atomicCall(const Symbol* s, size_t np, out AtomicOp op, out uint si
         case "load":     op = AtomicOp.load;     return np == 1;
         case "store":    op = AtomicOp.store;    return np == 2;
         case "fetchadd": op = AtomicOp.fetchAdd; return np == 2;
+        case "fetchor":  op = AtomicOp.fetchOr;  return np == 2;
         case "exchange": op = AtomicOp.exchange; return np == 2;
         case "cas":      op = AtomicOp.cas;      return np == 3;
         default:         return false;
@@ -3460,6 +3461,7 @@ private Reg genAtomic(AtomicOp op, uint size, elem*[] params)
             i.b = args[1];
             break;
         case AtomicOp.fetchAdd:
+        case AtomicOp.fetchOr:
         case AtomicOp.exchange:
             i.d = d;
             i.b = args[1];
@@ -11105,10 +11107,13 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
                     cdb.gen1(sz | 0x089F_FC00 | rn | pr(i.b));                  // STLR b,[a]
                     break;
                 case AtomicOp.fetchAdd:
+                case AtomicOp.fetchOr:
                 case AtomicOp.exchange:
                     def(pr(i.d));
-                    // LDADDAL b,x16,[a] or SWPAL b,x16,[a]
-                    cdb.gen1(sz | (i.cond == AtomicOp.fetchAdd ? 0x38E0_0000 : 0x38E0_8000) | (pr(i.b) << 16) | rn | 16);
+                    // LDADDAL b,x16,[a], LDSETAL b,x16,[a] or SWPAL b,x16,[a]
+                    const uint opc = i.cond == AtomicOp.fetchAdd ? 0x38E0_0000 :
+                                     i.cond == AtomicOp.fetchOr ? 0x38E0_3000 : 0x38E0_8000;
+                    cdb.gen1(sz | opc | (pr(i.b) << 16) | rn | 16);
                     cdb.gen1(INSTR.mov_register(1, 16, pr(i.d)));
                     break;
                 case AtomicOp.cas:

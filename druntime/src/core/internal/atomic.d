@@ -55,6 +55,11 @@ version (AArch64)
             uint   _d_aarch64_fetchadd4(void* p, uint value);
             ulong  _d_aarch64_fetchadd8(void* p, ulong value);
 
+            ubyte  _d_aarch64_fetchor1(void* p, ubyte value);
+            ushort _d_aarch64_fetchor2(void* p, ushort value);
+            uint   _d_aarch64_fetchor4(void* p, uint value);
+            ulong  _d_aarch64_fetchor8(void* p, ulong value);
+
             ubyte  _d_aarch64_exchange1(void* p, ubyte value);
             ushort _d_aarch64_exchange2(void* p, ushort value);
             uint   _d_aarch64_exchange4(void* p, uint value);
