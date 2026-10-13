@@ -26,10 +26,17 @@ shared struct SpinLock
         this.contention = contention;
     }
 
+    pragma(inline, true)
     void lock()
     {
-        if (cas(&val, size_t(0), size_t(1)))
-            return;
+        if (!cas(&val, size_t(0), size_t(1)))
+            lockContended();
+    }
+
+    /// lock() when the first try fails, waiting
+    void lockContended()
+    {
+        version (DigitalMars) pragma(inline, false);
         // Try to reduce the chance of another cas failure
         // TTAS lock (https://en.wikipedia.org/wiki/Test_and_test-and-set)
         immutable step = 1 << contention;
