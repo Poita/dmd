@@ -491,6 +491,16 @@ class ConservativeGC : GC
             return null;
         }
 
+        // a small block without metadata, as an object or a struct without a destructor
+        if (plainSmall(size, bits, ti))
+        {
+            size_t allocSize = void;
+            void* p = smallAllocLocked(size, bits, allocSize, ti);
+            if (!(bits & BlkAttr.NO_SCAN))
+                zeroTail(p + size, allocSize - size);
+            return p;
+        }
+
         adjustAttrs(bits, ti);
 
         auto alignAttr = cast(BlkAttr)(bits & BlkAttr.ALIGNMENT_MASK);
@@ -522,6 +532,39 @@ class ConservativeGC : GC
         return ret.ptr;
     }
 
+
+    /* Whether a block of size bytes with bits is a small one needing nothing but a
+     * free block of its bin: no metadata, as of arrays or of struct destructors, no
+     * alignment beyond the bins', and no debugging that adds to blocks
+     */
+    pragma(inline, true)
+    private static bool plainSmall(size_t size, uint bits, const TypeInfo ti) nothrow
+    {
+        debug (SENTINEL) return false;
+        else debug (LOGGING) return false;
+        else debug (PROFILE_API) return false;
+        else
+        {
+            if (size > PAGESIZE / 2 || (bits & BlkAttr.ALIGNMENT_MASK) > BlkAttr.ALIGNMENT_16 ||
+                bits & (BlkAttr.APPENDABLE | BlkAttr.STRUCTFINAL))
+                return false;
+            // what adjustAttrs() changes: the finalizer of a struct needs its type kept
+            return !(bits & BlkAttr.FINALIZE) || ti is null || typeid(ti) !is typeid(TypeInfo_Struct);
+        }
+    }
+
+    /* A small block from its bin, under the lock: mallocNoSync() for plainSmall() blocks,
+     * its variables kept in registers
+     */
+    private void* smallAllocLocked(size_t size, uint bits, out size_t allocSize, const TypeInfo ti) nothrow
+    {
+        lockNR();
+        scope (failure) gcLock.unlock();
+        void* p = gcx.smallAlloc(size, allocSize, bits, ti);
+        threadState.bytesAllocated += allocSize;
+        gcLock.unlock();
+        return p;
+    }
 
     //
     // Implementation for malloc and calloc.
@@ -564,6 +607,18 @@ class ConservativeGC : GC
         }
 
         BlkInfo retval;
+
+        if (plainSmall(size, bits & ~BlkAttr.APPENDABLE, ti))
+        {
+            size_t allocSize = void;
+            void* p = smallAllocLocked(size, bits, allocSize, ti);
+            if (!(bits & BlkAttr.NO_SCAN))
+                zeroTail(p + size, allocSize - size);
+            retval.base = p;
+            retval.size = allocSize;
+            retval.attr = bits;
+            return retval;
+        }
 
         retval.base = runLocked!(mallocNoSync, mallocTime, numMallocs)(size, bits, retval.size, ti);
 
