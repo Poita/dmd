@@ -11,6 +11,8 @@ T modv(T)(T a, T b) { return cast(T)(a % b); }
 
 pragma(inline, false) T divc(T, T d)(T a) { return cast(T)(a / d); }
 pragma(inline, false) T modc(T, T d)(T a) { return cast(T)(a % d); }
+pragma(inline, false) bool divisible(T, T d)(T a) { return a % d == 0; }
+pragma(inline, false) bool notDivisible(T, T d)(T a) { return a % d != 0; }
 
 __gshared int failures;
 
@@ -22,6 +24,11 @@ void check(T, T d)(T a)
     const r = modc!(T, d)(a);
     const wq = pd(a, d);
     const wr = pm(a, d);
+    if (divisible!(T, d)(a) != (wr == 0) || notDivisible!(T, d)(a) != (wr != 0))
+    {
+        printf("%s %lld %% %lld == 0 wrong\n", T.stringof.ptr, cast(long) a, cast(long) d);
+        ++failures;
+    }
     if (q != wq || r != wr)
     {
         printf("%s %lld / %lld: %lld %lld, want %lld %lld\n", T.stringof.ptr, cast(long) a, cast(long) d,
@@ -79,6 +86,14 @@ pragma(inline, false) ulong byBillion(ulong t) { return t / 1_000_000_000; }
 pragma(inline, false) uint byTen(uint t) { return t % 10; }
 pragma(inline, false) long bySeven(long t) { return t / 7; }
 pragma(inline, false) int byEight(int t) { return t / 8; }
+pragma(inline, false) bool isLeap(int y) { return y % 4 == 0 && (y % 100 != 0 || y % 400 == 0); }
+pragma(inline, false) bool by10(ulong v) { return v % 10 == 0; }
+pragma(inline, false) ulong carry(uint[] r, ulong t)
+{
+    // quotient and remainder of the same operands, computed together
+    r[0] = cast(uint)(t % 1_000_000_000);
+    return t / 1_000_000_000;
+}
 
 // Whether the code of f, up to its first return, divides
 bool divides(void* f)
@@ -86,6 +101,16 @@ bool divides(void* f)
     const(uint)* p = cast(const(uint)*) f;
     for (; *p != 0xD65F03C0; ++p)
         if ((*p & 0x7FE0_F800) == 0x1AC0_0800)
+            return true;
+    return false;
+}
+
+// Whether the code of f, up to its first return, computes a remainder with MSUB
+bool remainders(void* f)
+{
+    const(uint)* p = cast(const(uint)*) f;
+    for (; *p != 0xD65F03C0; ++p)
+        if ((*p & 0x7FE0_8000) == 0x1B00_8000)
             return true;
     return false;
 }
@@ -106,11 +131,19 @@ void main()
     assert(byTen(1234) == 4);
     assert(bySeven(-50) == -7);
     assert(byEight(-15) == -1);
+    foreach (y; -2000 .. 2500)
+        assert(isLeap(y) == ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0));
+    assert(by10(1230) && !by10(1231));
+    uint[1] r;
+    assert(carry(r[], 12_345_678_901_234) == 12_345 && r[0] == 678_901_234);
     version (AArch64)
     {
         assert(!divides(&byBillion));
         assert(!divides(&byTen));
         assert(!divides(&bySeven));
         assert(!divides(&byEight));
+        assert(!divides(&carry));
+        assert(!remainders(&isLeap));
+        assert(!remainders(&by10));
     }
 }

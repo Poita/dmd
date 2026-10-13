@@ -2237,6 +2237,14 @@ private bool absCompare(elem* e, out elem* x, out elem* s)
 @trusted
 private void valueCond(elem* e, bool jumpIfTrue, scope void delegate(COND) nothrow jump)
 {
+    if (isConstMod(e))
+    {
+        if (const c = divisibility(e, !jumpIfTrue))
+        {
+            jump(c);
+            return;
+        }
+    }
     Reg r;
     if (pairType(e.Ety))
     {
@@ -2325,6 +2333,11 @@ private COND compare(elem* e)
         }
 
         const sz = tysize(ty);
+        if ((c == eq || c == ne) && e2.Eoper == OPconst && el_tolong(e2) == 0 && isConstMod(e1))
+        {
+            if (const cd = divisibility(e1, c == eq))
+                return cd;
+        }
         Reg a = gen(e1);
         if (sz < 4)
             a = extend(a, ty, 4);
@@ -2343,6 +2356,74 @@ private COND compare(elem* e)
         emitIns(LOp.cmp, sz <= 4 ? 4 : 8, noReg, a, b);
         return c;
     }
+}
+
+/* Whether e is an integer remainder by a constant, its value used nowhere else
+ */
+@trusted
+private bool isConstMod(elem* e)
+{
+    return e.Eoper == OPmod && e.E2.Eoper == OPconst && !e.Ecount && tyintegral(e.Ety);
+}
+
+/* For e, x % d with d constant, set the flags to whether d divides x without computing
+ * the remainder, returning the condition that is true when it does (or, if !divides,
+ * when it does not), or 0 to compute the remainder after all.
+ * A power of 2 tests the low bits. Otherwise, with d = d0 * 2**k for odd d0, whose
+ * inverse modulo 2**N is inv, x * inv maps the multiples of d to the smallest values
+ * after rotating out the k bits that are zero for multiples of 2**k: for unsigned x,
+ * rotr(x * inv, k) <= (2**N - 1) / d, and for signed x the multiples of d from
+ * -A * d to A * d, A = 2**(N-1) / d, shifted by A, rotr(x * inv + (A << k), k) <= 2 * A
+ */
+@trusted
+private COND divisibility(elem* e, bool divides)
+{
+    import core.bitop : bsf;
+
+    const ty = tybasic(e.E1.Ety);
+    const sz = tysize(ty);
+    const uns = tyuns(ty) || tyuns(e.E2.Ety);
+    const isz = sz <= 4 ? 4 : 8;
+    const N = isz * 8;
+    ulong dv = divisor(el_tolong(e.E2), sz, !uns);
+    if (!uns && cast(long)dv < 0)
+        dv = -dv;
+    if (isz == 4)
+        dv = cast(uint)dv;
+    if (dv <= 1 || (!uns && dv >> (N - 1) && (dv & (dv - 1))))
+        return cast(COND)0;
+
+    Reg a = gen(e.E1);
+    if (sz < 4)
+        a = extendFrom(a, sz * 8, !uns, 4);
+    if (!(dv & (dv - 1)))
+    {
+        emitIns(LOp.tsti, isz, noReg, a, noReg, dv - 1);
+        return divides ? COND.eq : COND.ne;
+    }
+    const k = bsf(dv);
+    const ulong d0 = dv >> k;
+    ulong inv = d0;                     // correct to 3 bits, each step doubles that
+    foreach (i; 0 .. 5)
+        inv *= 2 - d0 * inv;
+    const ulong mask = N == 64 ? ulong.max : (1UL << N) - 1;
+    Reg t = op2(LOp.mul, isz, a, constReg(inv & mask, isz));
+    ulong bound;
+    if (uns)
+        bound = mask / dv;
+    else
+    {
+        const ulong A = (1UL << (N - 1)) / dv;
+        t = op2(LOp.add, isz, t, constReg((A << k) & mask, isz));
+        bound = 2 * A;
+    }
+    if (k)
+        t = opImm(LOp.rori, isz, t, k);
+    if (bound < 4096)
+        emitIns(LOp.cmpi, isz, noReg, t, noReg, bound);
+    else
+        emitIns(LOp.cmp, isz, noReg, t, constReg(bound, isz));
+    return divides ? COND.ls : COND.hi;
 }
 
 /* Evaluate e after a value in r whose register variable e may assign,
@@ -3591,7 +3672,22 @@ private void divMod(elem* e, out Reg q, out Reg r)
     const sz = tysize(ty1);
     const uns = tyuns(ty1) || tyuns(e.E2.Ety);
     Reg a, b;
-    if (ERTOL(e))
+    if (e.E2.Eoper == OPconst)
+    {
+        a = gen(e.E1);
+        if (sz < 4)
+            a = extendFrom(a, sz * 8, !uns, 4);
+        const dv = divisor(el_tolong(e.E2), sz, !uns);
+        const isz = sz <= 4 ? 4 : 8;
+        q = uns ? udivConst(a, dv, isz, false) : sdivConst(a, cast(long)dv, isz, false);
+        if (q)
+        {
+            r = remainder(a, q, dv, isz);
+            return;
+        }
+        b = gen(e.E2);
+    }
+    else if (ERTOL(e))
     {
         b = gen(e.E2);
         a = gen(e.E1);
@@ -4070,6 +4166,16 @@ private Reg genx(elem* e)
         case OPbool:
         {
             elem* e1 = e.E1;
+            if (isConstMod(e1))
+            {
+                if (const c = divisibility(e1, op == OPnot))
+                {
+                    Reg d = newVreg(RC.gp, sz);
+                    auto i = emitIns(LOp.cset, 4, d);
+                    i.cond = c;
+                    return d;
+                }
+            }
             Reg a = gen(e1);
             if (tyfloating(e1.Ety))
                 emitIns(LOp.fcmpz, tysize(e1.Ety), noReg, a);
@@ -4833,9 +4939,7 @@ private Reg arith(OPER op, tym_t ty, Reg a, elem* e2, Reg b, tym_t ty1)
             {
                 const signed = lop == LOp.sdiv;
                 Reg x = sz < 4 ? extendFrom(a, sz * 8, signed, 4) : a;
-                const bits = sz * 8;
-                const ulong dv = signed ? cast(ulong)((v << (64 - bits)) >> (64 - bits))
-                                        : bits == 64 ? v : v & ((1UL << bits) - 1);
+                const dv = divisor(v, sz, signed);
                 const isMod = op == OPmod || op == OPmodass;
                 Reg q = signed ? sdivConst(x, cast(long)dv, isz, isMod) : udivConst(x, dv, isz, isMod);
                 if (q)
@@ -4872,6 +4976,16 @@ private Reg arith(OPER op, tym_t ty, Reg a, elem* e2, Reg b, tym_t ty1)
     }
     emitIns(lop, isz, d, a, b);
     return d;
+}
+
+/* The constant v as a divisor of sz bytes, sign or zero extended to 64 bits
+ */
+private ulong divisor(ulong v, uint sz, bool signed)
+{
+    const bits = sz * 8;
+    if (bits == 64)
+        return v;
+    return signed ? cast(ulong)((cast(long)v << (64 - bits)) >> (64 - bits)) : v & ((1UL << bits) - 1);
 }
 
 /* A new register of size sz holding v
@@ -4997,7 +5111,14 @@ private Reg sdivConst(Reg a, long dv, uint sz, bool isMod)
         // a negative a is biased by ad - 1 to round toward zero
         const k = bsf(ad);
         Reg bias = opImm(LOp.lsri, sz, opImm(LOp.asri, sz, a, N - 1), N - k);
-        q = opImm(LOp.asri, sz, op2(LOp.add, sz, a, bias), k);
+        Reg t = op2(LOp.add, sz, a, bias);
+        if (isMod)
+        {
+            // the remainder is a less a rounded toward zero to a multiple of ad, whatever dv's sign
+            const ulong down = sz == 4 ? cast(uint)-ad : -ad;
+            return op2(LOp.sub, sz, a, opImm(LOp.andi, sz, t, down));
+        }
+        q = opImm(LOp.asri, sz, t, k);
     }
     else
     {
