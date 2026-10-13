@@ -69,6 +69,7 @@ enum LOp : ubyte
     addi, subi, lsli, lsri, asri, andi, orri, eori, rori,          // d = a op imm
     msub,           // d = c - a * b
     madd,           // d = c + a * b
+    bfi,            // d = a with the imm >> 8 bits from bit imm & 0xFF replaced by the low bits of b, sz 8
     neg,            // d = -a
     mvn,            // d = ~a
     sext,           // d = a sign extended from imm bits
@@ -1002,8 +1003,12 @@ private void assignAggregates()
     Barray!AggregateABI abis;
     abis.setLength(globsym.length);
     Barray!bool ok;
+    Barray!bool fields;     // whether a field of each is assigned apart
     ok.setLength(globsym.length);
     ok[][] = false;
+    fields.setLength(globsym.length);
+    fields[][] = false;
+    scope (exit) fields.dtor();
     bool any;
     foreach (k, s; globsym[])
     {
@@ -1054,14 +1059,14 @@ private void assignAggregates()
         return;
     }
 
-    void walk(const(elem)* e, bool isWrite = false)
+    void walk(const(elem)* e, bool isWrite = false, bool fieldOk = true)
     {
         while (1)
         {
             if (OTassign(e.Eoper) && e.E1.Eoper == OPvar)
             {
                 // the target is written, and for op= also read, at the same size
-                walk(e.E1, true);
+                walk(e.E1, true, e.Eoper == OPeq);
                 if (OTbinary(e.Eoper))
                 {
                     e = e.E2;
@@ -1090,8 +1095,18 @@ private void assignAggregates()
                         // a part of a pair, read in its low bytes or written whole
                         good = (e.Voffset == 0 || e.Voffset == 8) && !tyfloating(e.Ety) && scalarType(e.Ety) &&
                                (isWrite ? sz == 8 : sz <= 8);
-                    else if (e.Eoper == OPvar)
-                        good = e.Voffset == 0 && !tyfloating(e.Ety) && scalarType(e.Ety) && sz == a.size;
+                    else if (e.Eoper == OPvar && !tyfloating(e.Ety) && scalarType(e.Ety) && !pairType(e.Ety))
+                    {
+                        // the whole, or an integer field read or assigned
+                        good = e.Voffset == 0 && sz == a.size;
+                        if (!good && fieldOk && (sz == 1 || sz == 2 || sz == 4) && e.Voffset % sz == 0 &&
+                            e.Voffset + sz <= a.size)
+                        {
+                            good = true;
+                            if (isWrite)
+                                fields[k] = true;
+                        }
+                    }
                     if (!good)
                     {
                         ok[k] = false;
@@ -1131,6 +1146,7 @@ private void assignAggregates()
             av.slots[j] = r;
         }
         av.sym = s;
+        av.fields = fields[k];
         symAgg[k] = cast(int)aggs.length;
         aggs.push(av);
     }
@@ -1173,6 +1189,24 @@ private Reg varRegOf(const(elem)* e)
         return av.slots[e.Voffset / 8];
     }
     return noReg;
+}
+
+/* The aggregate variable held in one integer register whose field e is, apart from
+ * the rest of it, setting the field's lowest bit and number of bits, or null
+ */
+@trusted
+private AggVar* aggField(const(elem)* e, out uint lsb, out uint width)
+{
+    auto av = aggOf(e.Vsym);
+    if (!av || av.abi.kind != AggregateABI.Kind.gpr || av.abi.nregs != 1 || tyaggregate(e.Ety) ||
+        tyfloating(e.Ety) || !scalarType(e.Ety))
+        return null;
+    const sz = tysize(e.Ety);
+    if (e.Voffset == 0 && sz >= av.abi.size)
+        return null;
+    lsb = cast(uint)e.Voffset * 8;
+    width = sz * 8;
+    return av;
 }
 
 /* Whether e is one or two elements of an HFA variable held in registers viewed as an
@@ -1278,6 +1312,8 @@ private void finishVariables()
     foreach (ref av; aggs[])
     {
         Symbol* s = av.sym;
+        if (av.fields && s.Sclass != SC.fastpar)
+            emitIns(LOp.movi, 8, av.slots[0], noReg, noReg, 0);
         if (s.Sclass != SC.fastpar)
             continue;
         s.Sfl = FL.reg;
@@ -2755,6 +2791,7 @@ struct AggVar
     AggregateABI abi;
     Reg[4] slots;
     Symbol* sym;
+    bool fields;        // in one register with fields written apart, so made zero on entry
 }
 
 /* An aggregate value: the registers of an aggregate variable, the registers it is
@@ -4222,6 +4259,9 @@ private Reg genx(elem* e)
             }
             if (Reg r = hfaReadAsInteger(e))
                 return r;
+            uint lsb, width;
+            if (auto av = aggField(e, lsb, width))
+                return lsb ? opImm(LOp.lsri, 8, av.slots[0], lsb) : av.slots[0];
             if (Reg r = varRegOf(e))
                 return asClass(r, rc, sz);
             Reg d = newVreg(rc, sz);
@@ -5063,6 +5103,17 @@ private Reg genAssign(elem* e)
     }
     if (e1.Eoper == OPvar)
     {
+        uint lsb, width;
+        if (auto av = aggField(e1, lsb, width))
+        {
+            Reg v = gen(e.E2);
+            Reg r = av.slots[0];
+            Reg d = newVreg(RC.gp, 8);
+            emitIns(LOp.bfi, 8, d, r, v, lsb | width << 8);
+            copyOut(r, d, 8);
+            hintCopy(r, d);
+            return v;
+        }
         if (Reg r = varRegOf(e1))
         {
             Reg v = gen(e.E2);
@@ -9495,7 +9546,7 @@ private bool pureOp(ref const LIns i)
     {
         case LOp.add: .. case LOp.rorv:
         case LOp.addi: .. case LOp.rori:
-        case LOp.msub, LOp.madd, LOp.neg, LOp.mvn, LOp.sext, LOp.zext:
+        case LOp.msub, LOp.madd, LOp.neg, LOp.mvn, LOp.sext, LOp.zext, LOp.bfi:
         case LOp.fadd, LOp.fsub, LOp.fmul, LOp.fdiv, LOp.fneg, LOp.fabs, LOp.fsqrt:
         case LOp.scvtf, LOp.ucvtf, LOp.fcvtzs, LOp.fcvtzu, LOp.fcvtms, LOp.fcvt:
         case LOp.lea:
@@ -11101,6 +11152,30 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
             const d = pr(i.d);
             def(d);
             cdb.gen1(INSTR.madd(sf, pr(i.b), pr(i.c), pr(i.a), d));
+            break;
+        }
+
+        case LOp.bfi:           // BFI d,b,#lsb,#width, d first a
+        {
+            const d = pr(i.d);
+            def(d);
+            const a = pr(i.a), b = pr(i.b);
+            const lsb = cast(uint)i.imm & 0xFF, width = cast(uint)(i.imm >> 8);
+            const insert = (reg_t to) => INSTR.bitfield(1, 1, 1, (64 - lsb) & 63, width - 1, b, to);
+            if (d == a)
+                cdb.gen1(insert(d));
+            else if (d != b)
+            {
+                cdb.gen1(INSTR.mov_register(1, a, d));
+                cdb.gen1(insert(d));
+            }
+            else
+            {
+                // through x16, which holds nothing allocated
+                cdb.gen1(INSTR.mov_register(1, a, 16));
+                cdb.gen1(insert(16));
+                cdb.gen1(INSTR.mov_register(1, 16, d));
+            }
             break;
         }
 
