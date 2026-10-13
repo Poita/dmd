@@ -65,6 +65,7 @@ enum LOp : ubyte
     movi,           // d = imm
     fmovi,          // d = the float or double whose bits are imm
     add, sub, mul, sdiv, udiv, and_, orr, eor, lslv, lsrv, asrv, rorv, // d = a op b
+    umulh, smulh,   // d = the high 64 bits of the 128 bit product a * b, sz 8
     addi, subi, lsli, lsri, asri, andi, orri, eori, rori,          // d = a op imm
     msub,           // d = c - a * b
     madd,           // d = c + a * b
@@ -4828,6 +4829,18 @@ private Reg arith(OPER op, tym_t ty, Reg a, elem* e2, Reg b, tym_t ty1)
                 emitIns(iop, isz, d, a, noReg, v);
                 return d;
             }
+            if (lop == LOp.sdiv || lop == LOp.udiv)
+            {
+                const signed = lop == LOp.sdiv;
+                Reg x = sz < 4 ? extendFrom(a, sz * 8, signed, 4) : a;
+                const bits = sz * 8;
+                const ulong dv = signed ? cast(ulong)((v << (64 - bits)) >> (64 - bits))
+                                        : bits == 64 ? v : v & ((1UL << bits) - 1);
+                const isMod = op == OPmod || op == OPmodass;
+                Reg q = signed ? sdivConst(x, cast(long)dv, isz, isMod) : udivConst(x, dv, isz, isMod);
+                if (q)
+                    return q;
+            }
         }
         b = gen(e2);
     }
@@ -4859,6 +4872,164 @@ private Reg arith(OPER op, tym_t ty, Reg a, elem* e2, Reg b, tym_t ty1)
     }
     emitIns(lop, isz, d, a, b);
     return d;
+}
+
+/* A new register of size sz holding v
+ */
+@trusted
+private Reg constReg(ulong v, uint sz)
+{
+    Reg r = newVreg(RC.gp, sz);
+    emitIns(LOp.movi, sz, r, noReg, noReg, sz == 4 ? cast(uint)v : v);
+    return r;
+}
+
+/* d = a op imm, of size sz
+ */
+@trusted
+private Reg opImm(LOp op, uint sz, Reg a, long imm)
+{
+    Reg d = newVreg(RC.gp, sz);
+    emitIns(op, sz, d, a, noReg, imm);
+    return d;
+}
+
+/* d = a op b, of size sz
+ */
+@trusted
+private Reg op2(LOp op, uint sz, Reg a, Reg b)
+{
+    Reg d = newVreg(RC.gp, sz);
+    emitIns(op, sz, d, a, b);
+    return d;
+}
+
+/* a - q * dv, of size sz
+ */
+@trusted
+private Reg remainder(Reg a, Reg q, ulong dv, uint sz)
+{
+    Reg d = newVreg(RC.gp, sz);
+    auto i = emitIns(LOp.msub, sz, d, q, constReg(dv, sz));
+    i.c = a;
+    return d;
+}
+
+/* The unsigned quotient (or remainder if isMod) of the sz byte a by the constant dv,
+ * without a divide instruction: a multiply by a fixed point reciprocal of dv and shifts
+ * (Granlund and Montgomery, "Division by Invariant Integers using Multiplication").
+ * noReg if dv is 0 or 1
+ */
+@trusted
+private Reg udivConst(Reg a, ulong dv, uint sz, bool isMod)
+{
+    import core.bitop : bsf;
+    import dmd.backend.divcoeff : choose_multiplier, udiv_coefficients;
+
+    if (dv <= 1)
+        return noReg;
+    const N = sz * 8;
+    if (!(dv & (dv - 1)))
+    {
+        const k = bsf(dv);
+        return isMod ? opImm(LOp.andi, sz, a, dv - 1) : opImm(LOp.lsri, sz, a, k);
+    }
+    Reg q;
+    if (dv >> (N - 1))
+    {
+        // the quotient is 0 or 1
+        emitIns(LOp.cmp, sz, noReg, a, constReg(dv, sz));
+        q = newVreg(RC.gp, sz);
+        auto i = emitIns(LOp.cset, 4, q);
+        i.cond = COND.cs;
+    }
+    else if (N == 32)
+    {
+        Reg x = extendFrom(a, 32, false, 8);
+        ulong m;
+        int post;
+        if (choose_multiplier(32, dv, 32, &m, &post))
+        {
+            // a < 2**32 and ceil(2**64 / dv) - 2**64 / dv < 1 leave the floor of the product exact
+            q = op2(LOp.umulh, 8, x, constReg(ulong.max / dv + 1, 8));
+        }
+        else
+            q = opImm(LOp.lsri, 8, op2(LOp.mul, 8, x, constReg(m, 8)), 32 + post);
+    }
+    else
+    {
+        ulong m;
+        int pre, post;
+        if (udiv_coefficients(64, dv, &pre, &m, &post))
+        {
+            // the multiplier is 2**64 + m
+            Reg t = op2(LOp.umulh, 8, a, constReg(m, 8));
+            Reg u = op2(LOp.add, 8, opImm(LOp.lsri, 8, op2(LOp.sub, 8, a, t), 1), t);
+            q = post > 1 ? opImm(LOp.lsri, 8, u, post - 1) : u;
+        }
+        else
+        {
+            Reg x = pre ? opImm(LOp.lsri, 8, a, pre) : a;
+            q = op2(LOp.umulh, 8, x, constReg(m, 8));
+            if (post)
+                q = opImm(LOp.lsri, 8, q, post);
+        }
+    }
+    return isMod ? remainder(a, q, dv, sz) : q;
+}
+
+/* The signed quotient (or remainder if isMod) of the sz byte a by the constant dv,
+ * truncated toward zero, without a divide instruction. noReg if dv is -1, 0 or 1
+ */
+@trusted
+private Reg sdivConst(Reg a, long dv, uint sz, bool isMod)
+{
+    import core.bitop : bsf;
+    import dmd.backend.divcoeff : choose_multiplier;
+
+    if (dv >= -1 && dv <= 1)
+        return noReg;
+    const N = sz * 8;
+    const ulong ad = dv < 0 ? -cast(ulong)dv : dv;
+    Reg q;
+    if (!(ad & (ad - 1)))
+    {
+        // a negative a is biased by ad - 1 to round toward zero
+        const k = bsf(ad);
+        Reg bias = opImm(LOp.lsri, sz, opImm(LOp.asri, sz, a, N - 1), N - k);
+        q = opImm(LOp.asri, sz, op2(LOp.add, sz, a, bias), k);
+    }
+    else
+    {
+        ulong m;
+        int post;
+        if (choose_multiplier(N, ad, N - 1, &m, &post))
+            return noReg;
+        Reg t;
+        if (N == 32)
+        {
+            // |a| <= 2**31 and m < 2**32: the 64 bit product is exact
+            Reg x = extendFrom(a, 32, true, 8);
+            t = opImm(LOp.asri, 8, op2(LOp.mul, 8, x, constReg(m, 8)), 32 + post);
+        }
+        else
+        {
+            t = op2(LOp.smulh, 8, a, constReg(m, 8));
+            if (m >> 63)
+                t = op2(LOp.add, 8, t, a);  // the multiplier is m - 2**64 as a signed value
+            if (post)
+                t = opImm(LOp.asri, 8, t, post);
+        }
+        // a floor for a negative a is one less than truncation
+        q = op2(LOp.add, sz, t, opImm(LOp.lsri, sz, a, N - 1));
+    }
+    if (dv < 0)
+    {
+        Reg n = newVreg(RC.gp, sz);
+        emitIns(LOp.neg, sz, n, q);
+        q = n;
+    }
+    return isMod ? remainder(a, q, dv, sz) : q;
 }
 
 /* The constant v of an operation lop of size sz, as an addend in 32 bits or fewer is
@@ -4960,6 +5131,8 @@ private Reg genBinary(elem* e)
             emitIns(iop, isz, d, a, noReg, v);
             return d;
         }
+        if (op == OPdiv || op == OPmod)
+            return arith(op, ty, gen(e.E1), e2, noReg, e.E1.Ety);
     }
 
     Reg a, b;
@@ -10597,6 +10770,15 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
             const d = pr(i.d);
             def(d);
             cdb.gen1(INSTR.sdiv_udiv(sf, i.op == LOp.udiv, pr(i.b), pr(i.a), d));
+            break;
+        }
+
+        case LOp.umulh: case LOp.smulh:
+        {
+            const d = pr(i.d);
+            def(d);
+            cdb.gen1((i.op == LOp.umulh ? 0x9BC0_7C00 : 0x9B40_7C00) | (pr(i.b) & 31) << 16 |
+                     (pr(i.a) & 31) << 5 | (d & 31));
             break;
         }
 
