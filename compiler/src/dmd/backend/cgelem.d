@@ -6709,45 +6709,17 @@ void combineByteLoads(elem* e, bool valueUsed)
 @trusted
 void postoptelem(elem* e)
 {
-    Srcpos pos = {0};
-
+    /* A dereference of null is not reported here: it may be on a path the program
+     * never takes, put where the null is known by inlining, and when it is taken it
+     * faults as a null dereference does at run time
+     */
     elem_debug(e);
     while (1)
     {
         if (OTunary(e.Eoper))
-        {
-            /* This is necessary as the optimizer tends to lose this information
-             */
-            if (e.Esrcpos.Slinnum > pos.Slinnum)
-                pos = e.Esrcpos;
-
-            if (e.Eoper == OPind)
-            {
-                if (e.E1.Eoper == OPconst &&
-                    /* Allow TYfgptr to reference GS:[0000] etc.
-                     */
-                    tybasic(e.E1.Ety) == TYnptr)
-                {
-                    /* Disallow anything in the range [0..4096]
-                     * Let volatile pointers dereference null
-                     */
-                    const targ_ullong v = el_tolong(e.E1);
-                    if (v < 4096 && !(e.Ety & mTYvolatile))
-                    {
-                        error(pos, "null dereference in function %s", funcsym_p.Sident.ptr);
-                        e.E1.Vlong = 4096;     // suppress redundant messages
-                    }
-                }
-            }
             e = e.E1;
-        }
         else if (OTbinary(e.Eoper))
         {
-            /* This is necessary as the optimizer tends to lose this information
-             */
-            if (e.Esrcpos.Slinnum > pos.Slinnum)
-                pos = e.Esrcpos;
-
             if (e.Eoper == OPparam)
             {
                 if (!I64)
