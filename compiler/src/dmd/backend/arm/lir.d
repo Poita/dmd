@@ -3270,13 +3270,24 @@ private AggVal genAggAssign(elem* e)
         fail("aggregate type");
         return AggVal.init;
     }
-    const a = aarch64Aggregate(t);
+    AggregateABI a = aarch64Aggregate(t);
     elem* e1 = e.E1;
     while (e1.Eoper == OPcomma)
     {
         genEffect(e1.E1);
         e1 = e1.E2;
     }
+    /* A variable held in registers is laid out by its own type, which the parts
+     * copied must follow, whatever type the assignment has
+     */
+    foreach (x; [e1, e.E2])
+        if (x.Eoper == OPvar && x.Voffset == 0)
+            if (auto av = aggOf(x.Vsym))
+                if (av.abi.size == a.size)
+                {
+                    a = av.abi;
+                    break;
+                }
     if (e1.Eoper != OPvar && e1.Eoper != OPind ||
         !tyaggregate(e1.Ety) && tysize(e1.Ety) < type_size(t))
     {
