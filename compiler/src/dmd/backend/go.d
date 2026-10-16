@@ -292,6 +292,192 @@ void dbg_optprint(char* title)
 }
 }
 
+/* A local aggregate whose every assignment copies all of the same read-only data, as
+ * a struct's .init, and whose address is never taken, is read from that data instead,
+ * and the copies are dropped, so it needs no place of its own: a large one copied from
+ * .init to be read costs no stack
+ */
+@trusted
+private void forwardReadonlyCopies(ref BlockOpt bo)
+{
+    Barray!(Symbol*) source;    // for each local, the data all its copies are of
+    Barray!bool excluded;       // for each local, whether it is written otherwise
+    scope (exit)
+    {
+        source.dtor();
+        excluded.dtor();
+    }
+    source.setLength(globsym.length);
+    excluded.setLength(globsym.length);
+    source[][] = null;
+    excluded[][] = false;
+
+    static bool isLocal(const Symbol* s)
+    {
+        return (s.Sclass == SC.auto_ || s.Sclass == SC.register) && !(s.ty() & (mTYvolatile | mTYshared)) &&
+               tyaggregate(s.ty());
+    }
+
+    // the read-only data e copies to all of local s, or null
+    static Symbol* copyOfReadonly(const(elem)* e, const Symbol* s)
+    {
+        if (e.Eoper != OPstreq || e.Ecount || e.E1.Eoper != OPvar || e.E1.Voffset != 0)
+            return null;
+        const(elem)* e2 = e.E2;
+        if (e2.Eoper != OPind || e2.E1.Eoper != OPrelconst || e2.E1.Voffset != 0 ||
+            !(e2.E1.Vsym.Sflags & SFLreadonly) || !e.ET || type_size(e.ET) != type_size(s.Stype))
+            return null;
+        return cast(Symbol*)e2.E1.Vsym;
+    }
+
+    // the address of a local in e, which is it or it plus an index, or null
+    static elem* addressPart(elem* e)
+    {
+        if (e.Eoper == OPadd)
+            e = e.E1.Eoper == OPrelconst ? e.E1 : e.E2;
+        if (e.Eoper != OPrelconst)
+            return null;
+        Symbol* s = e.Vsym;
+        return s.Ssymnum < globsym.length && globsym[s.Ssymnum] is s ? e : null;
+    }
+    // the index added to the address of a local in e, or null
+    static elem* indexPart(elem* e)
+    {
+        if (e.Eoper != OPadd)
+            return null;
+        return e.E1.Eoper == OPrelconst ? e.E2 : e.E1;
+    }
+    static Symbol* localAddress(elem* e)
+    {
+        elem* a = addressPart(e);
+        return a ? a.Vsym : null;
+    }
+
+    bool any;
+    void gather(elem* e)
+    {
+        while (1)
+        {
+            if (OTassign(e.Eoper) && e.E1.Eoper == OPind)
+            {
+                // a store through the address of a local writes it
+                if (Symbol* s = localAddress(e.E1.E1))
+                {
+                    excluded[s.Ssymnum] = true;
+                    if (elem* i = indexPart(e.E1.E1))
+                        gather(i);
+                }
+                else
+                    gather(e.E1);
+                if (OTbinary(e.Eoper))
+                {
+                    e = e.E2;
+                    continue;
+                }
+                return;
+            }
+            if (e.Eoper == OPind && localAddress(e.E1))
+            {
+                // a load from it reads it
+                if (elem* i = indexPart(e.E1))
+                {
+                    e = i;
+                    continue;
+                }
+                return;
+            }
+            if (OTassign(e.Eoper) && e.E1.Eoper == OPvar)
+            {
+                Symbol* s = e.E1.Vsym;
+                if (s.Ssymnum < globsym.length && globsym[s.Ssymnum] is s && isLocal(s))
+                {
+                    Symbol* r = copyOfReadonly(e, s);
+                    if (!r || (source[s.Ssymnum] && source[s.Ssymnum] !is r))
+                        excluded[s.Ssymnum] = true;
+                    else
+                    {
+                        source[s.Ssymnum] = r;
+                        any = true;
+                    }
+                }
+                if (OTbinary(e.Eoper))
+                {
+                    e = e.E2;
+                    continue;
+                }
+                return;
+            }
+            if (e.Eoper == OPrelconst)
+            {
+                Symbol* s = e.Vsym;
+                if (s.Ssymnum < globsym.length && globsym[s.Ssymnum] is s)
+                    excluded[s.Ssymnum] = true;
+                return;
+            }
+            if (OTbinary(e.Eoper))
+            {
+                gather(e.E2);
+                e = e.E1;
+            }
+            else if (OTunary(e.Eoper))
+                e = e.E1;
+            else
+                return;
+        }
+    }
+    foreach (b; BlockRange(bo.startblock))
+        if (b.Belem)
+            gather(b.Belem);
+    if (!any)
+        return;
+
+    bool forwarded(const Symbol* s)
+    {
+        return s.Ssymnum < globsym.length && globsym[s.Ssymnum] is s && source[s.Ssymnum] &&
+               !excluded[s.Ssymnum];
+    }
+    void rewrite(ref elem* e)
+    {
+        if (e.Eoper == OPstreq && e.E1.Eoper == OPvar && forwarded(e.E1.Vsym))
+        {
+            // the copy goes, its source read for nothing
+            elem* e2 = e.E2;
+            e.E2 = null;
+            el_free(e);
+            e = e2;
+            rewrite(e);
+            return;
+        }
+        if (e.Eoper == OPvar && forwarded(e.Vsym))
+        {
+            e.Vsym = source[e.Vsym.Ssymnum];
+            return;
+        }
+        if (e.Eoper == OPind)
+            if (Symbol* s = localAddress(e.E1))
+                if (forwarded(s))
+                {
+                    addressPart(e.E1).Vsym = source[s.Ssymnum];
+                    if (e.E1.Eoper == OPadd)
+                        rewrite(e.E1.E1.Eoper == OPrelconst ? e.E1.E2 : e.E1.E1);
+                    return;
+                }
+        if (OTbinary(e.Eoper))
+        {
+            rewrite(e.E1);
+            rewrite(e.E2);
+        }
+        else if (OTunary(e.Eoper))
+            rewrite(e.E1);
+    }
+    foreach (b; BlockRange(bo.startblock))
+        if (b.Belem)
+            rewrite(b.Belem);
+    foreach (i, s; globsym[])
+        if (source[i] && !excluded[i])
+            s.Sflags |= SFLdead;
+}
+
 /****************************
  * Optimize function.
  */
@@ -374,7 +560,10 @@ void optfunc(ref GlobalOptimizer go, ref BlockOpt bo)
          * https://issues.dlang.org/show_bug.cgi?id=23857
          */
         if (iter == 1)
+        {
             scanForInlines(funcsym_p);
+            forwardReadonlyCopies(bo);
+        }
 
         if (go.mfoptim & MFdc)
             blockopt(go, bo, go.changes); // do block optimization

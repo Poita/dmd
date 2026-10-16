@@ -852,7 +852,7 @@ Symbol* toInitializer(AggregateDeclaration ad)
                 s = toSymbolX(ad, "__init", SC.extern_, stag.Stype, "Z");
 
             s.Sfl = FL.extern_;
-            s.Sflags |= SFLnodebug;
+            s.Sflags |= SFLnodebug | SFLreadonly;
             if (sd)
                 s.Salignment = sd.alignment.isDefault() ? -1 : sd.alignment.get();
             if (isDllImported(ad))
