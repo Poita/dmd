@@ -484,6 +484,15 @@ if (enable) // disable while we test the inliner
                     snew.Spreg2 = NOREG;
                     sold.Spreg2 = NOREG;
                 }
+                /* The halves of a parameter on the stack are where its caller put it,
+                 * which is set by the alignment of the whole, not of each half
+                 */
+                if (sold.Sclass == SC.parameter)
+                {
+                    const al = Symbol_Salignsize(*sold);
+                    sold.Salignment = al;
+                    snew.Salignment = al;
+                }
                 type_free(sold.Stype);
                 sold.Stype = type_fake(sia[si].ty[0]);
                 sold.Stype.Tcount++;
