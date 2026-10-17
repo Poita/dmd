@@ -1571,6 +1571,16 @@ private void genObjFile(Module m, bool multiobj, bool doppelganger)
         toObjFile(member, multiobj);
     }
 
+    /* Generating code can instantiate templates, adding the instances to modules
+     * other workers of a split compilation compile; this worker generates them
+     */
+    import dmd.parallel : adoptLateInstances;
+    for (auto late = adoptLateInstances(); late.length; late = adoptLateInstances())
+    {
+        foreach (ti; late)
+            toObjFile(ti, multiobj);
+    }
+
     Symbol* msictor;
     if (global.params.cov)
     {

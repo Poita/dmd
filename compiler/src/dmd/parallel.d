@@ -21,6 +21,7 @@ import core.stdc.string;
 
 import dmd.arraytypes;
 import dmd.dmodule;
+import dmd.dtemplate : TemplateInstance;
 import dmd.globals;
 import dmd.root.filename;
 
@@ -81,14 +82,10 @@ void semantic3Shared(ref Workers w, ref Modules modules) @system
  */
 void adoptForeignInstances(ref Workers w, ref Modules modules) @system
 {
-    import dmd.dsymbol : Dsymbol;
-    import dmd.dtemplate : TemplateInstance;
-    import dmd.dsymbolsem : runDeferredSemantic3;
-    import dmd.semantic3 : semantic3;
+    import dmd.dsymbol : PASS;
 
     if (w.index < 0 || !modules.length)
         return;
-    import dmd.dsymbol : PASS;
 
     TemplateInstance[] adopted;
     foreach (k, m; w.others)
@@ -102,10 +99,78 @@ void adoptForeignInstances(ref Workers w, ref Modules modules) @system
                     adopted ~= ti;
         }
     }
+    adoptAdded(w, adopted);
+    bool[TemplateInstance] added;
+    foreach (ti; adopted)
+    {
+        if (ti in added)
+            continue;
+        added[ti] = true;
+        modules[0].members.push(ti);
+    }
+    adopting = &w;
+}
+
+/**************************************
+ * Code generation can instantiate templates too, adding the instances to the
+ * modules other workers compile; this worker adopts those it has added since
+ * `adoptForeignInstances` (or the last call), to generate their code itself.
+ * Returns:
+ *      the instances adopted, semantically analyzed; none if the compilation is not split
+ */
+TemplateInstance[] adoptLateInstances() @system
+{
+    TemplateInstance[] adopted;
+    if (adopting)
+        adoptAdded(*adopting, adopted);
+    return adopted;
+}
+
+/* Returns: true if `ti` is a member of one of this worker's own root modules, which
+ * it generates the code of as it does theirs
+ */
+private bool isOwnMember(ref Workers w, TemplateInstance ti)
+{
+    foreach (m; w.others)
+        if (ti.memberOf is m)
+            return false;
+    return true;
+}
+
+/// The split this worker adopts instances from, once its modules have been analyzed
+private __gshared Workers* adopting;
+
+/* Semantically analyze the template instances added to the other workers' modules
+ * since they were last looked at, and those of them that were speculative at the
+ * split but that this worker has since needed, and append them to `adopted`.
+ */
+private void adoptAdded(ref Workers w, ref TemplateInstance[] adopted) @system
+{
+    import dmd.dsymbol : Dsymbol, PASS;
+    import dmd.dsymbolsem : runDeferredSemantic3;
+    import dmd.semantic3 : semantic3;
+
     bool again = true;
     while (again)
     {
         again = false;
+        /* An instance that was speculative at the split stays in the module it
+         * was added to; needing it does not add it to this worker's modules
+         */
+        size_t still = 0;
+        foreach (ti; w.speculativeAtSplit)
+        {
+            if (!ti.minst)
+                w.speculativeAtSplit[still++] = ti;
+            else if (!isOwnMember(w, ti))
+            {
+                if (ti.semanticRun < PASS.semantic3)
+                    semantic3(ti, null);
+                adopted ~= ti;
+                again = true;
+            }
+        }
+        w.speculativeAtSplit = w.speculativeAtSplit[0 .. still];
         foreach (k, m; w.others)
         {
             while (m.members && w.seen[k] < m.members.length)
@@ -121,8 +186,6 @@ void adoptForeignInstances(ref Workers w, ref Modules modules) @system
         }
         runDeferredSemantic3();
     }
-    foreach (ti; adopted)
-        modules[0].members.push(ti);
 }
 
 nothrow:
@@ -138,6 +201,9 @@ struct Workers
     size_t[] membersAtSplit;/// the number of members of each root module when the split happened
     Module[] others;        /// in a worker: the root modules other workers take
     size_t[] seen;          /// how many members of each of `others` have been looked at
+    /// the template instances of the root modules that were speculative when the
+    /// split happened, until this worker adopts them
+    TemplateInstance[] speculativeAtSplit;
 
     /// Returns: true if this is a forked worker
     bool isChild() const nothrow { return index >= 0; }
@@ -238,7 +304,14 @@ Workers split(ref Modules modules, uint requested)
             claims = cast(Claims*)c;
         w.order = order;
         foreach (m; modules)
+        {
             w.membersAtSplit ~= m.members ? m.members.length : 0;
+            if (m.members)
+                foreach (s; *m.members)
+                    if (auto ti = s.isTemplateInstance())
+                        if (!ti.minst)
+                            w.speculativeAtSplit ~= ti;
+        }
 
         fflush(stdout);
         fflush(stderr);
