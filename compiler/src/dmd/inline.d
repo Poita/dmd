@@ -615,7 +615,9 @@ public:
 
                 return;
             }
-            foreach (i; 0 .. ids.from.length)
+            // the latest copy of a variable, as an expression and its lowering
+            // share subexpressions declaring variables, which are copied for each
+            foreach_reverse (i; 0 .. ids.from.length)
             {
                 if (e.var != ids.from[i])
                     continue;
@@ -636,7 +638,8 @@ public:
                 result = ids.eret.copy();
                 return;
             }
-            foreach (i; 0 .. ids.from.length)
+            // the latest copy of a variable, as for SymOffExp
+            foreach_reverse (i; 0 .. ids.from.length)
             {
                 if (e.var != ids.from[i])
                     continue;

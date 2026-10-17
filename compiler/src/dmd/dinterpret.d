@@ -3497,10 +3497,11 @@ public:
             {
                 VarDeclaration v = ve.var.isVarDeclaration();
                 assert(v);
-                /* An out or ref variable is assigned through; the inliner makes
-                 * one the target of a blit when it inlines a generated opAssign
+                /* An out variable, or a ref variable already bound, is assigned
+                 * through; the inliner makes a ref parameter the target of a blit
+                 * when it inlines a generated opAssign
                  */
-                if (v.storage_class & (STC.out_ | STC.ref_))
+                if (v.storage_class & STC.out_ || v.storage_class & STC.ref_ && isBound(v))
                     goto L1;
             }
             else if (ultimateVar && !getValue(ultimateVar))
@@ -7616,6 +7617,16 @@ private Expression evaluateDtor(InterState* istate, Expression e)
 }
 
 /*************************** CTFE Sanity Checks ***************************/
+/* Returns: true if `vd` has a value in the frame of the function being interpreted
+ */
+private bool isBound(VarDeclaration vd)
+{
+    return vd.ctfeAdrOnStack != VarDeclaration.AdrOnStackNone &&
+           vd.ctfeAdrOnStack >= ctfeGlobals.stack.framepointer &&
+           vd.ctfeAdrOnStack < ctfeGlobals.stack.stackPointer() &&
+           getValue(vd) !is null;
+}
+
 /* Setter functions for CTFE variable values.
  * These functions exist to check for compiler CTFE bugs.
  */
