@@ -911,17 +911,14 @@ public:
                     if (ce.f.ident == Id._d_newarrayT ||
                         ce.f.ident == Id._d_newarraymTX ||
                         ce.f.ident == Id._d_aaNew)
-                    {
                         ne.lowering = doInlineAs!Expression(lowering, ids);
-                        goto LhasLowering;
-                    }
 
+            // CTFE interprets the expression itself rather than its lowering
             ne.placement = doInlineAs!Expression(e.placement, ids);
             ne.thisexp = doInlineAs!Expression(e.thisexp, ids);
             ne.argprefix = doInlineAs!Expression(e.argprefix, ids);
             ne.arguments = arrayExpressionDoInline(e.arguments);
 
-        LhasLowering:
             result = ne;
 
             semanticTypeInfo(null, e.type);
