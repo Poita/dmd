@@ -140,6 +140,20 @@ private bool isOwnMember(ref Workers w, TemplateInstance ti)
 /// The split this worker adopts instances from, once its modules have been analyzed
 private __gshared Workers* adopting;
 
+/**************************************
+ * Returns: true if `m` is a root module another worker of the split compilation
+ * generates the code of, after this worker's modules have been analyzed
+ */
+bool compiledElsewhere(const Module m) @system
+{
+    if (!adopting || !m)
+        return false;
+    foreach (o; adopting.others)
+        if (o is m)
+            return true;
+    return false;
+}
+
 /* Semantically analyze the template instances added to the other workers' modules
  * since they were last looked at, and those of them that were speculative at the
  * split but that this worker has since needed, and append them to `adopted`.

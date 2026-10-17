@@ -551,7 +551,24 @@ void FuncDeclaration_toObjFile(FuncDeclaration fd, bool multiobj)
      * generated, so that the other workers don't write such object files for it.
      */
     import dmd.mangle : mangleExact;
-    import dmd.parallel : claimFunction;
+    import dmd.parallel : claimFunction, compiledElsewhere;
+
+    /* A function of a module another worker compiles, or nested in one, is left to
+     * that worker: generating a nested function generates the function enclosing it,
+     * whose statics would then be defined twice
+     */
+    for (Dsymbol p = fd; p; p = p.toParent2())
+    {
+        auto pf = p.isFuncDeclaration();
+        if (!pf)
+            break;
+        if (!pf.isInstantiated() && compiledElsewhere(pf.getModule()))
+        {
+            ++functionsLeftToOtherWorkers;
+            return;
+        }
+    }
+
     if (fd.isInstantiated())
     {
         const claim = multiobj && fd.semanticRun != PASS.semanticdone && !inNonRootFunction(fd) &&
