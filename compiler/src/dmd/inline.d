@@ -3128,7 +3128,11 @@ private void expandInline(CallExp ecall, FuncDeclaration fd, FuncDeclaration par
     scope ids = new InlineDoState(parent, fd);
     ids.propagateNRVO = propagateNRVO;
 
-    if (fd.isNested())
+    /* A function literal outside any function can still be called from other
+     * modules (through an enum holding it), so the caller records it to be
+     * emitted even though its call here is gone.
+     */
+    if (fd.isNested() || fd.isFuncLiteralDeclaration())
     {
         if (!parent.inlinedNestedCallees)
             parent.inlinedNestedCallees = new FuncDeclarations();

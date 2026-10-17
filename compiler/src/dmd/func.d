@@ -379,6 +379,7 @@ extern (C++) class FuncDeclaration : Declaration
     /// Sibling nested functions which called this one
     FuncDeclarations siblingCallers;
 
+    /// Nested functions and function literals whose bodies were inlined into this one
     FuncDeclarations* inlinedNestedCallees;
 
     /// In case of failed `@safe` inference, store the error that made the function `@system` for

@@ -77,6 +77,7 @@ import dmd.location;
 import dmd.mtype;
 import dmd.statement;
 import dmd.target;
+import dmd.tokens;
 import dmd.typesem;
 import dmd.funcsem : genCfunc;
 import dmd.utils;
@@ -721,6 +722,24 @@ void FuncDeclaration_toObjFile(FuncDeclaration fd, bool multiobj)
     Array!(elem*) varsInScope;
     Label*[void*] labels = null;
     IRState irs = IRState(m, fd, &varsInScope, &deferToObj, &labels, &global.params, &target, global.errorSink);
+
+    // function literals inlined into fd are emitted as if it still called them
+    if (fd.inlinedNestedCallees)
+    {
+        foreach (fdc; *fd.inlinedNestedCallees)
+        {
+            auto fld = fdc.isFuncLiteralDeclaration();
+            if (!fld || fld.isNested() || fld.deferToObj)
+                continue;
+            if (fld.tok == TOK.reserved)
+            {
+                fld.tok = TOK.function_;
+                fld.vthis = null;
+            }
+            fld.deferToObj = true;
+            deferToObj.push(fld);
+        }
+    }
 
     Symbol* shidden = null;
     Symbol* sthis = null;
