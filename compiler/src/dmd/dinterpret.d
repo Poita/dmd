@@ -3497,7 +3497,10 @@ public:
             {
                 VarDeclaration v = ve.var.isVarDeclaration();
                 assert(v);
-                if (v.storage_class & STC.out_)
+                /* An out or ref variable is assigned through; the inliner makes
+                 * one the target of a blit when it inlines a generated opAssign
+                 */
+                if (v.storage_class & (STC.out_ | STC.ref_))
                     goto L1;
             }
             else if (ultimateVar && !getValue(ultimateVar))

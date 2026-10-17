@@ -997,7 +997,12 @@ public:
 
         override void visit(LoweredAssignExp e)
         {
-            result = doInlineAs!Expression(e.lowering, ids);
+            // CTFE interprets the assignment itself rather than its lowering
+            auto le = cast(LoweredAssignExp)e.copy();
+            le.lowering = doInlineAs!Expression(e.lowering, ids);
+            le.e1 = doInlineAs!Expression(e.e1, ids);
+            le.e2 = doInlineAs!Expression(e.e2, ids);
+            result = le;
         }
 
         override void visit(EqualExp e)
