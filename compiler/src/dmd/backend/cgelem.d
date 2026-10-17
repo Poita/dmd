@@ -1049,7 +1049,9 @@ L1:
     }
 
     // Replace ((e11 + c) + e2) with ((e11 + e2) + c)
+    // (not for floating point, where addition is not associative)
     if (e1.Eoper == OPadd && e1.E2.Eoper == OPconst &&
+        !tyfloating(e.Ety) && !tyvector(e.Ety) &&
         (e2.Eoper == OPvar || !OTleaf(e2.Eoper)) &&
         tysize(e1.Ety) == tysize(e2.Ety) &&
         tysize(e1.E2.Ety) == tysize(e2.Ety))
