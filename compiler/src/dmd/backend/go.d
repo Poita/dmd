@@ -450,7 +450,14 @@ private void forwardReadonlyCopies(ref BlockOpt bo)
         }
         if (e.Eoper == OPvar && forwarded(e.Vsym))
         {
-            e.Vsym = source[e.Vsym.Ssymnum];
+            // a load through the data's address, which every code generator handles
+            elem* a = el_ptr(source[e.Vsym.Ssymnum]);
+            a.Voffset = e.Voffset;
+            elem* load = el_una(OPind, e.Ety, a);
+            load.ET = e.ET;
+            load.Esrcpos = e.Esrcpos;
+            el_free(e);
+            e = load;
             return;
         }
         if (e.Eoper == OPind)
