@@ -1326,6 +1326,8 @@ void getlvalue(ref CGstate cg,ref CodeBuilder cdb,ref code pcs,elem* e,regm_t ke
                                 else if (voffset == 0)
                                 {
                                     pcs.reg = preg;
+                                    if (!tyfloating(ty) && !tyaggregate(ty))
+                                        pcs.Sextend = cast(ubyte)tyToExtend(ty);  // sign or zero extension
                                     cg.regcon.used |= mask(preg);
                                     break;
                                 }
