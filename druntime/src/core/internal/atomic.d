@@ -94,12 +94,13 @@ version (AArch64)
         {
             T result = void;
             _d_aarch64_load16(cast(const void*) src, &result);
-            return cast(inout(T)) result;
+            return *cast(inout(T)*) &result;
         }
         else
         {
             const bits = mixin("_d_aarch64_load" ~ T.sizeof.stringof[0 .. $ - 2])(cast(const void*) src);
-            return cast(inout(T)) fromBits!(T)(bits);
+            T result = fromBits!(T)(bits);
+            return *cast(inout(T)*) &result;
         }
     }
 
@@ -167,7 +168,7 @@ version (AArch64)
     bool atomicCompareExchangeStrongNoResult(MemoryOrder succ = MemoryOrder.seq, MemoryOrder fail = MemoryOrder.seq, T)(T* dest, const T compare, T value) pure nothrow @nogc @trusted
         if (CanCAS!T)
     {
-        T expected = cast(T) compare;
+        T expected = *cast(T*) &compare;
         return atomicCompareExchangeStrong!(succ, fail)(dest, &expected, value);
     }
 
