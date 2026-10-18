@@ -2594,9 +2594,13 @@ struct Gcx
             while ((_length + ranges.length) * RANGE.sizeof > _cap)
                 grow();
 
-            // reverse order for depth-first-order traversal
-            foreach_reverse (ref range; ranges)
-                _p[_length++] = range;
+            // reverse order for depth-first-order traversal; local pointers keep
+            // the copy loop free of reloads of _p and _length
+            auto dst = _p + _length;
+            auto src = ranges.ptr + ranges.length;
+            while (src > ranges.ptr)
+                *dst++ = *--src;
+            _length += ranges.length;
         }
 
         void pop(ref RANGE rng)
@@ -5743,4 +5747,35 @@ static if (!isSingleThreaded) unittest
 
     if (gc.gcx.numScanThreads == 0)
         assert(gc.gcx.toscanRoots.ptr is null);
+}
+
+// ranges pushed together are popped in their original order, after ranges pushed earlier
+unittest
+{
+    Gcx.ToScanStack!(Gcx.ScanRange!false) stack;
+    scope (exit) stack.reset();
+    auto r(size_t i) { return Gcx.ScanRange!false(cast(void*) (i * 16), cast(void*) (i * 16 + 8)); }
+
+    stack.push(r(100));
+    Gcx.ScanRange!false[5000] batch;
+    foreach (i, ref b; batch)
+        b = r(i);
+    stack.pushReverse(batch[]);
+    stack.pushReverse(batch[0 .. 3]);
+    assert(stack.length == 1 + batch.length + 3);
+
+    Gcx.ScanRange!false got;
+    foreach (i; 0 .. 3)
+    {
+        stack.pop(got);
+        assert(got == r(i));
+    }
+    foreach (i; 0 .. batch.length)
+    {
+        stack.pop(got);
+        assert(got == r(i));
+    }
+    stack.pop(got);
+    assert(got == r(100));
+    assert(stack.empty);
 }
