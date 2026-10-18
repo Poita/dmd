@@ -3276,11 +3276,7 @@ private Reg[4] aggParts(ref AggVal v, ref const AggregateABI a)
                 const off = k * 8;
                 const n = a.size - off < 8 ? a.size - off : 8;
                 m.offset += off;
-                r[k] = newVreg(RC.gp, n);
-                if (n == 8 || n == 4 || n == 2 || n == 1)
-                    load(r[k], m, chunkType(n));
-                else
-                    fail("aggregate chunk");
+                r[k] = loadChunk(m, n);
             }
             break;
     }
@@ -3321,10 +3317,7 @@ private void storeAggParts(ref AggVal v, ref const AggregateABI a, Reg[4] r)
                 const off = k * 8;
                 const n = a.size - off < 8 ? a.size - off : 8;
                 m.offset += off;
-                if (n == 8 || n == 4 || n == 2 || n == 1)
-                    store(r[k], m, chunkType(n));
-                else
-                    fail("aggregate chunk");
+                storeChunk(r[k], m, n);
             }
             break;
     }
@@ -3333,6 +3326,75 @@ private void storeAggParts(ref AggVal v, ref const AggregateABI a, Reg[4] r)
 private tym_t chunkType(uint n)
 {
     return n == 8 ? TYullong : n == 4 ? TYuint : n == 2 ? TYushort : TYuchar;
+}
+
+/* The n bytes, 1 to 8, at m, zero extended into an integer register; a size that
+ * is not a power of 2 loaded as pieces of 4, 2 and 1 bytes, each zero extended,
+ * joined by ORs shifted to their places
+ */
+@trusted
+private Reg loadChunk(Mem m, uint n)
+{
+    if (n == 8 || n == 4 || n == 2 || n == 1)
+    {
+        Reg d = newVreg(RC.gp, n);
+        load(d, m, chunkType(n));
+        return d;
+    }
+    Reg acc;
+    uint done;
+    static immutable uint[3] pieces = [4, 2, 1];
+    foreach (piece; pieces)
+    {
+        if (n - done < piece)
+            continue;
+        Mem mp = m;
+        mp.offset += done;
+        Reg t = newVreg(RC.gp, piece);
+        load(t, mp, chunkType(piece));
+        if (!acc)
+            acc = t;
+        else
+        {
+            Reg d = newVreg(RC.gp, 8);
+            auto i = emitIns(LOp.orr, 8, d, acc, t, done * 8);
+            i.flags |= F.shifted;
+            i.cond = 0;     // LSL
+            acc = d;
+        }
+        done += piece;
+    }
+    return acc;
+}
+
+/* Store the low n bytes, 1 to 8, of v to m; a size that is not a power of 2 as
+ * pieces of 4, 2 and 1 bytes
+ */
+@trusted
+private void storeChunk(Reg v, Mem m, uint n)
+{
+    if (n == 8 || n == 4 || n == 2 || n == 1)
+    {
+        store(v, m, chunkType(n));
+        return;
+    }
+    uint done;
+    static immutable uint[3] pieces = [4, 2, 1];
+    foreach (piece; pieces)
+    {
+        if (n - done < piece)
+            continue;
+        Mem mp = m;
+        mp.offset += done;
+        store(v, mp, chunkType(piece));
+        done += piece;
+        if (done < n)
+        {
+            Reg t = newVreg(RC.gp, 8);
+            emitIns(LOp.lsri, 8, t, v, noReg, piece * 8);
+            v = t;
+        }
+    }
 }
 
 /* e1 = e2 for aggregates, returning e1
