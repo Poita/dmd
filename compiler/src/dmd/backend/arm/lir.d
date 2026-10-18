@@ -5437,7 +5437,7 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
 }
 
 /// The most arguments a call generated here has
-private enum maxArgs = 64;
+private enum maxArgs = 128;
 
 /* e1 = e2
  */
