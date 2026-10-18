@@ -4919,8 +4919,8 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
 
     const tyf = tybasic(e.E1.Ety);
     const np = e.Eoper == OPcall ? el_nparams(e.E2) : 0;
-    Parameter[16] pbuf;
-    if (np > pbuf.length || e.numParams)
+    Parameter[maxArgs] pbuf;
+    if (np > pbuf.length)
     {
         fail("call form");
         return newVreg(RC.gp, 8);
@@ -4977,12 +4977,31 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
     // an aggregate returned in memory has its address passed as the last argument, in x8
     const hiddenIdx = e.Nflags & NFLhidden ? np - 1 : -1;
 
+    /* A C variadic function has its variadic arguments on the stack, and its last
+     * explicit argument on the stack aligned as they are
+     */
+    const numExplicit = e.numParams;        // the number of explicit arguments + 1, or 0
+    int apIdx = -1;
+
     // registers are allocated from the last argument to the first, as cdfunc() does
     FuncParamRegs fpr = FuncParamRegs_create(tyf);
     for (int i = np; --i >= 0;)
     {
         Parameter* p = &params[i];
         elem* ep = p.e;
+        p.isVariadic = numExplicit && np - i + 1 > numExplicit;
+        p.isAp = false;
+        if (p.isVariadic)
+        {
+            if (!scalarType(ep.Ety) || holdsAggregate(ep.Ety, ep.ET))
+            {
+                fail("call variadic arg");
+                return newVreg(RC.gp, 8);
+            }
+            p.reg = NOREG;
+            p.reg2 = NOREG;
+            continue;
+        }
         if (i == hiddenIdx)
         {
             p.reg = 8;
@@ -5007,6 +5026,7 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
                 // on the stack, the registers for it being used up
                 p.reg = NOREG;
                 p.reg2 = NOREG;
+                apIdx = i;
                 continue;
             }
             if (p.reg == NOREG || p.reg == 8)
@@ -5029,6 +5049,7 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
             // on the stack
             p.reg = NOREG;
             p.reg2 = NOREG;
+            apIdx = i;
             continue;
         }
         if ((p.reg2 != NOREG) != isPair || (isPair && (p.reg >= 32 || p.reg2 >= 32)))
@@ -5038,8 +5059,11 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
         }
     }
 
+    if (apIdx >= 0 && numExplicit)
+        params[apIdx].isAp = true;
+
     /* The offsets of the arguments on the stack, as cdfunc() has them: aligned
-     * as struct fields on OSX
+     * as struct fields on OSX, and the variadic ones to 8 bytes
      */
     import dmd.backend.x86.cod1 : paramsize;
     uint numpara = 0;
@@ -5062,6 +5086,8 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
         }
         if (alignsize > 16)
             alignsize = 16;
+        if (p.isVariadic || p.isAp)
+            alignsize = 8;
         numpara = (numpara + (alignsize - 1)) & ~(alignsize - 1);
         p.offset = numpara;
         numpara += sz;
@@ -5086,9 +5112,9 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
         sf = e1.E1.Vsym;            // called directly, as BL reaches any function
 
     // the arguments are evaluated from the first to the last, as cdfunc() does
-    Reg[16] vals;
-    Reg[16] his;
-    Reg[4][16] aggArgs;
+    Reg[maxArgs] vals;
+    Reg[maxArgs] his;
+    Reg[4][maxArgs] aggArgs;
     foreach (i, ref p; params)
     {
         if (i == hiddenIdx)
@@ -5164,6 +5190,8 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
                 m.offset += 8;
                 store(his[i], m, TYullong);
             }
+            else if (p.isVariadic && !tyfloating(ty) && tysize(ty) < 8)
+                store(extend(vals[i], ty, 8), m, TYullong);     // the whole of its 8 byte slot
             else
                 store(vals[i], m, ty);
         }
@@ -5265,6 +5293,9 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
     hintCopy(d, phys(0));
     return d;
 }
+
+/// The most arguments a call generated here has
+private enum maxArgs = 64;
 
 /* e1 = e2
  */
