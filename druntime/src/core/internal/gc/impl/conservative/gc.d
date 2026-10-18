@@ -2668,6 +2668,33 @@ struct Gcx
     }
 
     /**
+     * Set the mark bit `biti` of `pool`.
+     *
+     * The bit is tested with a plain load first, so a block that is already
+     * marked costs no store, and no atomic operation when `shared_mem`.
+     *
+     * Returns: true if the block was unmarked and is to be scanned
+     */
+    pragma(inline, true)
+    private static bool markForScan(bool shared_mem)(Pool* pool, size_t biti) nothrow @nogc
+    {
+        const pos = biti >> GCBits.BITS_SHIFT;
+        const mask = GCBits.BITS_1 << (biti & GCBits.BITS_MASK);
+        auto markWord = pool.mark.data + pos;
+        const w = *markWord;
+        if (w & mask)
+            return false;
+        static if (shared_mem)
+        {
+            if (pool.mark.setLocked(biti))
+                return false;
+        }
+        else
+            *markWord = w | mask;
+        return (pool.noscan.data[pos] & mask) == 0;
+    }
+
+    /**
      * Search a range of memory values and mark any pointers into the GC pool.
      */
     private void mark(bool precise, bool parallel, bool shared_mem)(ScanRange!precise rng) scope nothrow
@@ -2752,7 +2779,7 @@ struct Gcx
                     biti = offsetBase >> Pool.ShiftBy.Small;
                     //debug(PRINTF) printf("\t\tbiti = x%x\n", biti);
 
-                    if (!pool.mark.testAndSet!shared_mem(biti) && !pool.noscan.test(biti))
+                    if (markForScan!shared_mem(pool, biti))
                     {
                         tgt.pbot = pool.baseAddr + offsetBase;
                         tgt.ptop = tgt.pbot + binsize[bin];
@@ -2779,7 +2806,7 @@ struct Gcx
                     if (tgt.pbot != sentinel_sub(p) && pool.nointerior.nbits && pool.nointerior.test(biti))
                         goto LnextPtr;
 
-                    if (!pool.mark.testAndSet!shared_mem(biti) && !pool.noscan.test(biti))
+                    if (markForScan!shared_mem(pool, biti))
                     {
                         tgt.ptop = tgt.pbot + (cast(LargeObjectPool*)pool).getSize(pn);
                         goto LaddLargeRange;
@@ -2794,7 +2821,7 @@ struct Gcx
                     if (pool.nointerior.nbits && pool.nointerior.test(biti))
                         goto LnextPtr;
 
-                    if (!pool.mark.testAndSet!shared_mem(biti) && !pool.noscan.test(biti))
+                    if (markForScan!shared_mem(pool, biti))
                     {
                         tgt.pbot = pool.baseAddr + (pn * PAGESIZE);
                         tgt.ptop = tgt.pbot + (cast(LargeObjectPool*)pool).getSize(pn);
@@ -5817,4 +5844,31 @@ unittest
             assert(dst[i] == r(next--));
     }
     assert(stack.empty);
+}
+
+// marking sets the mark bit once and reports whether the block is to be scanned
+unittest
+{
+    static foreach (shared_mem; [false, true])
+    {{
+        Pool pool;
+        pool.mark.alloc(256);
+        pool.noscan.alloc(256);
+        scope (exit)
+        {
+            pool.mark.Dtor();
+            pool.noscan.Dtor();
+        }
+        pool.noscan.set(64);
+        pool.noscan.set(130);
+
+        foreach (biti; [0, 1, 63, 64, 65, 127, 130, 255])
+        {
+            const scan = !pool.noscan.test(biti);
+            assert(Gcx.markForScan!shared_mem(&pool, biti) == scan);
+            assert(pool.mark.test(biti));
+            assert(!Gcx.markForScan!shared_mem(&pool, biti));
+        }
+        assert(!pool.mark.test(2) && !pool.mark.test(66) && !pool.mark.test(129));
+    }}
 }
