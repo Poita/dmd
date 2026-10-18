@@ -3415,6 +3415,9 @@ struct Gcx
                 else
                     startScanThreads();
             }
+            // without scan threads the parallel path only adds locking to every mark
+            if (!numScanThreads)
+                doParallel = false;
         }
         else
             enum doParallel = false;
@@ -5722,4 +5725,22 @@ unittest
         foreach (i; size .. GC.sizeOf(p))
             assert(p[i] == 0);
     }
+}
+
+// a collection marks on the sequential path when there are no scan threads to share the work
+static if (!isSingleThreaded) unittest
+{
+    auto gc = cast(ConservativeGC) initialize();
+    scope (exit)
+        destroy(gc);
+
+    void*[16] keep;
+    foreach (ref p; keep)
+        p = gc.malloc(32);
+    gc.collect();
+    foreach (p; keep)
+        assert(gc.addrOf(p) is p);
+
+    if (gc.gcx.numScanThreads == 0)
+        assert(gc.gcx.toscanRoots.ptr is null);
 }
