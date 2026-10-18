@@ -2823,7 +2823,10 @@ struct AggVar
  */
 struct AggVal
 {
-    enum Kind : ubyte { none, slots, parts, mem }
+    /* words: r[0] and r[1] hold its bytes 0 .. 7 and 8 .. 15, each in an integer
+     * register, or as a double in a V register
+     */
+    enum Kind : ubyte { none, slots, parts, mem, words }
     Kind kind;
     Reg[4] r;
     Mem m;
@@ -3022,6 +3025,14 @@ private bool aggregateLvalue(const(elem)* e)
 {
     while (e.Eoper == OPcomma)
         e = e.E2;
+    if (e.Eoper == OPvar && e.Ecount)
+    {
+        /* a CSE of an aggregate variable in registers is read from them again where
+         * they hold the same value at each use, as gen() reads a register variable
+         */
+        auto av = aggOf(e.Vsym);
+        return av && !(symAssigned[e.Vsym.Ssymnum] && (assignedInBlock(e.Vsym) || isCrossBlockVar(e)));
+    }
     return (e.Eoper == OPvar || e.Eoper == OPind) && !e.Ecount;
 }
 
@@ -3096,6 +3107,34 @@ private AggVal genAgg(elem* e)
         case OPeq:
         case OPstreq:
             return genAggAssign(e);
+
+        case OPconst:
+            // the bytes of an aggregate of at most 16 of them
+            v.kind = AggVal.Kind.words;
+            const ulong[2] words = [e.Vcent.lo, e.Vcent.hi];
+            foreach (k, bits; words)
+            {
+                v.r[k] = newVreg(RC.gp, 8);
+                emitIns(LOp.movi, 8, v.r[k], noReg, noReg, cast(long)bits);
+            }
+            return v;
+
+        case OPpair:
+        case OPrpair:
+        {
+            // the bytes of an aggregate of 16 of them, as two halves of 8
+            if (tysize(e.E1.Ety) != 8 || tysize(e.E2.Ety) != 8)
+            {
+                fail("aggregate pair halves");
+                return v;
+            }
+            Reg a = gen(e.E1);
+            Reg b = gen(e.E2);
+            v.kind = AggVal.Kind.words;
+            v.r[0] = e.Eoper == OPpair ? a : b;
+            v.r[1] = e.Eoper == OPpair ? b : a;
+            return v;
+        }
 
         case OPcond:
         {
@@ -3193,6 +3232,36 @@ private Reg[4] aggParts(ref AggVal v, ref const AggregateABI a)
             }
             break;
 
+        case AggVal.Kind.words:
+            if (a.size > 16 || a.kind == AggregateABI.Kind.hfa && a.esz != 4 && a.esz != 8)
+            {
+                fail("aggregate words");
+                break;
+            }
+            foreach (k; 0 .. a.nregs)
+            {
+                if (a.kind != AggregateABI.Kind.hfa)
+                {
+                    r[k] = asClass(v.r[k], RC.gp, 8);
+                    continue;
+                }
+                if (a.esz == 8)
+                {
+                    r[k] = asClass(v.r[k], RC.fp, 8);
+                    continue;
+                }
+                // a float, the low or high half of a word
+                Reg w = asClass(v.r[k / 2], RC.gp, 8);
+                if (k & 1)
+                {
+                    Reg t = newVreg(RC.gp, 8);
+                    emitIns(LOp.lsri, 8, t, w, noReg, 32);
+                    w = t;
+                }
+                r[k] = asClass(w, RC.fp, 4);
+            }
+            break;
+
         case AggVal.Kind.mem:
             foreach (k; 0 .. a.nregs)
             {
@@ -3227,6 +3296,7 @@ private void storeAggParts(ref AggVal v, ref const AggregateABI a, Reg[4] r)
     {
         case AggVal.Kind.none:
         case AggVal.Kind.parts:
+        case AggVal.Kind.words:
             break;
 
         case AggVal.Kind.slots:
@@ -4925,8 +4995,21 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
             // in consecutive registers from p.reg
             const a = aarch64Aggregate(ep.ET);
             if (!tyaggregate(ep.Ety) && !aggregateLvalue(ep) && !integerHfa(ep, a) && !integerGpr(ep, a) ||
-                a.kind != AggregateABI.Kind.hfa && a.kind != AggregateABI.Kind.gpr ||
-                !FuncParamRegs_alloc(*cgp, fpr, ep.ET, ep.Ety, p.reg, p.reg2) || p.reg == NOREG || p.reg == 8)
+                a.kind != AggregateABI.Kind.hfa && a.kind != AggregateABI.Kind.gpr)
+            {
+                if (env!"DMD_NEWCG_WHY")
+                    fprintf(stderr, "newcg-aggarg: %s kind %d\n", tym_str(ep.Ety), a.kind);
+                fail("call aggregate arg");
+                return newVreg(RC.gp, 8);
+            }
+            if (!FuncParamRegs_alloc(*cgp, fpr, ep.ET, ep.Ety, p.reg, p.reg2))
+            {
+                // on the stack, the registers for it being used up
+                p.reg = NOREG;
+                p.reg2 = NOREG;
+                continue;
+            }
+            if (p.reg == NOREG || p.reg == 8)
             {
                 if (env!"DMD_NEWCG_WHY")
                     fprintf(stderr, "newcg-aggarg: %s kind %d reg %d\n", tym_str(ep.Ety), a.kind, p.reg);
@@ -4970,6 +5053,13 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
         if (sz == 0)
             sz = 1;
         uint alignsize = el_alignsize(p.e);
+        if (holdsAggregate(p.e.Ety, p.e.ET) && !tyaggregate(p.e.Ety))
+        {
+            // an aggregate painted as an integer takes the stack space of the aggregate
+            sz = cast(uint)type_size(p.e.ET);
+            alignsize = type_alignsize(p.e.ET);
+            p.size = sz;
+        }
         if (alignsize > 16)
             alignsize = 16;
         numpara = (numpara + (alignsize - 1)) & ~(alignsize - 1);
@@ -5060,7 +5150,15 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
             m.base = phys(31);
             m.offset = p.offset;
             const ty = tybasic(p.e.Ety);
-            if (pairType(ty))
+            if (holdsAggregate(p.e.Ety, p.e.ET))
+            {
+                const a = aarch64Aggregate(p.e.ET);
+                AggVal v;
+                v.kind = AggVal.Kind.mem;
+                v.m = m;
+                storeAggParts(v, a, aggArgs[i]);
+            }
+            else if (pairType(ty))
             {
                 store(vals[i], m, TYullong);
                 m.offset += 8;
