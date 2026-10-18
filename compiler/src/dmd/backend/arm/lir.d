@@ -2385,6 +2385,30 @@ private COND compare(elem* e)
             return c;
         }
 
+        if (pairType(ty))
+        {
+            // equal if both halves are: CMP of the low halves, then CCMP of the high ones if equal
+            if (c != eq && c != ne)
+            {
+                fail("pair ordering");
+                return c;
+            }
+            Pair a = genPair(e1);
+            if (el_sideeffect(e2))
+            {
+                // e2 may assign the variable a is in
+                Pair t = Pair(newVreg(RC.gp, 8), newVreg(RC.gp, 8));
+                emitIns(LOp.copy, 8, t.lo, a.lo);
+                emitIns(LOp.copy, 8, t.hi, a.hi);
+                a = t;
+            }
+            Pair b = genPair(e2);
+            emitIns(LOp.cmp, 8, noReg, a.lo, b.lo);
+            auto cc = emitIns(LOp.ccmp, 8, noReg, a.hi, b.hi);
+            cc.cond = eq;
+            cc.imm = 0;      // NZCV clear when the low halves differ: ne
+            return c;
+        }
         const sz = tysize(ty);
         if ((c == eq || c == ne) && e2.Eoper == OPconst && el_tolong(e2) == 0 && isConstMod(e1))
         {
@@ -2938,8 +2962,8 @@ private Pair genPairx(elem* e)
 @trusted
 private bool hfaAsInteger(const(elem)* e)
 {
-    // the whole of it, not an integer sized part
-    return e.ET && !tyaggregate(e.Ety) && tyaggregate(e.ET.Tty) &&
+    // the whole of it, not an integer sized part, nor an address of it
+    return e.ET && !tyaggregate(e.Ety) && tyaggregate(e.ET.Tty) && !typtr(e.Ety) && e.Eoper != OPrelconst &&
            tysize(e.Ety) >= type_size(cast(type*)e.ET) && (e.Eoper != OPvar || e.Voffset == 0) &&
            aarch64Aggregate(cast(type*)e.ET).kind == AggregateABI.Kind.hfa;
 }
