@@ -564,7 +564,7 @@ private bool pairOp(OPER op)
     switch (op)
     {
         case OPvar: case OPind: case OPpair: case OPrpair: case OPconst:
-        case OPcomma: case OPeq: case OPcall: case OPucall: case OPcond: case OPcolon:
+        case OPcomma: case OPeq: case OPcall: case OPucall: case OPcond: case OPcolon: case OPcolon2:
         case OPremquo:
             return true;
         default:
@@ -603,7 +603,7 @@ private bool supportedElem(const(elem)* e)
     while (1)
     {
         const op = e.Eoper;
-        if (!(op == OPcolon) && !(op == OPcomma) && !(op == OPeq) && !(op == OPparam) &&
+        if (!(op == OPcolon) && !(op == OPcolon2) && !(op == OPcomma) && !(op == OPeq) && !(op == OPparam) &&
             !scalarType(e.Ety) && tybasic(e.Ety) != TYvoid && tybasic(e.Ety) != TYnoreturn &&
             !(pairType(e.Ety) && pairOp(op)) && !(tyaggregate(e.Ety) && aggregateOp(e)) &&
             op != OPmemcpy && op != OPmemset && op != OPstreq)
@@ -696,7 +696,7 @@ private bool supportedElem(const(elem)* e)
             case OPeq:
             case OPcomma:
             case OPandand: case OPoror:
-            case OPcond: case OPcolon:
+            case OPcond: case OPcolon: case OPcolon2:
             case OPlt: case OPle: case OPgt: case OPge: case OPeqeq: case OPne:
             case OPaddass: case OPminass: case OPmulass: case OPdivass: case OPmodass:
             case OPandass: case OPorass: case OPxorass:
@@ -2122,7 +2122,7 @@ private void genCond(elem* e, bool jumpIfTrue, uint l, block* t = null)
         case OPcond:
         {
             // c ? a : b as the test of a, or that of b
-            if (!tyintegral(e.Ety) || e.E2.Eoper != OPcolon)
+            if (!tyintegral(e.Ety) || e.E2.Eoper != OPcolon && e.E2.Eoper != OPcolon2)
             {
                 valueCond(e, jumpIfTrue, &jump);
                 return;
