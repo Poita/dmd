@@ -2726,8 +2726,17 @@ struct Gcx
 
             debug(MARK_PRINTF) printf("\tmark %p: %p\n", rng.pbot, p);
 
-            if (cast(size_t)(p - minAddr) < memSize &&
-                (cast(size_t)p & ~cast(size_t)(PAGESIZE-1)) != pcache)
+            // most words cannot point into the GC heap: this path falls through
+            // to the next word with a single taken branch
+            if (cast(size_t)(p - minAddr) >= memSize)
+            {
+                rng.pbot += (void*).sizeof;
+                if (rng.pbot < rng.ptop)
+                    continue;
+                goto LnextRange;
+            }
+
+            if ((cast(size_t)p & ~cast(size_t)(PAGESIZE-1)) != pcache)
             {
                 static if (precise) if (rng.pbase)
                 {
