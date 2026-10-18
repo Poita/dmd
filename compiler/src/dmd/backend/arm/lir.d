@@ -541,6 +541,8 @@ private bool aggregateOp(const(elem)* e)
     {
         case OPvar: case OPind:
             return true;            // the type comes from what they are assigned to or from
+        case OPcond:
+            return true;            // its arms' effects, or genAgg() of its value by its type
         case OPcomma: case OPstrpar:
         case OPeq: case OPstreq:
             break;
@@ -5277,7 +5279,8 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
                 }
                 continue;
             }
-            if (!tyaggregate(p.e.Ety) && !aggregateLvalue(p.e))
+            if (!tyaggregate(p.e.Ety) && !aggregateLvalue(p.e) &&
+                !(p.e.Eoper == OPcond && a.kind == AggregateABI.Kind.hfa))
             {
                 aggArgs[i] = splitHfa(p.e, a);
                 continue;
