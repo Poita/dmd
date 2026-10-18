@@ -100,12 +100,12 @@ void adoptForeignInstances(ref Workers w, ref Modules modules) @system
         }
     }
     adoptAdded(w, adopted);
-    bool[TemplateInstance] added;
+    bool[void*] added;     // by identity, as frontend classes are extern(C++)
     foreach (ti; adopted)
     {
-        if (ti in added)
+        if (cast(void*) ti in added)
             continue;
-        added[ti] = true;
+        added[cast(void*) ti] = true;
         modules[0].members.push(ti);
     }
     adopting = &w;

@@ -3295,7 +3295,7 @@ private void expandInline(CallExp ecall, FuncDeclaration fd, FuncDeclaration par
             {
                 // the copy keeps its initializer if the function only calls the parameter
                 if (onlyCalled(vfrom, fd))
-                    unchangedCopies[vto] = true;
+                    unchangedCopies[cast(void*) vto] = true;
                 if (auto ve = arg.isVarExp())
                 {
                     if (ve.var.isFuncDeclaration())
@@ -3431,7 +3431,7 @@ private bool onlyOneAssign(VarDeclaration v, FuncDeclaration fd) @trusted
 {
     if (!v.type.isMutable())
         return true;            // currently the only case handled atm
-    return (v in unchangedCopies) !is null;
+    return (cast(void*) v in unchangedCopies) !is null;
 }
 
 /// Whether the code generator keeps enough variables in registers for the functions
@@ -3455,7 +3455,7 @@ private bool givenLiteral(CallExp e)
 }
 
 /// The copies of parameters made by inlining that are never changed
-private __gshared bool[VarDeclaration] unchangedCopies;
+private __gshared bool[void*] unchangedCopies;      // by identity, as frontend classes are extern(C++)
 
 /**
  * Whether parameter v of fd is only ever called, so it holds its argument throughout
