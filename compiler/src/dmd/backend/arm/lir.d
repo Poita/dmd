@@ -2865,6 +2865,29 @@ private Pair genPair(elem* e)
 @trusted
 private Pair genPairx(elem* e)
 {
+    if (hfaAsInteger(e) && hfaInMemory(e))
+    {
+        // its bytes, those past the aggregate zero
+        Mem m = memOf(e, false);
+        const size = cast(uint)type_size(e.ET);
+        Pair p;
+        p.lo = loadChunk(m, size < 8 ? size : 8);
+        if (size > 8)
+        {
+            m.offset += 8;
+            p.hi = loadChunk(m, size - 8);
+        }
+        else
+        {
+            p.hi = newVreg(RC.gp, 8);
+            emitIns(LOp.movi, 8, p.hi, noReg, noReg, 0);
+        }
+        return p;
+    }
+    if (hfaAsInteger(e) && e.Eoper == OPvar)
+        if (auto av = aggOf(e.Vsym))
+            if (av.abi.kind == AggregateABI.Kind.hfa && av.abi.size > 8 && av.abi.size <= 16)
+                return Pair(hfaWord(av, 0), hfaWord(av, 1));    // its bytes, from the elements
     if (hfaAsInteger(e))
     {
         if (env!"DMD_NEWCG_WHY")
@@ -2969,6 +2992,50 @@ private bool hfaAsInteger(const(elem)* e)
     return e.ET && !tyaggregate(e.Ety) && tyaggregate(e.ET.Tty) && !typtr(e.Ety) && e.Eoper != OPrelconst &&
            tysize(e.Ety) >= type_size(cast(type*)e.ET) && (e.Eoper != OPvar || e.Voffset == 0) &&
            aarch64Aggregate(cast(type*)e.ET).kind == AggregateABI.Kind.hfa;
+}
+
+/* Bytes 8 * w .. 8 * w + 7 of the HFA variable av held in V registers, those past
+ * it zero, in a new integer register
+ */
+@trusted
+private Reg hfaWord(AggVar* av, uint w)
+{
+    const esz = av.abi.esz;
+    if (esz == 8)
+    {
+        Reg d = newVreg(RC.gp, 8);
+        if (w < av.abi.nregs)
+            emitIns(LOp.copy, 8, d, av.slots[w]);
+        else
+            emitIns(LOp.movi, 8, d, noReg, noReg, 0);
+        return d;
+    }
+    const k = w * 2;
+    if (k >= av.abi.nregs)
+    {
+        Reg d = newVreg(RC.gp, 8);
+        emitIns(LOp.movi, 8, d, noReg, noReg, 0);
+        return d;
+    }
+    Reg lo = extendFrom(asClass(av.slots[k], RC.gp, 4), 32, false, 8);
+    if (k + 1 >= av.abi.nregs)
+        return lo;
+    Reg hi = asClass(av.slots[k + 1], RC.gp, 4);
+    Reg d = newVreg(RC.gp, 8);
+    auto i = emitIns(LOp.orr, 8, d, lo, hi, 32);
+    i.flags |= F.shifted;
+    i.cond = 0;         // LSL
+    return d;
+}
+
+/* Whether e reads an aggregate from memory, where its bytes are the integer it is
+ * typed as, rather than from registers or a call that has it in V registers
+ */
+@trusted
+private bool hfaInMemory(const(elem)* e)
+{
+    return e.Eoper == OPind ||
+           e.Eoper == OPvar && !aggOf(e.Vsym) && !varReg(e.Vsym) && varSupported(e.Vsym);
 }
 
 /* Whether e is an integer typed value, not in memory, of the aggregate of ABI a passed in
@@ -4416,6 +4483,16 @@ private Reg genx(elem* e)
     const ty = tybasic(e.Ety);
     const sz = tysize(ty);
     const RC rc = tyfloating(ty) ? RC.fp : RC.gp;
+    if (!pairType(ty) && hfaAsInteger(e))
+    {
+        // its bytes
+        if (hfaInMemory(e))
+            return loadChunk(memOf(e, false), cast(uint)type_size(e.ET));
+        if (e.Eoper == OPvar)
+            if (auto av = aggOf(e.Vsym))
+                if (av.abi.kind == AggregateABI.Kind.hfa && av.abi.size <= 8)
+                    return hfaWord(av, 0);
+    }
     if (pairType(ty) || hfaAsInteger(e))
     {
         import dmd.backend.debugprint : oper_str;
