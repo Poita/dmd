@@ -2610,6 +2610,22 @@ struct Gcx
             rng = _p[--_length];
         }
 
+        /**
+         * Move the top ranges to `dst`, as many as fit, keeping their order:
+         * the top of the stack goes to the last element written.
+         *
+         * Returns: the number of ranges moved
+         */
+        size_t popInto(RANGE[] dst)
+        {
+            const n = _length < dst.length ? _length : dst.length;
+            _length -= n;
+            auto src = _p + _length;
+            foreach (i; 0 .. n)
+                dst.ptr[i] = src[i];
+            return n;
+        }
+
         @property bool empty() const { return !_length; }
         size_t length() const { return _length; }
         RANGE* ptr() { return _p; }
@@ -2838,22 +2854,23 @@ struct Gcx
             }
             else
             {
-                // popped into a copy, so rng's address is not taken and it can stay in registers
-                ScanRange!precise popped = void;
                 static if (parallel)
                 {
+                    // popped into a copy, so rng's address is not taken and it can stay in registers
+                    ScanRange!precise popped = void;
                     if (!scanStackPopLocked(popped))
                         break; // nothing more to do
+                    rng = popped;
                 }
                 else
                 {
-                    if (scanStack!precise.empty)
+                    // move a batch of ranges from the global stack to the local one,
+                    // which pops them more cheaply, one at a time
+                    stackPos = scanStack!precise.popInto(stack[]);
+                    if (!stackPos)
                         break; // nothing more to do
-
-                    // pop range from global stack and recurse
-                    scanStack!precise.pop(popped);
+                    rng = stack[--stackPos];
                 }
-                rng = popped;
             }
             // printf("  pop [%p..%p] (%#zx)\n", p1, p2, cast(size_t)p2 - cast(size_t)p1);
             goto LcontRange;
@@ -5777,5 +5794,27 @@ unittest
     }
     stack.pop(got);
     assert(got == r(100));
+    assert(stack.empty);
+}
+
+// ranges moved off the scan stack in batches come off in the order single pops would take them
+unittest
+{
+    Gcx.ToScanStack!(Gcx.ScanRange!false) stack;
+    scope (exit) stack.reset();
+    auto r(size_t i) { return Gcx.ScanRange!false(cast(void*) (i * 16), cast(void*) (i * 16 + 8)); }
+
+    foreach (i; 0 .. 70)
+        stack.push(r(i));
+
+    Gcx.ScanRange!false[32] dst;
+    size_t next = 69;
+    foreach (expected; [32, 32, 6, 0])
+    {
+        const n = stack.popInto(dst[]);
+        assert(n == expected);
+        foreach_reverse (i; 0 .. n)
+            assert(dst[i] == r(next--));
+    }
     assert(stack.empty);
 }
