@@ -13258,6 +13258,27 @@ private bool overlapsAcrossCalls(ref Barray!Range occ, ref Barray!Range rs)
     return false;
 }
 
+/* Call dg with each range of the sorted ranges occ that overlaps one of the sorted
+ * ranges rs
+ */
+@trusted
+private void forOverlapping(ref Barray!Range occ, ref Barray!Range rs, scope void delegate(ref Range) nothrow dg)
+{
+    size_t i, j;
+    while (i < occ.length && j < rs.length)
+    {
+        if (occ[i].to <= rs[j].from)
+            ++i;
+        else if (rs[j].to <= occ[i].from)
+            ++j;
+        else
+        {
+            dg(occ[i]);
+            ++i;
+        }
+    }
+}
+
 @trusted
 private void occupy(uint p, ref Barray!Range rs, Reg owner)
 {
@@ -13515,8 +13536,26 @@ private void allocate()
      */
     buildAffinities();
 
-    foreach (r; order[])
+    /* How much keeping each register in memory costs for the length of its ranges, so
+     * a register used often for a short while takes the place of one used little for
+     * a long while
+     */
+    Barray!float density;
+    density.setLength(vinfo.length);
+    Barray!uint span;
+    span.setLength(vinfo.length);
+    foreach (k, ref vk; vinfo[])
     {
+        span[k] = 0;
+        foreach (rg; vk.ranges[])
+            span[k] += rg.to - rg.from;
+        density[k] = vk.cost / (span[k] + 1);
+    }
+    size_t evictions;
+
+    for (size_t oi = 0; oi < order.length; ++oi)
+    {
+        const r = order[oi];
         auto v = vi(r);
         const(ubyte)[] prefs = regOrder(v.rc);
         const affs = affinities[affStart[r - firstVreg] .. affStart[r - firstVreg + 1]];
@@ -13639,6 +13678,63 @@ private void allocate()
                         break;
                     }
         }
+        if (chosen == uint.max && v.cost > 0 && span[r - firstVreg] <= 8 && evictions < 4 * vinfo.length)
+        {
+            /* a register of a few instructions kept in memory still needs a register
+             * where it is made and used, so it takes the place of the registers less
+             * dense than it overlapping it in the register where the densest of them
+             * is least dense, which are allocated again after it
+             */
+            const dr = density[r - firstVreg];
+            float bestDensity = float.max;
+            foreach (p; prefs)
+            {
+                if (!allowedFor(p, v))
+                    continue;
+                float most = 0;
+                bool ok = true;
+                forOverlapping(occupied[p], v.ranges, (ref Range o) {
+                    if (!o.owner || o.owner == clobberOwner || density[o.owner - firstVreg] >= dr)
+                        ok = false;
+                    else if (density[o.owner - firstVreg] > most)
+                        most = density[o.owner - firstVreg];
+                });
+                if (ok && most < bestDensity)
+                {
+                    bestDensity = most;
+                    chosen = p;
+                }
+            }
+            if (chosen != uint.max)
+            {
+                Barray!Reg evicted;
+                forOverlapping(occupied[chosen], v.ranges, (ref Range o) {
+                    foreach (e; evicted[])
+                        if (e == o.owner)
+                            return;
+                    evicted.push(o.owner);
+                });
+                auto occ = &occupied[chosen];
+                size_t to;
+                foreach (o; (*occ)[])
+                {
+                    bool out_;
+                    foreach (e; evicted[])
+                        out_ |= e == o.owner;
+                    if (!out_)
+                        (*occ)[to++] = o;
+                }
+                occ.setLength(to);
+                foreach (e; evicted[])
+                {
+                    vi(e).preg = uint.max;
+                    vi(e).callSaved = false;
+                    order.push(e);
+                    ++evictions;
+                }
+                evicted.dtor();
+            }
+        }
         if (chosen == uint.max)
         {
             v.spilled = true;
@@ -13647,6 +13743,8 @@ private void allocate()
         v.preg = chosen;
         occupy(chosen, v.ranges, r);
     }
+    density.dtor();
+    span.dtor();
     order.dtor();
     copyHead.dtor();
     copyNext.dtor();
