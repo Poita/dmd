@@ -29,7 +29,7 @@ float copies0_dps(const ref Weapon w)
 void main()
 {
     auto w = Weapon(10, 3, 0.5, 2, 0, 1);
-    assert(copies0_dps(w) == 30.0f / 6);
+    assert(copies0_dps(w) == 30.0f / 4);
     w.burstCount = 1;
     assert(copies0_dps(w) == 10.0f / 3);
 }

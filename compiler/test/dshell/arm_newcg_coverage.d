@@ -29,7 +29,7 @@ int main()
         const mangled = text(name.length, name);
         {
             auto f = File(log, "w");
-            run("$DMD -m$MODEL -O -inline -release -of" ~ exe ~ " " ~ src, stdout, f,
+            run("$DMD -m$MODEL -O -inline -release -check=assert=on -of" ~ exe ~ " " ~ src, stdout, f,
                 ["DMD_NEWCG": "1", "DMD_NEWCG_WHY": "1"]);
         }
         foreach (line; readText(log).lineSplitter)
@@ -47,7 +47,7 @@ int main()
         if (readText(src).canFind("callee"))
             foreach (filter; ["-callee", "callee"])
             {
-                run("$DMD -m$MODEL -O -inline -release -of" ~ exe ~ " " ~ src, stdout, stderr,
+                run("$DMD -m$MODEL -O -inline -release -check=assert=on -of" ~ exe ~ " " ~ src, stdout, stderr,
                     ["DMD_NEWCG": "1", "DMD_NEWCG_NAME": filter]);
                 run(exe);
             }

@@ -31,7 +31,7 @@ int main()
         const mangled = "_D" ~ text(name.length, name);
         {
             auto f = File(log, "w");
-            run("$DMD -m$MODEL -O -inline -release -of" ~ exe ~ " " ~ src, stdout, f,
+            run("$DMD -m$MODEL -O -inline -release -check=assert=on -of" ~ exe ~ " " ~ src, stdout, f,
                 ["DMD_NEWCG": "1", "DMD_NEWCG_WHY": "1", "DMD_NEWCG_SWLOG": "1"]);
         }
         bool[string] wrapped;

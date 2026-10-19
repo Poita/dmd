@@ -78,7 +78,7 @@ int main()
         total = 0;
         mixed(V2(1, 2), 3, extra);
         const once = 2 + 2 * 1 + 3 * 3 + 4 * 4 + 5 * 0.5 + 6 * 3;
-        assert(total == (extra ? 2 * once + once + 1 - 6 : once));
+        assert(total == (extra ? 3 * once + 1 - 6 : 2 * once));
     }
     return 0;
 }

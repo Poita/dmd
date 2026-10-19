@@ -5,7 +5,7 @@ module agg_words;
 struct P { long a, b; }
 struct Q { int a; float b; }
 struct C { ubyte r, g, b, a; }
-struct D2 { double x, y; }
+struct D2 { double x = 0.5, y = -3; }
 struct V4 { float x, y, z, w; }
 struct V2 { float x, y; }
 
@@ -39,12 +39,12 @@ int main()
     assert(constQ() == Q(7, 1.5f));
     assert(constC() == C(1, 2, 3, 4));
     assert(constD2() == D2(0.25, -8));
-    assert(zeroD2() == D2(0, 0));
+    assert(zeroD2() == D2(0.5, -3));
     assert(constV4() == V4(1, 2, 3, 4));
     assert(constV2() == V2(-1, 0.5f));
     assert(pairD2(2, 3) == D2(3, 6));
     assert(passConsts(10) == 1 + 2 * 30 + 0 + 4 * 4 + 5 * 5 + 6 * 8);
-    assert(passFloats() == 1 + 2 * 2 + 3 * 5 + 4 * 6 + 5 * 7 + 6 * 8 + 0);
+    assert(passFloats() == 1 + 2 * 2 + 3 * 5 + 4 * 6 + 5 * 7 + 6 * 8 + 7 * -3);
     assignConsts();
     assert(gp == P(11, 12) && gd == D2(13, 14) && gv == V4(15, 16, 17, 18));
     return 0;

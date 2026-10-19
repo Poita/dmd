@@ -27,7 +27,7 @@ int main()
         const log = OUTPUT_BASE ~ "_" ~ name ~ ".ra";
         {
             auto f = File(log, "w");
-            run("$DMD -m$MODEL -O -inline -release -of" ~ exe ~ " " ~ src, stdout, f,
+            run("$DMD -m$MODEL -O -inline -release -check=assert=on -of" ~ exe ~ " " ~ src, stdout, f,
                 ["DMD_NEWCG": "1", "DMD_NEWCG_RASTATS": "1"]);
         }
         size_t checked;
