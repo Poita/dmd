@@ -825,7 +825,10 @@ void prolog_genvarargs_osx(ref CGstate cg, ref CodeBuilder cdb, Symbol* sv)
 
 
     //printf("Para.size: %d Para.offset: %d\n", cast(int)cg.Para.size, cast(int)cg.Para.offset);
-    uint imm12 = cast(uint)(/*cg.Para.size +*/ cg.Para.offset);  // offset past parameters that went onto the stack
+    /* offset past the named parameters that went onto the stack, which are packed
+     * to their own alignment; the variadic arguments after them start 8 byte aligned
+     */
+    uint imm12 = cast(uint)((cg.Para.offset + REGSIZE - 1) & ~(REGSIZE - 1));
     if (cg.hasframe)
         imm12 += REGSIZE * 2;
     imm12 += localsize;
