@@ -478,7 +478,7 @@ private int tryMain(const(char)[][] argv, out Param params)
     {
         int served;
         if (serverStart(argv, params, served))
-            return served;
+            exit(served);   // the server reported everything, as a compilation does
     }
 
     // Create Modules

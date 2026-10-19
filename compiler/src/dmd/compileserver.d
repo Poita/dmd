@@ -49,9 +49,11 @@ import core.stdc.string;
 
 import dmd.arraytypes;
 import dmd.astenums : FileType;
+import dmd.dimport : Import;
 import dmd.dmodule;
 import dmd.dsymbol;
 import dmd.globals;
+import dmd.location : Loc;
 import dmd.root.array;
 import dmd.root.filename;
 
@@ -106,6 +108,10 @@ struct Pending { Module m; Dsymbols* members; }
 __gshared Array!Pending pending;
 // in a server: the root module each imported module is imported from, by file name
 __gshared Module[const(char)[]] listedImporter;
+// in a client: the name each module was loaded by
+__gshared const(char)[][void*] loadedAs;
+// in a server: the modules it loaded for the root modules' imports, by identity
+__gshared bool[void*] unplaced;
 
 struct Stamp
 {
@@ -168,6 +174,8 @@ bool start(const(char)[][] argv, ref Param params, out int status)
             role = Role.none;
             return false;
         }
+        import dmd.dsymbolsem : onImport;
+        onImport = &noteImport;
         if (role == Role.server)
             return false;
 
@@ -237,11 +245,17 @@ void recordImports(ref Modules modules)
             startable = false;
             return;
         }
+        auto name = cast(void*)m in loadedAs;
+        if (!name)
+        {
+            startable = false;
+            return;
+        }
         size_t from = 0;
         foreach (i, r; modules)
             if (r is m.importedFrom)
                 from = i;
-        buf.printf("%d\t%s\t%s\n", cast(int)from, m.toPrettyChars(), m.srcfile.toChars());
+        buf.printf("%d\t%.*s\t%s\n", cast(int)from, cast(int)name.length, name.ptr, m.srcfile.toChars());
     }
     importList = buf.extractSlice();
 }
@@ -307,16 +321,47 @@ void serve(ref Modules modules)
 }
 
 /**************************************
- * In a server loading the imported modules: the root module `m` is first imported from
- * in the compilation the server was started from, or null.
+ * Called when an import has found or loaded (`loaded`) its module. A client notes the
+ * name each module is loaded by. A server loading the imported modules sets the root
+ * module each is first imported from as in the compilation it was started from. In a
+ * request, the module the server loaded for a root module's import takes that import's
+ * location, as loading it there would have given it.
  */
-Module importerOf(Module m)
+void noteImport(Import imp, bool loaded)
 {
-    if (role != Role.server || !listedImporter.length)
-        return null;
-    if (auto p = m.srcfile.toString() in listedImporter)
-        return *p;
-    return null;
+    final switch (role)
+    {
+        case Role.none:
+            break;
+        case Role.client:
+            if (loaded)
+            {
+                import dmd.common.outbuffer;
+                OutBuffer buf;
+                foreach (p; imp.packages)
+                {
+                    buf.writestring(p.toString());
+                    buf.writeByte('.');
+                }
+                buf.writestring(imp.id.toString());
+                loadedAs[cast(void*)imp.mod] = buf.extractSlice();
+            }
+            break;
+        case Role.server:
+            if (!imp.mod.importedFrom)
+                if (auto p = imp.mod.srcfile.toString() in listedImporter)
+                    imp.mod.importedFrom = *p;
+            break;
+        case Role.request:
+            if (cast(void*)imp.mod in unplaced)
+            {
+                // a module's location is that of the import that loads it, which the
+                // server loaded it before
+                *cast(Loc*)&imp.mod.loc = imp.loc;
+                unplaced.remove(cast(void*)imp.mod);
+            }
+            break;
+    }
 }
 
 private:
@@ -711,7 +756,7 @@ void stopListening(int listener)
 /// Load the imported modules of the list; true when the server can start
 bool preload(ref Modules roots)
 {
-    import dmd.dsymbolsem : importAll, knownImporter;
+    import dmd.dsymbolsem : importAll;
     import dmd.identifier : Identifier;
     import dmd.location : Loc;
     import dmd.root.file : File;
@@ -760,7 +805,6 @@ bool preload(ref Modules roots)
         listedImporter[e.file] = e.from;
     }
 
-    knownImporter = &importerOf;
     Module[const(char)[]] loaded;
     foreach (ref e; entries)
     {
@@ -770,9 +814,14 @@ bool preload(ref Modules roots)
             const(char)[] rest = e.name;
             for (ptrdiff_t dot; (dot = indexOf(rest, '.')) >= 0; rest = rest[dot + 1 .. $])
                 packages ~= Identifier.idPool(rest[0 .. dot]);
-            auto m = Module.load(Loc.initial, packages, Identifier.idPool(rest));
+            // as an import of a root module loads it, but without the import's location
+            auto id = Identifier.idPool(rest);
+            auto dst = Package.resolve(packages, null, null);
+            auto m = Module.load(Loc.initial, packages, id);
             if (!m || m.srcfile.toString() != e.file || global.errors)
                 return false;
+            dst.insert(id, m);
+            unplaced[cast(void*)m] = true;
             if (!m.importedFrom)
                 m.importedFrom = e.from;
             m.importAll(null);
@@ -798,7 +847,6 @@ bool preload(ref Modules roots)
         m.members = null;
     }
     listedImporter = null;
-    knownImporter = null;
     return stampFiles(roots);
 }
 
