@@ -13257,6 +13257,90 @@ private void occupy(uint p, ref Barray!Range rs, Reg owner)
     }
 }
 
+/// A register copied to or from another, and how often
+struct Affinity
+{
+    Reg r;
+    float w;
+}
+
+private __gshared Barray!uint affStart;         // by register - firstVreg: start of its affinities
+private __gshared Barray!Affinity affinities;
+
+/* For each virtual register, the registers of the same class it is copied to or
+ * from, with the estimated frequency of the copies, the most frequent first, and
+ * the register it is hinted to share
+ */
+@trusted
+private void buildAffinities()
+{
+    const nv = vinfo.length;
+    affStart.setLength(nv + 1);
+    affStart[][] = 0;
+    bool wanted(Reg d, Reg a)
+    {
+        return d && a && d != a && (!isPhys(d) || !isPhys(a)) && rcOf(d) == rcOf(a);
+    }
+    foreach (ref i; ins[])
+        if (i.op == LOp.copy && wanted(i.d, i.a))
+        {
+            if (!isPhys(i.d)) ++affStart[i.d - firstVreg + 1];
+            if (!isPhys(i.a)) ++affStart[i.a - firstVreg + 1];
+        }
+    foreach (k; 0 .. nv)
+        if (vinfo[k].hint)
+            ++affStart[k + 1];
+    foreach (k; 1 .. nv + 1)
+        affStart[k] += affStart[k - 1];
+    affinities.setLength(affStart[nv]);
+    Barray!uint fill;
+    scope (exit) fill.dtor();
+    fill.setLength(nv);
+    fill[][] = 0;
+    void add(Reg x, Reg y, float w)
+    {
+        if (isPhys(x))
+            return;
+        const k = x - firstVreg;
+        // merged with an affinity to the same register already there
+        foreach (ref e; affinities[affStart[k] .. affStart[k] + fill[k]])
+            if (e.r == y)
+            {
+                e.w += w;
+                return;
+            }
+        affinities[affStart[k] + fill[k]++] = Affinity(y, w);
+    }
+    foreach (bi; 0 .. blocks.length)
+        foreach (ref i; ins[blockStart[bi] .. blockStart[bi + 1]])
+            if (i.op == LOp.copy && wanted(i.d, i.a))
+            {
+                add(i.d, i.a, blockFreq[bi]);
+                add(i.a, i.d, blockFreq[bi]);
+            }
+    // a hint is the least of the affinities
+    foreach (k; 0 .. nv)
+        if (Reg h = vinfo[k].hint)
+            add(cast(Reg)(firstVreg + k), h, 1e-6f);
+    // the most frequent first, and the places of merged affinities removed
+    uint to = 0;
+    foreach (k; 0 .. nv)
+    {
+        const from = affStart[k];
+        affStart[k] = to;
+        foreach (j; from .. from + fill[k])
+            affinities[to++] = affinities[j];
+        auto a = affinities[affStart[k] .. to];
+        foreach (x; 1 .. a.length)
+            for (size_t j = x; j > 0 && a[j - 1].w < a[j].w; --j)
+            {
+                const t = a[j]; a[j] = a[j - 1]; a[j - 1] = t;
+            }
+    }
+    affStart[nv] = to;
+    affinities.setLength(to);
+}
+
 @trusted
 private void allocate()
 {
@@ -13370,22 +13454,39 @@ private void allocate()
             copyHead[o - firstVreg] = cast(Reg)(firstVreg + k);
         }
 
+    /* What each register is copied to or from, with how often, so it is given the
+     * register of those it is copied to or from or one they can have too
+     */
+    buildAffinities();
+
     foreach (r; order[])
     {
         auto v = vi(r);
         const(ubyte)[] prefs = v.rc == RC.fp ? fpOrder : gpOrder;
+        const affs = affinities[affStart[r - firstVreg] .. affStart[r - firstVreg + 1]];
         uint chosen = uint.max;
-        // the register of the copy it comes from or goes to
-        if (Reg h = v.hint)
+        // the register of what it is copied to or from most often that it can have
         {
-            uint p = uint.max;
-            if (isPhys(h))
-                p = physOf(h);
-            else if (!vi(h).spilled && vi(h).preg != uint.max)
-                p = vi(h).preg;
-            if (p != uint.max && (p >= 32) == (v.rc == RC.fp) && allowedFor(p, v) &&
-                (!overlaps(occupied[p], v.ranges, occupiedMaxLen[p]) || !isPhys(h) && canShare(r, h, p)))
-                chosen = p;
+            float[64] score = 0;
+            float best = 0;
+            foreach (ref e; affs)
+            {
+                uint p = uint.max;
+                if (isPhys(e.r))
+                    p = physOf(e.r);
+                else if (!vi(e.r).spilled && vi(e.r).preg != uint.max)
+                    p = vi(e.r).preg;
+                if (p == uint.max || (p >= 32) != (v.rc == RC.fp) || !allowedFor(p, v))
+                    continue;
+                if (overlaps(occupied[p], v.ranges, occupiedMaxLen[p]) && (isPhys(e.r) || !canShare(r, e.r, p)))
+                    continue;
+                score[p] += e.w;
+                if (score[p] > best)
+                {
+                    best = score[p];
+                    chosen = p;
+                }
+            }
         }
         if (chosen == uint.max)
         {
@@ -13421,12 +13522,43 @@ private void allocate()
         }
         if (chosen == uint.max)
         {
+            /* a free register, the first in order of preference, or of those as costly
+             * to use, one free too for the most copied to or from that are yet to
+             * be allocated and do not overlap r
+             */
+            Reg[4] later;
+            float[4] laterW;
+            uint nlater;
+            foreach (ref e; affs)
+            {
+                if (isPhys(e.r) || nlater == later.length)
+                    continue;
+                auto vm = vi(e.r);
+                if (vm.preg != uint.max || vm.spilled || vm.rc != v.rc || overlaps(vm.ranges, v.ranges))
+                    continue;
+                later[nlater] = e.r;
+                laterW[nlater++] = e.w;
+            }
+            float best = -1;
             foreach (p; prefs)
-                if (allowedFor(p, v) && !overlaps(occupied[p], v.ranges, occupiedMaxLen[p]))
-                {
-                    chosen = p;
+            {
+                if (!allowedFor(p, v) || overlaps(occupied[p], v.ranges, occupiedMaxLen[p]))
+                    continue;
+                // a callee saved register costs saving, which a caller saved one does not
+                if (chosen != uint.max && (callClobbers & (1UL << chosen)) && !(callClobbers & (1UL << p)))
                     break;
+                float bonus = 0;
+                foreach (k; 0 .. nlater)
+                    if (allowedFor(p, vi(later[k])) && !overlaps(occupied[p], vi(later[k]).ranges, occupiedMaxLen[p]))
+                        bonus += laterW[k];
+                if (bonus > best)
+                {
+                    best = bonus;
+                    chosen = p;
                 }
+                if (!nlater)
+                    break;
+            }
         }
         if (chosen == uint.max && v.cost > 0)
         {

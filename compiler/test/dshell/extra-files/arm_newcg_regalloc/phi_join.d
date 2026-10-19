@@ -4,7 +4,7 @@ import core.math : sqrt;
 import std.math : floor;
 
 // the floor of a quotient clamped to a range of cells
-int copies5_cellOf(float v, float o, float size, int n)
+int copies2_cellOf(float v, float o, float size, int n)
 {
     int i = cast(int) floor((v + o) / size);
     return i < 0 ? 0 : (i >= n ? n - 1 : i);
@@ -18,14 +18,8 @@ struct Grid
     ubyte[] cells;
 }
 
-int cell(float v, int n)
-{
-    int i = cast(int) v;
-    return i < 0 ? 0 : (i >= n ? n - 1 : i);
-}
-
 // a walk along a line, stepping in x or in y as their next crossing comes first
-bool copies0_clearLine(ref const Grid g, float ax, float ay, float bx, float by)
+bool copies3_clearLine(ref const Grid g, float ax, float ay, float bx, float by)
 {
     float tx = (ax + g.ox) / g.size;
     float ty = (ay + g.oy) / g.size;
@@ -46,7 +40,7 @@ bool copies0_clearLine(ref const Grid g, float ax, float ay, float bx, float by)
             ty += sy;
             ++y;
         }
-        if (g.cells[cell(x, g.w) + cell(y, g.w) * g.w])
+        if (g.cells[copies2_cellOf(x, 0, 1, g.w) + copies2_cellOf(y, 0, 1, g.w) * g.w])
             return false;
     }
     return true;
@@ -54,14 +48,14 @@ bool copies0_clearLine(ref const Grid g, float ax, float ay, float bx, float by)
 
 void main()
 {
-    assert(copies5_cellOf(2.5, 0, 1, 4) == 2);
-    assert(copies5_cellOf(-2.5, 0, 1, 4) == 0);
-    assert(copies5_cellOf(9.5, 0, 1, 4) == 3);
-    assert(copies5_cellOf(1, 0.5, 0.5, 8) == 3);
+    assert(copies2_cellOf(2.5, 0, 1, 4) == 2);
+    assert(copies2_cellOf(-2.5, 0, 1, 4) == 0);
+    assert(copies2_cellOf(9.5, 0, 1, 4) == 3);
+    assert(copies2_cellOf(1, 0.5, 0.5, 8) == 3);
 
     ubyte[16] cells;
     auto g = Grid(4, 1, 0, 0, cells[]);
-    assert(copies0_clearLine(g, 0.5, 0.5, 3.5, 3.5));
+    assert(copies3_clearLine(g, 0.5, 0.5, 3.5, 3.5));
     cells[5] = 1;
-    assert(!copies0_clearLine(g, 0.5, 0.5, 3.5, 3.5));
+    assert(!copies3_clearLine(g, 0.5, 0.5, 3.5, 3.5));
 }
