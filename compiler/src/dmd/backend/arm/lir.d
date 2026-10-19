@@ -415,7 +415,7 @@ bool lirCodegen(ref CGstate cg)
     }
     estimateFrequencies();
     computeLiveness();
-    allocate();
+    allocateAll();
     if (env!"DMD_NEWCG_DUMP")
         dump();
     splitSpilled();
@@ -13163,6 +13163,27 @@ private immutable ubyte[] fpOrder = [32+16,32+17,32+18,32+19,32+20,32+21,32+22,3
                                      32+0,32+1,32+2,32+3,32+4,32+5,32+6,32+7,
                                      32+8,32+9,32+10,32+11,32+12,32+13,32+14,32+15];
 
+/* The same with the registers reserved for spilled values too, for a function that
+ * spills none of the class
+ */
+private immutable ubyte[] gpOrderAll = [9,10,11,12,13,8,0,1,2,3,4,5,6,7,14,15, 19,20,21,22,23,24,25,26,27,28];
+private immutable ubyte[] fpOrderAll = [32+16,32+17,32+18,32+19,32+20,32+21,32+22,32+23,32+24,32+25,32+26,32+27,32+28,
+                                        32+29,32+30,32+31,
+                                        32+0,32+1,32+2,32+3,32+4,32+5,32+6,32+7,
+                                        32+8,32+9,32+10,32+11,32+12,32+13,32+14,32+15];
+
+private __gshared bool[2] scratchAllocated;     // by RC: the spill registers are allocated as others
+
+/* The registers allocated for values of class rc, in order of preference
+ */
+@trusted
+private const(ubyte)[] regOrder(RC rc)
+{
+    if (rc == RC.fp)
+        return scratchAllocated[RC.fp] ? fpOrderAll : fpOrder;
+    return scratchAllocated[RC.gp] ? gpOrderAll : gpOrder;
+}
+
 /* Whether physical register p may hold v: of its class, and for a 128 bit vector not
  * one of v8 .. v15, of which a call preserves only the low 64 bits
  */
@@ -13171,7 +13192,8 @@ private bool allowedFor(uint p, const VInfo* v)
     return allocatable(p, v.rc) && !(v.sz == 16 && p >= 32 + 8 && p < 32 + 16);
 }
 
-/* Registers reserved for loading and storing spilled values
+/* Registers reserved for loading and storing spilled values, unless none of their
+ * class is spilled
  */
 private immutable ubyte[3] gpScratch = [14, 15, 17];
 private immutable ubyte[3] fpScratch = [32+29, 32+30, 32+31];     // no instruction has more FP operands
@@ -13254,6 +13276,40 @@ private void occupy(uint p, ref Barray!Range rs, Reg owner)
             --k;
         }
         (*occ)[k] = r;
+    }
+}
+
+/* Allocate the registers, first with the registers reserved for spilled values
+ * allocated too, then again with them reserved for a class of which a register is
+ * spilled
+ */
+@trusted
+private void allocateAll()
+{
+    scratchAllocated[RC.gp] = true;
+    // POPCNT counts in v29
+    scratchAllocated[RC.fp] = true;
+    foreach (ref i; ins[])
+        if (i.op == LOp.popcnt)
+            scratchAllocated[RC.fp] = false;
+    while (true)
+    {
+        allocate();
+        bool again;
+        foreach (ref v; vinfo[])
+            if (v.spilled && scratchAllocated[v.rc])
+            {
+                scratchAllocated[v.rc] = false;
+                again = true;
+            }
+        if (!again)
+            return;
+        foreach (ref v; vinfo[])
+        {
+            v.preg = uint.max;
+            v.spilled = false;
+            v.callSaved = false;
+        }
     }
 }
 
@@ -13462,7 +13518,7 @@ private void allocate()
     foreach (r; order[])
     {
         auto v = vi(r);
-        const(ubyte)[] prefs = v.rc == RC.fp ? fpOrder : gpOrder;
+        const(ubyte)[] prefs = regOrder(v.rc);
         const affs = affinities[affStart[r - firstVreg] .. affStart[r - firstVreg + 1]];
         uint chosen = uint.max;
         // the register of what it is copied to or from most often that it can have
@@ -13662,7 +13718,7 @@ private bool covers(ref Barray!Range rs, uint from, uint to)
 
 private bool allocatable(uint p, RC rc)
 {
-    foreach (q; rc == RC.fp ? fpOrder : gpOrder)
+    foreach (q; regOrder(rc))
         if (q == p)
             return true;
     return false;
@@ -13812,7 +13868,7 @@ private void splitSpilled()
             if (held)
                 continue;
             auto v = vi(r);
-            foreach (p; v.rc == RC.fp ? fpOrder : gpOrder)
+            foreach (p; regOrder(v.rc))
                 if (!overlaps(occupied[p], lr, occupiedMaxLen[p]))
                 {
                     occupy(p, lr, r);
