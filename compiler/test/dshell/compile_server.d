@@ -89,8 +89,9 @@ int main()
         if (exists(d))
             rmdirRecurse(d);
     mkdirRecurse(serverDir);
-    mkdirRecurse(src ~ "/imp");
-    foreach (f; ["app.d", "imp/lib.d", "imp/old.d", "imp/renamed.d", "banner.txt"])
+    mkdirRecurse(src ~ "/imp/pkg");
+    foreach (f; ["app.d", "imp/lib.d", "imp/old.d", "imp/renamed.d", "imp/pkg/package.d", "imp/pkg/sub.d",
+            "banner.txt"])
         copy(EXTRA_FILES ~ "/compile_server/" ~ f, src ~ "/" ~ f);
     environment["DMD_SERVER"] = serverDir;
     environment.remove("DMD_SERVER_VERIFY");
