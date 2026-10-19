@@ -42,6 +42,22 @@ pragma(inline, false) int id(int x) @safe { return x; }
     return best;
 }
 
+// 22 iterations: 5 of 4 lanes and 2 left
+@safe int vecFirstOver(const ref int[22] p, int v)
+{
+    int best = 99, bestErr = int.max;
+    foreach (k; 0 .. 22)
+    {
+        const e = p[k] > v ? p[k] - v : v - p[k];
+        if (e < bestErr)
+        {
+            bestErr = e;
+            best = k;
+        }
+    }
+    return best;
+}
+
 int vecArgmin(const(int)* p, int n)
 {
     int best = -1, bestErr = int.max;
@@ -163,6 +179,10 @@ int main()
             s = id(s + (v > x ? v - x : x - v));
         check(unrolledAbsSum(p, v) == s);
         check(vecArgminFixed(p, v) == refArgmin(p[], v, false));
+        int[22] q;
+        foreach (ref x; q)
+            x = rnd() % (t % 3 == 0 ? 4 : 300) - 20;
+        check(vecFirstOver(q, v) == refArgmin(q[], v, false));
     }
     foreach (n; 0 .. 40)
     {

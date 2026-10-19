@@ -11327,12 +11327,51 @@ private bool vectorizeLoops()
                 s.push(b);
             }
             const notCond = lv.cond == COND.cc ? COND.cs : lv.cond == COND.lt ? COND.ge : COND.eq;
-            LoopVec.emitTo(code, LOp.cmp, w, noReg, lv.iv, nreg);
-            branch(code, notCond, scalarLabel, scalarToLabel);
+            /* the number of iterations, when the induction starts at a constant everywhere
+             * before the loop and the bound is a constant
+             */
+            long known = -1;
+            if (lv.boundIsImm)
+            {
+                bool ok = true, any;
+                long c0;
+                foreach (n, ref i; ins[])
+                {
+                    if (n >= start && n < lend || i.d != lv.iv)
+                        continue;
+                    const(LIns)* d = &i;
+                    if (d.op == LOp.copy && d.a && !isPhys(d.a) && d.a - firstVreg < nregs && lv.ndefs[d.a - firstVreg] == 1)
+                        d = &ins[lv.defIns[d.a - firstVreg]];
+                    if (d.op != LOp.movi || any && d.imm != c0)
+                        ok = false;
+                    c0 = d.imm;
+                    any = true;
+                }
+                if (ok && any)
+                {
+                    long b = lv.boundImm;
+                    if (w == 4)
+                    {
+                        c0 = lv.cond == COND.lt ? cast(int)c0 : cast(uint)c0;
+                        b = lv.cond == COND.lt ? cast(int)b : cast(uint)b;
+                    }
+                    if (lv.cond == COND.cc ? cast(ulong)c0 < cast(ulong)b : lv.cond == COND.lt ? c0 < b : c0 != b && c0 < b)
+                        known = b - c0;
+                }
+            }
+            if (known >= 0 && known < 4)
+                return fails("few iterations");
             Reg cnt = newVreg(RC.gp, w);
-            LoopVec.emitTo(code, LOp.sub, w, cnt, nreg, lv.iv);
-            LoopVec.emitTo(code, LOp.cmpi, w, noReg, cnt, noReg, 4);
-            branch(code, COND.cc, scalarLabel, scalarToLabel);
+            if (known >= 0)
+                LoopVec.emitTo(code, LOp.movi, w, cnt, noReg, noReg, known);
+            else
+            {
+                LoopVec.emitTo(code, LOp.cmp, w, noReg, lv.iv, nreg);
+                branch(code, notCond, scalarLabel, scalarToLabel);
+                LoopVec.emitTo(code, LOp.sub, w, cnt, nreg, lv.iv);
+                LoopVec.emitTo(code, LOp.cmpi, w, noReg, cnt, noReg, 4);
+                branch(code, COND.cc, scalarLabel, scalarToLabel);
+            }
             foreach (ref i; lv.pre[])
                 code.push(i);
             foreach (ref i; lv.checks[])
@@ -11435,7 +11474,10 @@ private bool vectorizeLoops()
                 if (!c.induction)
                     LoopVec.emitTo(code, LOp.vqg, 16, c.acc, c.r, noReg, c.zeroLanes ? Neon.fmovSW : Neon.dup4sW);
             Reg c4 = newVreg(RC.gp, w), vend = newVreg(RC.gp, w);
-            LoopVec.emitTo(code, LOp.andi, w, c4, cnt, noReg, w == 4 ? 0xFFFF_FFFCL : ~3L);
+            if (known >= 0)
+                LoopVec.emitTo(code, LOp.movi, w, c4, noReg, noReg, known & ~3L);
+            else
+                LoopVec.emitTo(code, LOp.andi, w, c4, cnt, noReg, w == 4 ? 0xFFFF_FFFCL : ~3L);
             LoopVec.emitTo(code, LOp.add, w, vend, lv.iv, c4);
 
             // the vector loop
@@ -11502,8 +11544,13 @@ private bool vectorizeLoops()
                 LoopVec.emitTo(code, LOp.vq, 16, s, sel, noReg, c.signedIndex ? Neon.sminv : Neon.uminv);
                 LoopVec.emitTo(code, LOp.vgq, 4, c.r, s, noReg, Neon.fmovWS);
             }
-            LoopVec.emitTo(code, LOp.cmp, w, noReg, lv.iv, nreg);
-            branch(code, notCond, exitTarget, false);
+            if (known >= 0 && known % 4 == 0)
+                branch(code, COND.al, exitTarget, false);      // no iterations left
+            else
+            {
+                LoopVec.emitTo(code, LOp.cmp, w, noReg, lv.iv, nreg);
+                branch(code, notCond, exitTarget, false);
+            }
 
             // commit
             foreach (ref i; code[])
