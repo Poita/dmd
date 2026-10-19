@@ -3101,6 +3101,18 @@ Lno:
     return false;
 }
 
+/// The functions a call was inlined into, and the functions enclosing them
+private __gshared bool[void*] inlinedInto;
+
+/***********************************************************
+ * Returns:
+ *      whether a call was inlined into `fd` or a function nested in it
+ */
+public bool hasInlinedCalls(FuncDeclaration fd)
+{
+    return (cast(void*)fd in inlinedInto) !is null;
+}
+
 /***********************************************************
  * Expand a function call inline,
  *      ethis.fd(arguments)
@@ -3132,6 +3144,10 @@ private void expandInline(CallExp ecall, FuncDeclaration fd, FuncDeclaration par
     }
     scope ids = new InlineDoState(parent, fd);
     ids.propagateNRVO = propagateNRVO;
+
+    for (Dsymbol p = parent; p; p = p.toParent2())
+        if (auto f = p.isFuncDeclaration())
+            inlinedInto[cast(void*)f] = true;
 
     /* A function literal outside any function can still be called from other
      * modules (through an enum holding it), so the caller records it to be

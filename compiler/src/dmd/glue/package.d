@@ -2018,9 +2018,15 @@ private void findUnusedNested(FuncDeclaration fd)
     import dmd.visitor.postorder : walkPostorder;
     import dmd.visitor : StoppableVisitor;
     import dmd.dsymbolsem : toAlias;
+    import dmd.inline : hasInlinedCalls;
 
     // needsClosure() is not asked, as buildClosure() diagnoses what it changes
     if (!fd.fbody || fd.hasInlineAsm)
+        return;
+    /* Only inlining leaves a nested function nothing refers to that is worth
+     * leaving out; without it the scan would cost more than it saves
+     */
+    if (!hasInlinedCalls(fd))
         return;
     bool simple = true;
     FuncDeclarations declared;
