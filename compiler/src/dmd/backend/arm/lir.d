@@ -2753,16 +2753,16 @@ private void cseForget(size_t mark)
     cseBlocks.setLength(mark);
 }
 
-/* The register of CSE e evaluated before: a read of a variable shared by blocks
- * only from a block that dominates this one, as one that does not need not have
- * run before it, and reading the variable again there is as good
+/* The register of CSE e evaluated before, in this block or one that dominates it:
+ * the optimizer shares CSEs between blocks, which are generated in the order they
+ * are laid out, where one that does not dominate this one need not have run before
+ * it; evaluating e again here is as good
  */
 @trusted
 private Reg cseLookup(elem* e)
 {
-    const shared_ = isCrossBlockVar(e);
     foreach (i, x; cseElems[])
-        if (x is e && (!shared_ || blockDominates(cseBlocks[i], curBlock)))
+        if (x is e && blockDominates(cseBlocks[i], curBlock))
             return cseRegs[i];
     return noReg;
 }
@@ -3016,9 +3016,8 @@ private Pair genPair(elem* e)
 {
     if (e.Ecount)
     {
-        const shared_ = isCrossBlockVar(e);
         foreach (i, x; cseElems[])
-            if (x is e && (!shared_ || blockDominates(cseBlocks[i], curBlock)))
+            if (x is e && blockDominates(cseBlocks[i], curBlock))
                 return Pair(cseRegs[i], cseHis[i]);
     }
     Pair p = genPairx(e);
