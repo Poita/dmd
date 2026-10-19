@@ -479,7 +479,7 @@ private bool supported(ref CGstate cg)
                 return true;
         return false;
     }
-    if (tyr != TYvoid && !scalarType(tyr) && !pairType(tyr) &&
+    if (tyr != TYvoid && tyr != TYnoreturn && !scalarType(tyr) && !pairType(tyr) &&
         retAgg != AggregateABI.Kind.hfa && retAgg != AggregateABI.Kind.gpr &&
         !(tyaggregate(tyr) && hiddenResult()))
     {
