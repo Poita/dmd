@@ -247,8 +247,8 @@ version (Posix)
     }
     /// in a worker: the template instance functions each worker generates, by the worker
     private __gshared NameTable* claims;
-    /// in a worker: the functions of root modules found not to be inlinable, with
-    /// a bit set for each way they were found not to be inlinable (see `inlineVerdictBit`)
+    /// in a worker: the functions found not to be inlinable, with a bit set for each
+    /// way they were found not to be inlinable (see `inlineVerdictBit`)
     private __gshared NameTable* verdicts;
     private __gshared uint workerIndex;     // in a worker: its number
 
@@ -438,9 +438,8 @@ uint inlineVerdictBit(bool hasThis, bool statementsToo)
 }
 
 /**************************************
- * In a worker: record for the other workers that a function of a root module, which
- * this worker has analyzed, cannot be inlined in one way, so that they need not analyze
- * it to find that out.
+ * In a worker: record for the other workers that a function this worker has analyzed
+ * cannot be inlined in one way, so that they need not analyze it to find that out.
  * Params:
  *      name = the function's mangled name
  *      bit = the way it cannot be inlined, from `inlineVerdictBit`
