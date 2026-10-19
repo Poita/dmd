@@ -8728,6 +8728,7 @@ extern (D) bool load(Import imp, Scope* sc)
             return true;
         }
     }
+    bool loaded;
     Dsymbol s = dst.lookup(imp.id);
     if (s)
     {
@@ -8745,6 +8746,7 @@ extern (D) bool load(Import imp, Scope* sc)
                 {
                     const preverrors = global.errors;
                     imp.mod = Module.load(imp.loc, imp.packages, imp.id);
+                    loaded = imp.mod !is null;
                     if (!imp.mod)
                         p.isPkgMod = PKG.package_;
                     else
@@ -8780,7 +8782,6 @@ extern (D) bool load(Import imp, Scope* sc)
             }
         }
     }
-    bool loaded;
     if (!imp.mod)
     {
         // Load module

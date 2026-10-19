@@ -56,6 +56,7 @@ import dmd.globals;
 import dmd.location : Loc;
 import dmd.root.array;
 import dmd.root.filename;
+import dmd.root.string : toDString;
 
 version (Posix)
 {
@@ -245,17 +246,21 @@ void recordImports(ref Modules modules)
             startable = false;
             return;
         }
+        // a module no import loaded is a package.d loaded to look up a package
         auto name = cast(void*)m in loadedAs;
-        if (!name)
+        if (!name && !m.isPackageFile)
         {
             startable = false;
             return;
         }
-        size_t from = 0;
+        const(char)[] how = name ? "import" : "package";
+        const(char)[] n = name ? *name : m.toPrettyChars().toDString();
+        int from = -1;
         foreach (i, r; modules)
             if (r is m.importedFrom)
-                from = i;
-        buf.printf("%d\t%.*s\t%s\n", cast(int)from, cast(int)name.length, name.ptr, m.srcfile.toChars());
+                from = cast(int)i;
+        buf.printf("%d\t%.*s\t%.*s\t%s\n", from, cast(int)how.length, how.ptr,
+            cast(int)n.length, n.ptr, m.srcfile.toChars());
     }
     importList = buf.extractSlice();
 }
@@ -789,20 +794,28 @@ bool preload(ref Modules roots)
     }
     Identifier.suffixCount = rootIds;
 
-    static struct Entry { Module from; const(char)[] name; const(char)[] file; }
+    // `<root index or -1>\t<import|package>\t<name>\t<file>`
+    static struct Entry { Module from; bool imported; const(char)[] name; const(char)[] file; }
     Entry[] entries;
     foreach (line; lines[1 .. $])
     {
-        const t1 = indexOf(line, '\t');
-        const t2 = t1 < 0 ? -1 : indexOf(line[t1 + 1 .. $], '\t');
-        if (t2 < 0)
+        const(char)[][4] f;
+        foreach (i; 0 .. 3)
+        {
+            const t = indexOf(line, '\t');
+            if (t < 0)
+                return false;
+            f[i] = line[0 .. t];
+            line = line[t + 1 .. $];
+        }
+        f[3] = line;
+        const from = atoi((f[0] ~ '\0').ptr);
+        if (from < -1 || from >= cast(int)roots.length)
             return false;
-        const from = atoi((line[0 .. t1] ~ '\0').ptr);
-        if (from < 0 || from >= roots.length)
-            return false;
-        auto e = Entry(roots[from], line[t1 + 1 .. t1 + 1 + t2].idup, line[t1 + 2 + t2 .. $].idup);
+        auto e = Entry(from < 0 ? null : roots[from], f[1] == "import", f[2].idup, f[3].idup);
         entries ~= e;
-        listedImporter[e.file] = e.from;
+        if (e.from)
+            listedImporter[e.file] = e.from;
     }
 
     Module[const(char)[]] loaded;
@@ -814,14 +827,18 @@ bool preload(ref Modules roots)
             const(char)[] rest = e.name;
             for (ptrdiff_t dot; (dot = indexOf(rest, '.')) >= 0; rest = rest[dot + 1 .. $])
                 packages ~= Identifier.idPool(rest[0 .. dot]);
-            // as an import of a root module loads it, but without the import's location
+            // as an import of a root module loads it, but without the import's location,
+            // or as looking up a package loads its package.d
             auto id = Identifier.idPool(rest);
             auto dst = Package.resolve(packages, null, null);
             auto m = Module.load(Loc.initial, packages, id);
             if (!m || m.srcfile.toString() != e.file || global.errors)
                 return false;
-            dst.insert(id, m);
-            unplaced[cast(void*)m] = true;
+            if (e.imported)
+            {
+                dst.insert(id, m);
+                unplaced[cast(void*)m] = true;
+            }
             if (!m.importedFrom)
                 m.importedFrom = e.from;
             m.importAll(null);
