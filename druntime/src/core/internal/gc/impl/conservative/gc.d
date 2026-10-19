@@ -5787,19 +5787,30 @@ unittest
 // a collection marks on the sequential path when there are no scan threads to share the work
 static if (!isSingleThreaded) unittest
 {
-    auto gc = cast(ConservativeGC) initialize();
-    scope (exit)
-        destroy(gc);
+    version (Posix)
+        auto processGcx = Gcx.instance;
+    {
+        // the test Gcx replaces Gcx.instance, which the fork handlers use, and
+        // clears it when destroyed: hand it back to the process GC afterwards
+        version (Posix)
+            scope (exit)
+                Gcx.instance = processGcx;
+        auto gc = cast(ConservativeGC) initialize();
+        scope (exit)
+            destroy(gc);
 
-    void*[16] keep;
-    foreach (ref p; keep)
-        p = gc.malloc(32);
-    gc.collect();
-    foreach (p; keep)
-        assert(gc.addrOf(p) is p);
+        void*[16] keep;
+        foreach (ref p; keep)
+            p = gc.malloc(32);
+        gc.collect();
+        foreach (p; keep)
+            assert(gc.addrOf(p) is p);
 
-    if (gc.gcx.numScanThreads == 0)
-        assert(gc.gcx.toscanRoots.ptr is null);
+        if (gc.gcx.numScanThreads == 0)
+            assert(gc.gcx.toscanRoots.ptr is null);
+    }
+    version (Posix)
+        assert(Gcx.instance is processGcx);
 }
 
 // ranges pushed together are popped in their original order, after ranges pushed earlier
