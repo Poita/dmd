@@ -3219,34 +3219,34 @@ public bool hasInlinedCalls(FuncDeclaration fd)
 }
 
 /* In a compilation split across worker processes, a worker can inline functions of
- * the root modules other workers compile, which it analyzes to find whether it can.
- * What a worker finds cannot be inlined is shared with the other workers, which then
- * need not analyze such functions themselves: that also spares them analyzing the
- * template instances their bodies need.
+ * the root modules other workers compile, and of imported modules, which it analyzes to
+ * find whether it can. What a worker finds cannot be inlined is shared with the other
+ * workers, which then need not analyze such functions themselves: that also spares them
+ * analyzing the template instances their bodies need.
  *
  * Only the functions whose analysis does not change their signature, and so their
  * mangled name, are shared.
  */
 private bool sharesInlineVerdict(FuncDeclaration fd)
 {
-    if (!fd.type || !fd.type.deco ||
-        fd.isInstantiated() || fd.isNested() || fd.isFuncLiteralDeclaration() || fd.inferRetType ||
-        fd.purityInprocess || fd.safetyInprocess || fd.nothrowInprocess || fd.nogcInprocess)
-        return false;
-    auto m = fd.getModule();
-    return m && m.isRoot();
+    return fd.type && fd.type.deco && fd.getModule() &&
+        !(fd.isInstantiated() || fd.isNested() || fd.isFuncLiteralDeclaration() || fd.inferRetType ||
+          fd.purityInprocess || fd.safetyInprocess || fd.nothrowInprocess || fd.nogcInprocess);
 }
 
-/* Returns: true if `fd`, not analyzed by this worker and of a module another worker
- * compiles, was found by a worker not to be inlinable
+/* Returns: true if `fd`, not analyzed by this worker and of a module it does not compile,
+ * was found by a worker not to be inlinable
  */
 private bool foundNotInlinableElsewhere(FuncDeclaration fd, bool hasThis, bool statementsToo)
 {
     import dmd.mangle : mangleExact;
-    import dmd.parallel : compiledElsewhere, foundNotInlinable, inlineVerdictBit;
+    import dmd.parallel : compiledElsewhere, foundNotInlinable, inlineVerdictBit, sharingInlineVerdicts;
     import dmd.root.string : toDString;
 
-    if (!compiledElsewhere(fd.getModule()) || !sharesInlineVerdict(fd))
+    if (!sharingInlineVerdicts() || !sharesInlineVerdict(fd))
+        return false;
+    auto m = fd.getModule();
+    if (m.isRoot() && !compiledElsewhere(m))
         return false;
     return foundNotInlinable(mangleExact(fd).toDString(), inlineVerdictBit(hasThis, statementsToo));
 }
