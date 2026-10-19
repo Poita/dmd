@@ -2890,7 +2890,19 @@ private Pair genPairx(elem* e)
         if (auto av = aggOf(e.Vsym))
             if (av.abi.kind == AggregateABI.Kind.hfa && av.abi.size > 8 && av.abi.size <= 16)
                 return Pair(hfaWord(av, 0), hfaWord(av, 1));    // its bytes, from the elements
-    if (hfaAsInteger(e))
+    if (hfaAsInteger(e) && (e.Eoper == OPcall || e.Eoper == OPucall) && !(e.Nflags & NFLhidden))
+    {
+        // its bytes, from the elements the call returns in V registers
+        const a = aarch64Aggregate(cast(type*)e.ET);
+        if (a.kind == AggregateABI.Kind.hfa && a.size <= 16)
+        {
+            Reg[4] r;
+            genCall(e, null, &r);
+            return Pair(hfaWord(a, r, 0), hfaWord(a, r, 1));
+        }
+    }
+    // the halves of a pair are the bytes of the aggregate
+    if (hfaAsInteger(e) && e.Eoper != OPpair && e.Eoper != OPrpair)
     {
         if (env!"DMD_NEWCG_WHY")
         {
@@ -3002,27 +3014,36 @@ private bool hfaAsInteger(const(elem)* e)
 @trusted
 private Reg hfaWord(AggVar* av, uint w)
 {
-    const esz = av.abi.esz;
+    return hfaWord(av.abi, av.slots, w);
+}
+
+/* Bytes 8 * w .. 8 * w + 7 of the HFA of ABI a whose elements are in the V
+ * registers r, those past it zero, in a new integer register
+ */
+@trusted
+private Reg hfaWord(ref const AggregateABI a, Reg[4] r, uint w)
+{
+    const esz = a.esz;
     if (esz == 8)
     {
         Reg d = newVreg(RC.gp, 8);
-        if (w < av.abi.nregs)
-            emitIns(LOp.copy, 8, d, av.slots[w]);
+        if (w < a.nregs)
+            emitIns(LOp.copy, 8, d, r[w]);
         else
             emitIns(LOp.movi, 8, d, noReg, noReg, 0);
         return d;
     }
     const k = w * 2;
-    if (k >= av.abi.nregs)
+    if (k >= a.nregs)
     {
         Reg d = newVreg(RC.gp, 8);
         emitIns(LOp.movi, 8, d, noReg, noReg, 0);
         return d;
     }
-    Reg lo = extendFrom(asClass(av.slots[k], RC.gp, 4), 32, false, 8);
-    if (k + 1 >= av.abi.nregs)
+    Reg lo = extendFrom(asClass(r[k], RC.gp, 4), 32, false, 8);
+    if (k + 1 >= a.nregs)
         return lo;
-    Reg hi = asClass(av.slots[k + 1], RC.gp, 4);
+    Reg hi = asClass(r[k + 1], RC.gp, 4);
     Reg d = newVreg(RC.gp, 8);
     auto i = emitIns(LOp.orr, 8, d, lo, hi, 32);
     i.flags |= F.shifted;
@@ -4494,6 +4515,16 @@ private Reg genx(elem* e)
             if (auto av = aggOf(e.Vsym))
                 if (av.abi.kind == AggregateABI.Kind.hfa && av.abi.size <= 8)
                     return hfaWord(av, 0);
+        if ((op == OPcall || op == OPucall) && !(e.Nflags & NFLhidden))
+        {
+            const a = aarch64Aggregate(cast(type*)e.ET);
+            if (a.kind == AggregateABI.Kind.hfa && a.size <= 8)
+            {
+                Reg[4] r;
+                genCall(e, null, &r);
+                return hfaWord(a, r, 0);
+            }
+        }
     }
     if (pairType(ty) || hfaAsInteger(e))
     {
