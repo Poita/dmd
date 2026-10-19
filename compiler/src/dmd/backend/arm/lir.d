@@ -13954,12 +13954,24 @@ private void rewriteSpills()
                 ins.push(l);
                 r = s;
             }
-            // a copy to or from a spilled register is a store or a load
-            if (i.op == LOp.copy && !(i.flags & F.condDef) && i.d && i.a && !isPhys(i.d) && !isPhys(i.a) &&
-                rcOf(i.d) == rcOf(i.a) && vi(i.d).spilled != vi(i.a).spilled)
+            /* a copy to or from a spilled register is a store or a load, also of a
+             * physical register when the copy is of all that the stack slot holds
+             */
+            bool spilledVirtual(Reg r) { return !isPhys(r) && vi(r).spilled; }
+            bool wholeSlot()
+            {
+                if (!isPhys(i.d) && !isPhys(i.a))
+                    return true;
+                if (isPhys(i.d) && isPhys(i.a))
+                    return false;
+                auto v = vi(isPhys(i.d) ? i.a : i.d);
+                return i.sz == (v.rc == RC.fp ? v.sz : 8);
+            }
+            if (i.op == LOp.copy && !(i.flags & F.condDef) && i.d && i.a && rcOf(i.d) == rcOf(i.a) &&
+                spilledVirtual(i.d) != spilledVirtual(i.a) && wholeSlot())
             {
                 LIns m;
-                if (vi(i.d).spilled)
+                if (spilledVirtual(i.d))
                 {
                     auto v = vi(i.d);
                     m.op = LOp.st;
