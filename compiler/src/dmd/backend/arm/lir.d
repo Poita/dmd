@@ -6225,6 +6225,7 @@ private bool cheapConstant(ref const LIns i)
 private void computeLiveness()
 {
     const nb = blocks.length;
+    clearNops();
 
     // the definitions of each register, and the registers that are a copy of another
     defStart.setLength(vinfo.length + 1);
@@ -7698,6 +7699,17 @@ private void removeDead()
         }
     }
     uses.dtor();
+    clearNops();
+}
+
+/* Take the registers out of the instructions made nops, which define and use nothing
+ */
+@trusted
+private void clearNops()
+{
+    foreach (ref i; ins[])
+        if (i.op == LOp.nop)
+            i.d = i.a = i.b = i.c = noReg;
 }
 
 /* The truncation of x to an integer fixed up to round toward minus infinity,
