@@ -3,6 +3,18 @@
 // not reassociated, so stays scalar.
 module float_ops;
 
+// asserts are compiled out by -release
+void check(bool ok, int line = __LINE__)
+{
+    import core.stdc.stdio : printf;
+    import core.stdc.stdlib : abort;
+    if (!ok)
+    {
+        printf("check failed at line %d\n", line);
+        abort();
+    }
+}
+
 pragma(inline, false) float id(float x) { return x; }
 pragma(inline, false) int idi(int x) { return x; }
 
@@ -99,28 +111,29 @@ int main()
             ia[i] = idi(cast(int)(i * 2654435761u));
         }
         vecArith(c, a, b);
-        foreach (i; 0 .. n) assert(same(c[i], id(a[i]) * b[i] - a[i] / (b[i] + 1.5f)));
+        foreach (i; 0 .. n) check(same(c[i], id(a[i]) * b[i] - a[i] / (b[i] + 1.5f)));
         vecUnary(c, a);
         {
             import core.math : sqrt;
-            foreach (i; 0 .. n) assert(same(c[i], -(id(a[i]) < 0 ? -a[i] : a[i]) + sqrt(id(a[i]) * a[i])));
+            foreach (i; 0 .. n) check(same(c[i], -(id(a[i]) < 0 ? -a[i] : a[i]) + sqrt(id(a[i]) * a[i])));
         }
         vecFmin(c, a, b);
-        foreach (i; 0 .. n) assert(same(c[i], id(a[i]) < b[i] ? a[i] : b[i]));
+        foreach (i; 0 .. n) check(same(c[i], id(a[i]) < b[i] ? a[i] : b[i]));
         vecFmaxGe(c, a, b);
-        foreach (i; 0 .. n) assert(same(c[i], id(a[i]) >= b[i] ? a[i] : b[i]));
+        foreach (i; 0 .. n) check(same(c[i], id(a[i]) >= b[i] ? a[i] : b[i]));
         vecSelectNe(c, a, b);
-        foreach (i; 0 .. n) assert(same(c[i], id(a[i]) != b[i] ? 1.0f : 2.0f));
+        foreach (i; 0 .. n) check(same(c[i], id(a[i]) != b[i] ? 1.0f : 2.0f));
         vecToInt(ic, a);
-        foreach (i; 0 .. n) assert(ic[i] == cast(int)(id(a[i]) * 2.5f));
+        foreach (i; 0 .. n) check(ic[i] == cast(int)(id(a[i]) * 2.5f));
         vecFromInt(c, ia);
-        foreach (i; 0 .. n) assert(same(c[i], cast(float)idi(ia[i]) * 0.5f));
+        foreach (i; 0 .. n) check(same(c[i], cast(float)idi(ia[i]) * 0.5f));
         vecZeroCompare(c, a);
-        foreach (i; 0 .. n) assert(same(c[i], id(a[i]) > 0 ? a[i] : 0));
+        foreach (i; 0 .. n) check(same(c[i], id(a[i]) > 0 ? a[i] : 0));
         float s = 0;
         foreach (v; a[0 .. n])
             s = id(s + v);
-        assert(same(novecSum(a), s));
+        const t = novecSum(a);
+        check(same(t, s) || t != t && s != s);      // which NaN an addition of two keeps may differ
     }
 
     foreach (size; 0 .. 12)
@@ -144,7 +157,7 @@ int main()
                 const c = size_t(j) * size + i;
                 const uL = size_t(j) * g.uw + i;
                 const vB = size_t(j) * size + i;
-                assert(same(g.div[c], id(g.hu[uL + 1] * g.wu[uL + 1]) - id(g.hu[uL] * g.wu[uL])
+                check(same(g.div[c], id(g.hu[uL + 1] * g.wu[uL + 1]) - id(g.hu[uL] * g.wu[uL])
                     + id(g.hv[vB + size] * g.wv[vB + size]) - id(g.hv[vB] * g.wv[vB])));
             }
     }

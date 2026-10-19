@@ -2,6 +2,18 @@
 // written back truncated, give what the scalar loop does.
 module widen;
 
+// asserts are compiled out by -release
+void check(bool ok, int line = __LINE__)
+{
+    import core.stdc.stdio : printf;
+    import core.stdc.stdlib : abort;
+    if (!ok)
+    {
+        printf("check failed at line %d\n", line);
+        abort();
+    }
+}
+
 pragma(inline, false) int id(int x) { return x; }
 
 void vecUbyte(int[] c, const(ubyte)[] a, const(int)[] b)
@@ -59,18 +71,18 @@ int main()
             ib[i] = id(cast(int)(i * 2654435761u));
         }
         vecUbyte(c, a, ib);
-        foreach (i; 0 .. n) assert(c[i] == id(a[i]) * 3 + ib[i]);
+        foreach (i; 0 .. n) check(c[i] == id(a[i]) * 3 + ib[i]);
         vecByte(c, sb);
-        foreach (i; 0 .. n) assert(c[i] == id(sb[i]) - 1);
+        foreach (i; 0 .. n) check(c[i] == id(sb[i]) - 1);
         vecShort(c, s, us);
-        foreach (i; 0 .. n) assert(c[i] == id(s[i]) * us[i]);
+        foreach (i; 0 .. n) check(c[i] == id(s[i]) * us[i]);
         vecNarrow(cb, a, b);
-        foreach (i; 0 .. n) assert(cb[i] == cast(ubyte)(id(a[i]) + b[i]));
+        foreach (i; 0 .. n) check(cb[i] == cast(ubyte)(id(a[i]) + b[i]));
         vecNarrowShort(cs, ib);
-        foreach (i; 0 .. n) assert(cs[i] == cast(short)(id(ib[i]) >> 1));
+        foreach (i; 0 .. n) check(cs[i] == cast(short)(id(ib[i]) >> 1));
         int m = 0;
         foreach (v; a) m = id(v > m ? v : m);
-        assert(vecMaxByte(a) == m);
+        check(vecMaxByte(a) == m);
     }
     return 0;
 }

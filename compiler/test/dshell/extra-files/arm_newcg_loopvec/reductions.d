@@ -3,6 +3,18 @@
 // give what the scalar loop does, wrapping included.
 module reductions;
 
+// asserts are compiled out by -release
+void check(bool ok, int line = __LINE__)
+{
+    import core.stdc.stdio : printf;
+    import core.stdc.stdlib : abort;
+    if (!ok)
+    {
+        printf("check failed at line %d\n", line);
+        abort();
+    }
+}
+
 pragma(inline, false) int id(int x) { return x; }
 
 int vecSum(const(int)[] a, int s)
@@ -127,43 +139,43 @@ int main()
         auto u = cast(uint[])a;
         int s = 99;
         foreach (v; a) s = id(s + v);
-        assert(vecSum(a, 99) == s);
+        check(vecSum(a, 99) == s);
         uint us = 7;
         foreach (v; u) us = id(us + v * v);
-        assert(vecSumSquares(u) == us);
+        check(vecSumSquares(u) == us);
         s = 1000;
         foreach (v; a) s = id(s - v);
-        assert(vecSubtract(a) == s);
+        check(vecSubtract(a) == s);
         int m = int.min;
         foreach (v; a) m = id(v > m ? v : m);
-        assert(vecMax(a) == m);
+        check(vecMax(a) == m);
         m = 12;
         foreach (v; a) m = id(m < v ? m : v);
-        assert(vecMinStart(a, 12) == m);
+        check(vecMinStart(a, 12) == m);
         uint um = uint.max;
         foreach (v; u) um = id(v <= um ? v : um);
-        assert(vecUMin(u) == um);
+        check(vecUMin(u) == um);
         um = 3;
         foreach (v; u) um = id(v >= um ? v : um);
-        assert(vecUMaxGe(u) == um);
+        check(vecUMaxGe(u) == um);
         int k = 0;
         foreach (v; a) k = id(k + (v > 100));
-        assert(vecCount(a, 100) == k);
+        check(vecCount(a, 100) == k);
         um = 0x100;
         foreach (v; u) um = id(um | v);
-        assert(vecOr(u) == um);
+        check(vecOr(u) == um);
         um = 5;
         foreach (v; u) um = id(um ^ (v * 3));
-        assert(vecXor(u) == um);
+        check(vecXor(u) == um);
         um = uint.max;
         foreach (v; u) um = id(um & (v | 1));
-        assert(vecAnd(u) == um);
+        check(vecAnd(u) == um);
         s = 0; m = int.max;
         foreach (i; 0 .. n) { s = id(s + a[i] * b[i]); m = id(a[i] < m ? a[i] : m); }
-        assert(vecTwo(a, b) == (s ^ m));
+        check(vecTwo(a, b) == (s ^ m));
         s = 0;
-        assert(novecPrefix(c, a) == vecSum(a, 0));
-        foreach (i; 0 .. n) { s = id(s + a[i]); assert(c[i] == s); }
+        check(novecPrefix(c, a) == vecSum(a, 0));
+        foreach (i; 0 .. n) { s = id(s + a[i]); check(c[i] == s); }
     }
     return 0;
 }

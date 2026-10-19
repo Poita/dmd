@@ -4,6 +4,18 @@
 // 4 at a time.
 module aliasing;
 
+// asserts are compiled out by -release
+void check(bool ok, int line = __LINE__)
+{
+    import core.stdc.stdio : printf;
+    import core.stdc.stdlib : abort;
+    if (!ok)
+    {
+        printf("check failed at line %d\n", line);
+        abort();
+    }
+}
+
 pragma(inline, false) int id(int x) { return x; }
 
 void vecCopyAdd(int* d, const(int)* s, size_t n)
@@ -47,14 +59,14 @@ void vecField(ref S s)
 void vecBytes(ubyte* d, const(int)* s, size_t n)
 {
     foreach (i; 0 .. n)
-        d[i] = cast(ubyte)(s[i] + 1);
+        d[i] = cast(ubyte)((s[i] >> 3) + 1);
 }
 
 void refCopyAdd(int* d, const(int)* s, size_t n) { foreach (i; 0 .. n) d[i] = id(s[i] + 1); }
 void refTwoStores(int* d, int* e, const(int)* s, size_t n) { foreach (i; 0 .. n) { d[i] = id(s[i]); e[i] = id(s[i] * 2); } }
 void refStoreLoad(int* d, int* e, size_t n) { foreach (i; 0 .. n) { d[i] = id(cast(int)i); e[i] = id(e[i] + d[i] * 3); } }
 void refUniform(int* d, const(int)* k, size_t n) { foreach (i; 0 .. n) d[i] = id(*k + cast(int)i); }
-void refBytes(ubyte* d, const(int)* s, size_t n) { foreach (i; 0 .. n) d[i] = cast(ubyte)id(s[i] + 1); }
+void refBytes(ubyte* d, const(int)* s, size_t n) { foreach (i; 0 .. n) d[i] = cast(ubyte)id((s[i] >> 3) + 1); }
 
 int main()
 {
@@ -67,22 +79,22 @@ int main()
                 foreach (i; 0 .. N) x[i] = y[i] = id(cast(int)(i * 37 + 5));
                 vecCopyAdd(x.ptr + dd, x.ptr + ds, n);
                 refCopyAdd(y.ptr + dd, y.ptr + ds, n);
-                assert(x == y);
+                check(x == y);
 
                 foreach (i; 0 .. N) x[i] = y[i] = id(cast(int)(i * 37 + 5));
                 vecTwoStores(x.ptr + dd, x.ptr + ds, x.ptr + 8, n);
                 refTwoStores(y.ptr + dd, y.ptr + ds, y.ptr + 8, n);
-                assert(x == y);
+                check(x == y);
 
                 foreach (i; 0 .. N) x[i] = y[i] = id(cast(int)(i * 37 + 5));
                 vecStoreLoad(x.ptr + dd, x.ptr + ds, n);
                 refStoreLoad(y.ptr + dd, y.ptr + ds, n);
-                assert(x == y);
+                check(x == y);
 
                 foreach (i; 0 .. N) x[i] = y[i] = id(cast(int)(i * 37 + 5));
                 vecUniform(x.ptr + dd, x.ptr + ds, n);
                 refUniform(y.ptr + dd, y.ptr + ds, n);
-                assert(x == y);
+                check(x == y);
 
                 ubyte[N * 4] bx, by;
                 foreach (i; 0 .. N) x[i] = y[i] = id(cast(int)(i * 37 + 5));
@@ -90,7 +102,7 @@ int main()
                 auto xb = cast(ubyte*)x.ptr, yb = cast(ubyte*)y.ptr;
                 vecBytes(xb + dd * 3, x.ptr + ds, n);
                 refBytes(yb + dd * 3, y.ptr + ds, n);
-                assert(x == y);
+                check(x == y);
             }
     foreach (n; 0 .. 20)
     {
@@ -99,7 +111,7 @@ int main()
         foreach (i, ref v; s.a) v = id(cast(int)i - 3);
         s.scale = 3;
         vecField(s);
-        foreach (i, v; s.a) assert(v == (id(cast(int)i) - 3) * 3 + 1);
+        foreach (i, v; s.a) check(v == (id(cast(int)i) - 3) * 3 + 1);
     }
     return 0;
 }

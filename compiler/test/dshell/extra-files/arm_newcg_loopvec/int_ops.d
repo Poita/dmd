@@ -2,6 +2,18 @@
 // what the scalar loop does for every length, including the wrapping of overflow.
 module int_ops;
 
+// asserts are compiled out by -release
+void check(bool ok, int line = __LINE__)
+{
+    import core.stdc.stdio : printf;
+    import core.stdc.stdlib : abort;
+    if (!ok)
+    {
+        printf("check failed at line %d\n", line);
+        abort();
+    }
+}
+
 pragma(inline, false) int id(int x) { return x; }
 
 void vecAddMul(int[] c, const(int)[] a, const(int)[] b)
@@ -110,41 +122,41 @@ int main()
         if (n > 5) { a[5] = int.min; b[5] = int.min; }
 
         vecAddMul(c, a, b);
-        foreach (i; 0 .. n) assert(c[i] == refAddMul(a[i], b[i]));
+        foreach (i; 0 .. n) check(c[i] == refAddMul(a[i], b[i]));
         vecMulWrap(c.ptr, a.ptr, b.ptr, n);
-        foreach (i; 0 .. n) assert(c[i] == id(a[i]) * b[i] + int.max);
+        foreach (i; 0 .. n) check(c[i] == id(a[i]) * b[i] + int.max);
         vecLogic(c, a, b);
-        foreach (i; 0 .. n) assert(c[i] == ((id(a[i]) & b[i]) ^ (a[i] | 5) ^ ~b[i]));
+        foreach (i; 0 .. n) check(c[i] == ((id(a[i]) & b[i]) ^ (a[i] | 5) ^ ~b[i]));
         vecShift(c, a);
-        foreach (i; 0 .. n) assert(c[i] == (id(a[i]) << 3) + (a[i] >> 2) + cast(int)(cast(uint)a[i] >>> 5) - a[i]);
+        foreach (i; 0 .. n) check(c[i] == (id(a[i]) << 3) + (a[i] >> 2) + cast(int)(cast(uint)a[i] >>> 5) - a[i]);
         vecNeg(c, a);
-        foreach (i; 0 .. n) assert(c[i] == -id(a[i]));
+        foreach (i; 0 .. n) check(c[i] == -id(a[i]));
         vecAbsDiff(c, a, b);
-        foreach (i; 0 .. n) assert(c[i] == (id(a[i]) > b[i] ? a[i] - b[i] : b[i] - a[i]));
+        foreach (i; 0 .. n) check(c[i] == (id(a[i]) > b[i] ? a[i] - b[i] : b[i] - a[i]));
         vecMin(c, a, b);
-        foreach (i; 0 .. n) assert(c[i] == (id(a[i]) < b[i] ? a[i] : b[i]));
+        foreach (i; 0 .. n) check(c[i] == (id(a[i]) < b[i] ? a[i] : b[i]));
         auto uc = new uint[](n);
         vecUMax(uc, cast(uint[])a, cast(uint[])b);
-        foreach (i; 0 .. n) assert(uc[i] == (cast(uint)id(a[i]) > cast(uint)b[i] ? a[i] : b[i]));
+        foreach (i; 0 .. n) check(uc[i] == (cast(uint)id(a[i]) > cast(uint)b[i] ? a[i] : b[i]));
         vecSelectConst(c, a);
-        foreach (i; 0 .. n) assert(c[i] == (id(a[i]) >= 10 ? 100 : -1));
+        foreach (i; 0 .. n) check(c[i] == (id(a[i]) >= 10 ? 100 : -1));
         b[n / 2 .. $] = a[n / 2 .. $];
         vecEq(c, a, b);
-        foreach (i; 0 .. n) assert(c[i] == (id(a[i]) == b[i]));
+        foreach (i; 0 .. n) check(c[i] == (id(a[i]) == b[i]));
         vecIota(c);
-        foreach (i; 0 .. n) assert(c[i] == id(cast(int)i) * 5 - 3);
+        foreach (i; 0 .. n) check(c[i] == id(cast(int)i) * 5 - 3);
         vecUintIndex(c, a, cast(uint)n);
-        foreach (i; 0 .. n) assert(c[i] == id(a[i]) + cast(int)i);
+        foreach (i; 0 .. n) check(c[i] == id(a[i]) + cast(int)i);
         vecIntFor(c.ptr, a.ptr, cast(int)n);
-        foreach (i; 0 .. n) assert(c[i] == id(a[i]) * 7);
+        foreach (i; 0 .. n) check(c[i] == id(a[i]) * 7);
         vecInvariant(c, a, 12345, -3);
-        foreach (i; 0 .. n) assert(c[i] == (id(a[i]) + 12345) * -3);
+        foreach (i; 0 .. n) check(c[i] == (id(a[i]) + 12345) * -3);
         if (n >= 2)
         {
             r[] = c[];
             vecOffsets(c, a);
-            assert(c[0] == r[0] && c[n - 1] == r[n - 1]);
-            foreach (i; 1 .. n - 1) assert(c[i] == id(a[i - 1]) + 2 * a[i] + a[i + 1]);
+            check(c[0] == r[0] && c[n - 1] == r[n - 1]);
+            foreach (i; 1 .. n - 1) check(c[i] == id(a[i - 1]) + 2 * a[i] + a[i + 1]);
         }
     }
     return 0;
