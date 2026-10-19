@@ -1,6 +1,7 @@
 // Each program in extra-files/arm_newcg_regalloc runs correctly when made by the new
 // AArch64 code generator, and the register allocation of each of its functions named
-// copies<N>_... leaves at most N copies from one register to another.
+// copies<N>_... leaves at most N copies from one register to another, and of each
+// named loads<N>_... at most N loads of registers kept on the stack.
 module test.dshell.arm_newcg_regalloc;
 
 import dshell;
@@ -30,33 +31,38 @@ int main()
                 ["DMD_NEWCG": "1", "DMD_NEWCG_RASTATS": "1"]);
         }
         size_t checked;
-        // newcg-ra: copies <n> <weighted> loads ... <mangled name>
+        // newcg-ra: copies <n> <weighted> loads <n> <weighted> stores <n> <weighted> <mangled name>
         foreach (line; readText(log).lineSplitter)
         {
             if (!line.canFind("newcg-ra:"))
                 continue;
             const words = line.split;
             const fn = words[$ - 1];
-            auto after = fn.findSplitAfter("copies");
-            if (!after || !fn.canFind("_D" ~ to!string(name.length) ~ name))
+            if (!fn.canFind("_D" ~ to!string(name.length) ~ name))
                 continue;
-            size_t digits;
-            while (digits < after[1].length && after[1][digits] >= '0' && after[1][digits] <= '9')
-                ++digits;
-            if (!digits || digits >= after[1].length || after[1][digits] != '_')
-                continue;
-            const allowed = after[1][0 .. digits].to!uint;
-            const copies = words[2].to!uint;
-            ++checked;
-            if (copies > allowed)
+            foreach (k, what; ["copies", "loads"])
             {
-                writeln(name, ": ", copies, " copies, at most ", allowed, " expected: ", line);
-                ++failures;
+                auto after = fn.findSplitAfter(what);
+                if (!after)
+                    continue;
+                size_t digits;
+                while (digits < after[1].length && after[1][digits] >= '0' && after[1][digits] <= '9')
+                    ++digits;
+                if (!digits || digits >= after[1].length || after[1][digits] != '_')
+                    continue;
+                const allowed = after[1][0 .. digits].to!uint;
+                const count = words[2 + 3 * k].to!uint;
+                ++checked;
+                if (count > allowed)
+                {
+                    writeln(name, ": ", count, " ", what, ", at most ", allowed, " expected: ", line);
+                    ++failures;
+                }
             }
         }
         if (!checked)
         {
-            writeln(name, ": no function named copies<N>_... reported");
+            writeln(name, ": no function named copies<N>_... or loads<N>_... reported");
             ++failures;
         }
         run(exe);

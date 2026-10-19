@@ -13158,7 +13158,7 @@ private bool pairable(ref const LIns i, bool isLoad)
 /* The registers allocated, in order of preference: the caller saved first,
  * as they need no saving, then the callee saved
  */
-private immutable ubyte[] gpOrder = [9,10,11,12,13,0,1,2,3,4,5,6,7, 19,20,21,22,23,24,25,26,27,28];
+private immutable ubyte[] gpOrder = [9,10,11,12,13,8,0,1,2,3,4,5,6,7, 19,20,21,22,23,24,25,26,27,28];
 private immutable ubyte[] fpOrder = [32+16,32+17,32+18,32+19,32+20,32+21,32+22,32+23,32+24,32+25,32+26,32+27,32+28,
                                      32+0,32+1,32+2,32+3,32+4,32+5,32+6,32+7,
                                      32+8,32+9,32+10,32+11,32+12,32+13,32+14,32+15];
