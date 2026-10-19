@@ -3165,15 +3165,20 @@ private Pair genPairx(elem* e)
     }
 }
 
-/* Whether e is an HFA typed as an integer, which is passed in V registers not X
+/* Whether e is an HFA typed as an integer, which is passed in V registers not X.
+ * An HFA of one element typed as that element's floating type is that value.
  */
 @trusted
 private bool hfaAsInteger(const(elem)* e)
 {
     // the whole of it, not an integer sized part, nor an address of it
-    return e.ET && !tyaggregate(e.Ety) && tyaggregate(e.ET.Tty) && !typtr(e.Ety) && e.Eoper != OPrelconst &&
-           tysize(e.Ety) >= type_size(cast(type*)e.ET) && (e.Eoper != OPvar || e.Voffset == 0) &&
-           aarch64Aggregate(cast(type*)e.ET).kind == AggregateABI.Kind.hfa;
+    if (!(e.ET && !tyaggregate(e.Ety) && tyaggregate(e.ET.Tty) && !typtr(e.Ety) && e.Eoper != OPrelconst &&
+          tysize(e.Ety) >= type_size(cast(type*)e.ET) && (e.Eoper != OPvar || e.Voffset == 0)))
+        return false;
+    const a = aarch64Aggregate(cast(type*)e.ET);
+    if (a.kind != AggregateABI.Kind.hfa)
+        return false;
+    return !(tyfloating(e.Ety) && !tycomplex(e.Ety) && a.nregs == 1 && a.esz == tysize(e.Ety));
 }
 
 /* Bytes 8 * w .. 8 * w + 7 of the HFA variable av held in V registers, those past
@@ -4675,9 +4680,9 @@ private Reg genx(elem* e)
     const ty = tybasic(e.Ety);
     const sz = tysize(ty);
     const RC rc = tyfloating(ty) ? RC.fp : RC.gp;
-    if (!pairType(ty) && hfaAsInteger(e))
+    if (!pairType(ty) && !tyfloating(ty) && hfaAsInteger(e))
     {
-        // its bytes
+        // its bytes, in an X register
         if (hfaInMemory(e))
             return loadChunk(memOf(e, false), cast(uint)type_size(e.ET));
         if (e.Eoper == OPvar)
