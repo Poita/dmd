@@ -40,10 +40,18 @@ void waitForServer(size_t n)
     }
 }
 
+/// Compile the program, with the messages in `messages`
 int build()
 {
-    return tryRun("$DMD -m$MODEL -I" ~ src ~ "/imp -J" ~ src ~ " -of" ~ exe ~ " " ~ src ~ "/app.d");
+    auto f = File(OUTPUT_BASE ~ "/messages.txt", "w");
+    const status = tryRun("$DMD -m$MODEL -I" ~ src ~ "/imp -J" ~ src ~ " -of" ~ exe ~ " " ~ src ~ "/app.d",
+        std.stdio.stdout, f);
+    f.close();
+    messages = readText(OUTPUT_BASE ~ "/messages.txt");
+    return status;
 }
+
+string messages;
 
 void expectOutput(string expected)
 {
@@ -51,6 +59,8 @@ void expectOutput(string expected)
     const r = execute([exe]);
     assert(r.status == 0, r.output);
     assert(r.output.strip == expected, "expected `" ~ expected ~ "`, got `" ~ r.output.strip ~ "`\n" ~ logs());
+    // the deprecation is reported where the module is imported
+    assert(messages.canFind("app.d(2): Deprecation: module `old` is deprecated"), messages);
 }
 
 void edit(string file, string from, string to)
@@ -80,9 +90,10 @@ int main()
             rmdirRecurse(d);
     mkdirRecurse(serverDir);
     mkdirRecurse(src ~ "/imp");
-    foreach (f; ["app.d", "imp/lib.d", "banner.txt"])
+    foreach (f; ["app.d", "imp/lib.d", "imp/old.d", "imp/renamed.d", "banner.txt"])
         copy(EXTRA_FILES ~ "/compile_server/" ~ f, src ~ "/" ~ f);
     environment["DMD_SERVER"] = serverDir;
+    environment.remove("DMD_SERVER_VERIFY");
     environment["DMD_SERVER_IDLE"] = "120";
     scope (exit) stopServers();
 
@@ -99,11 +110,8 @@ int main()
 
     // errors reach the client
     edit(src ~ "/app.d", "tag.ptr", "tagg.ptr");
-    auto errors = File(OUTPUT_BASE ~ "/errors.txt", "w");
-    assert(tryRun("$DMD -m$MODEL -I" ~ src ~ "/imp -J" ~ src ~ " -of" ~ exe ~ " " ~ src ~ "/app.d",
-        std.stdio.stdout, errors) != 0);
-    errors.close();
-    assert(readText(OUTPUT_BASE ~ "/errors.txt").canFind("undefined identifier `tagg`"));
+    assert(build() != 0);
+    assert(messages.canFind("undefined identifier `tagg`"), messages);
     assert(logs.canFind("served 1"), logs);
     edit(src ~ "/app.d", "tagg.ptr", "tag.ptr");
 

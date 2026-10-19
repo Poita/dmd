@@ -84,9 +84,9 @@ import dmd.visitor;
 enum LOG = false;
 
 
-/// The root module an imported module is first imported from, when that is known
-/// before the root modules are analyzed (see `dmd.compileserver`), or null
-__gshared Module function(Module) knownImporter;
+/// Called when an import has found or loaded (`loaded`) its module, before the module's
+/// `importedFrom` is set (see `dmd.compileserver`)
+__gshared void function(Import imp, bool loaded) onImport;
 
 /***************************************
  * Create a new scope from sc.
@@ -8780,6 +8780,7 @@ extern (D) bool load(Import imp, Scope* sc)
             }
         }
     }
+    bool loaded;
     if (!imp.mod)
     {
         // Load module
@@ -8788,13 +8789,13 @@ extern (D) bool load(Import imp, Scope* sc)
         {
             // imp.id may be different from mod.ident, if so then insert alias
             dst.insert(imp.id, imp.mod);
+            loaded = true;
         }
     }
+    if (imp.mod && onImport)
+        onImport(imp, loaded);
     if (imp.mod && !imp.mod.importedFrom)
-    {
-        auto from = knownImporter ? knownImporter(imp.mod) : null;
-        imp.mod.importedFrom = from ? from : sc ? sc._module.importedFrom : Module.rootModule;
-    }
+        imp.mod.importedFrom = sc ? sc._module.importedFrom : Module.rootModule;
     if (!imp.pkg)
     {
         if (imp.mod && imp.mod.isPackageFile)
