@@ -1437,6 +1437,15 @@ private __gshared Barray!bool skipBlock;
  */
 private __gshared Reg[2] ehRegs;
 
+/* Whether an exception thrown by a call being selected may go to a landing pad of
+ * the function, so what the call destroys matters even if it does not return
+ */
+@trusted
+private bool callMayLand()
+{
+    return blocks[curBlock].Btry !is null;
+}
+
 /* The landing pad of the try block t: its catch block, or the landing pad of its
  * finally block
  */
@@ -5436,8 +5445,9 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
             funcsym_p.Sfunc.Fflags &= ~Fnothrow;
         return noReg;
     }
-    if (tybasic(e.Ety) == TYnoreturn || sf && sf.Sflags & SFLexit)
-        c.flags |= F.noreturn;      // as the runtime's array bounds errors
+    // as the runtime's array bounds errors, unless the exception goes to a landing pad here
+    if ((tybasic(e.Ety) == TYnoreturn || sf && sf.Sflags & SFLexit) && !callMayLand())
+        c.flags |= F.noreturn;
     if (stackArgs)
         emitIns(LOp.spadd, 8, noReg, noReg, noReg, stackArgs);
     if (!sf || sf == funcsym_p || !sf.Sfunc || !(sf.Sfunc.Fflags & Fnothrow))
@@ -6177,6 +6187,7 @@ private void setFrom(Reg r, uint pos)
 
 private __gshared
 {
+    Barray!bool padLive;                // by register: live where a landing pad starts
     Barray!Reg globalRegs;              // by globalId
     Barray!ulong liveIn, liveOut;       // bit sets of globalIds by segment
     size_t setWords;
@@ -6364,6 +6375,22 @@ private void computeLiveness()
     }
     gen.dtor();
     kill.dtor();
+
+    // what the landing pads read of what is live before them
+    padLive.setLength(vinfo.length);
+    padLive[][] = false;
+    void pad(size_t si)
+    {
+        foreach (w, bits; row(liveIn, si))
+            for (; bits; bits &= bits - 1)
+            {
+                import core.bitop : bsf;
+                padLive[globalRegs[w * 64 + bsf(bits)] - firstVreg] = true;
+            }
+    }
+    foreach (bi, b; blocks[])
+        if (b.bc == BC.jcatch || b.bc == BC.lpad)
+            pad(blockSeg[bi]);
 
     // build the ranges backward
     foreach_reverse (si; 0 .. ns)
@@ -13700,10 +13727,11 @@ private void allocate()
                     break;
             }
         }
-        if (chosen == uint.max && v.cost > 0)
+        if (chosen == uint.max && v.cost > 0 && !(r - firstVreg < padLive.length && padLive[r - firstVreg]))
         {
             /* a caller saved register, saved around the calls the register is live
-             * across, when that costs less than keeping it in memory
+             * across, when that costs less than keeping it in memory, but for what a
+             * landing pad reads, as the way there from a call skips the load after it
              */
             float saveCost = 0;
             size_t c = 0;
