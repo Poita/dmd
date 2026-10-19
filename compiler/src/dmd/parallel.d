@@ -8,7 +8,9 @@
  * the original process waits for the workers and combines the parts into the requested
  * output. Declarations are fully analyzed before the split, so every worker sees the
  * same symbols; a template instance can end up generated in more than one part, which
- * is harmless as template instances are weak definitions.
+ * is harmless as template instances are weak definitions. What a worker finds cannot be
+ * inlined is shared with the others, so that a function other workers consider inlining
+ * is not analyzed by each of them.
  *
  * Copyright:   Copyright (C) 1999-2026 by The D Language Foundation, All Rights Reserved
  * License:     $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0)
@@ -233,18 +235,21 @@ const(char)[] partSuffix(int index)
 
 version (Posix)
 {
-    /* The mangled names of the template instance functions the workers generate code
-     * for, in memory shared by the workers
+    /* Mangled names, each with a value, in memory shared by the workers
      */
-    private struct Claims
+    private struct NameTable
     {
         enum slotCount = 1 << 20;                   // a power of 2
         enum arenaSize = 64 << 20;
-        shared(uint)[slotCount] slots;  // offset + 1 in `arena` of a claimed name, 0 if free
+        shared(uint)[slotCount] slots;  // offset + 1 in `arena` of a name, 0 if free
         shared(uint) used;              // bytes of `arena` in use
-        ubyte[arenaSize] arena;         // each name as its length and its claimer, uints, then its characters
+        ubyte[arenaSize] arena;         // each name as its length and its value, uints, then its characters
     }
-    private __gshared Claims* claims;       // in a worker: the claims of all workers
+    /// in a worker: the template instance functions each worker generates, by the worker
+    private __gshared NameTable* claims;
+    /// in a worker: the functions of root modules found not to be inlinable, with
+    /// a bit set for each way they were found not to be inlinable (see `inlineVerdictBit`)
+    private __gshared NameTable* verdicts;
     private __gshared uint workerIndex;     // in a worker: its number
 
     /* In a worker: where it reports its results to the original process, and how
@@ -313,9 +318,15 @@ Workers split(ref Modules modules, uint requested)
         if (next == MAP_FAILED)
             return w;
         w.next = cast(shared(size_t)*)next;
-        void* c = mmap(null, Claims.sizeof, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+        void* c = mmap(null, NameTable.sizeof, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
         if (c != MAP_FAILED)
-            claims = cast(Claims*)c;
+            claims = cast(NameTable*)c;
+        if (global.params.useInline)
+        {
+            void* v = mmap(null, NameTable.sizeof, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+            if (v != MAP_FAILED)
+                verdicts = cast(NameTable*)v;
+        }
         w.order = order;
         foreach (m; modules)
         {
@@ -363,6 +374,7 @@ Workers split(ref Modules modules, uint requested)
         }
 
         claims = null;              // the original process generates all it compiles
+        verdicts = null;            // and analyzes all it inlines
         w.count = cast(int)children.length;
         w.succeeded = children.length == n;
         foreach (k, pid; children)
@@ -398,10 +410,81 @@ bool claimFunction(const(char)[] name, bool claim)
 {
     version (Posix)
     {
-        import core.atomic : atomicFetchAdd, atomicLoad, cas;
+        import core.atomic : atomicLoad;
 
         if (!claims)
             return true;
+        auto claimer = lookUp(claims, name, workerIndex, claim);
+        return !claimer || atomicLoad(*claimer) == workerIndex;
+    }
+    else
+        return true;
+}
+
+/// Returns: true if this is a worker sharing with the others what it finds cannot be inlined
+bool sharingInlineVerdicts()
+{
+    version (Posix)
+        return verdicts !is null;
+    else
+        return false;
+}
+
+/// Returns: the bit `noteNotInlinable` and `foundNotInlinable` keep for one way of
+/// inlining a function
+uint inlineVerdictBit(bool hasThis, bool statementsToo)
+{
+    return 1u << (hasThis * 2 + statementsToo);
+}
+
+/**************************************
+ * In a worker: record for the other workers that a function of a root module, which
+ * this worker has analyzed, cannot be inlined in one way, so that they need not analyze
+ * it to find that out.
+ * Params:
+ *      name = the function's mangled name
+ *      bit = the way it cannot be inlined, from `inlineVerdictBit`
+ */
+void noteNotInlinable(const(char)[] name, uint bit)
+{
+    version (Posix)
+    {
+        import core.atomic : atomicOp;
+
+        if (!verdicts)
+            return;
+        if (auto bits = lookUp(verdicts, name, 0, true))
+            atomicOp!"|="(*bits, bit);
+    }
+}
+
+/// Returns: true if in a worker, a worker has recorded with `noteNotInlinable` that the
+/// function mangled as `name` cannot be inlined in the way `bit` stands for
+bool foundNotInlinable(const(char)[] name, uint bit)
+{
+    version (Posix)
+    {
+        import core.atomic : atomicLoad;
+
+        if (!verdicts)
+            return false;
+        auto bits = lookUp(verdicts, name, 0, false);
+        return bits && (atomicLoad(*bits) & bit) != 0;
+    }
+    else
+        return false;
+}
+
+version (Posix)
+{
+    /* Find `name` in `table`, adding it with `value` if it is not there and `add` is set.
+     * Returns: the name's value, null if the name is not there and not added, or the
+     * table is out of space
+     */
+    private shared(uint)* lookUp(NameTable* table, const(char)[] name, uint value, bool add)
+    {
+        import core.atomic : atomicFetchAdd, atomicLoad, cas;
+
         ulong h = 14695981039346656037UL;          // FNV-1a
         foreach (c; name)
         {
@@ -409,36 +492,36 @@ bool claimFunction(const(char)[] name, bool claim)
             h *= 1099511628211UL;
         }
         uint mine;
-        foreach (probe; 0 .. Claims.slotCount)
+        foreach (probe; 0 .. NameTable.slotCount)
         {
-            shared(uint)* slot = &claims.slots[(h + probe) & (Claims.slotCount - 1)];
+            shared(uint)* slot = &table.slots[(h + probe) & (NameTable.slotCount - 1)];
             uint v = atomicLoad(*slot);
             if (v == 0)
             {
-                if (!claim)
-                    return true;
+                if (!add)
+                    return null;
                 if (!mine)
                 {
                     const need = cast(uint)((2 * uint.sizeof + name.length + 3) & ~3);
-                    const offset = atomicFetchAdd(claims.used, need);
-                    if (offset + need > Claims.arenaSize)
-                        return true;            // out of space: generate it anyway
-                    auto header = cast(uint*)(claims.arena.ptr + offset);
+                    const offset = atomicFetchAdd(table.used, need);
+                    if (offset + need > NameTable.arenaSize)
+                        return null;
+                    auto header = cast(uint*)(table.arena.ptr + offset);
                     header[0] = cast(uint)name.length;
-                    header[1] = workerIndex;
-                    memcpy(claims.arena.ptr + offset + 2 * uint.sizeof, name.ptr, name.length);
+                    header[1] = value;
+                    memcpy(table.arena.ptr + offset + 2 * uint.sizeof, name.ptr, name.length);
                     mine = offset + 1;
                 }
                 if (cas(slot, 0u, mine))
-                    return true;
+                    return cast(shared(uint)*)(table.arena.ptr + mine - 1 + uint.sizeof);
                 v = atomicLoad(*slot);
             }
-            const header = cast(uint*)(claims.arena.ptr + v - 1);
+            auto header = cast(uint*)(table.arena.ptr + v - 1);
             if (header[0] == name.length && memcmp(header + 2, name.ptr, name.length) == 0)
-                return header[1] == workerIndex;
+                return cast(shared(uint)*)(header + 1);
         }
+        return null;
     }
-    return true;
 }
 
 /**************************************
