@@ -345,6 +345,10 @@ bool lirCodegen(ref CGstate cg)
     assignVariables();
     computeBlockDominators();
     ehRegs[] = noReg;
+    ehPads.setLength(0);
+    ehRanges = false;
+    padDepth = 0;
+    normalDtors = 0;
     bool hasTry;
     foreach (b; blocks[])
     {
@@ -431,6 +435,11 @@ bool lirCodegen(ref CGstate cg)
     {
         import dmd.backend.code : EHtry;
         cg.usednteh |= EHtry;       // so its try blocks get their entries in the EH table
+    }
+    if (ehRanges)
+    {
+        import dmd.backend.code : EHcleanup;
+        cg.usednteh |= EHcleanup;   // so the code is scanned for the ranges' marks
     }
     foreach (b; switchBlocks[])
         b.bc = BC.ifthen;           // done as comparisons, no jump table
@@ -677,6 +686,22 @@ private bool supportedElem(const(elem)* e)
             case OPrelconst:
                 whyNot = "address of variable";
                 return varSupported(e.Vsym) || tlvDescriptor(e.Vsym);
+
+            case OPinfo:
+                // the construction of a temporary the code up to its OPddtor destroys
+                // if an exception leaves it
+                whyNot = "info";
+                if (e.E1.Eoper != OPdctor || config.ehmethod != EHmethod.EH_DWARF)
+                    return false;
+                e = e.E2;
+                continue;
+
+            case OPddtor:
+                whyNot = "ddtor";
+                if (config.ehmethod != EHmethod.EH_DWARF)
+                    return false;
+                e = e.E1;
+                continue;
 
             case OPind:
             case OPneg:
@@ -1437,13 +1462,118 @@ private __gshared Barray!bool skipBlock;
  */
 private __gshared Reg[2] ehRegs;
 
+/* The code between an OPinfo constructing a temporary and the OPddtor destroying it
+ * is a range of the exception table whose landing pad, apart from the code, runs the
+ * OPddtor's code as an exception leaves it: the calls made in the range are marked
+ * with the pad's label, as a way they may go
+ */
+private __gshared
+{
+    Barray!uint ehPads;         // the landing pad labels of the ranges being selected, innermost last
+    bool ehRanges;              // the function has such ranges
+    uint padDepth;              // number of landing pads being selected
+    uint normalDtors;           // number of OPddtors being selected for the way without an exception
+}
+
+/// What a label instruction marks in its cond, besides its place
+private enum LabelMark : ubyte
+{
+    none,
+    rangeStart,     // the start of a range of the exception table
+    pad,            // the end of the innermost range, and its landing pad
+}
+
+/* The landing pad label + 1 of the calls being selected, or 0
+ */
+@trusted
+private uint callPad()
+{
+    return ehPads.length ? ehPads[ehPads.length - 1] + 1 : 0;
+}
+
 /* Whether an exception thrown by a call being selected may go to a landing pad of
  * the function, so what the call destroys matters even if it does not return
  */
 @trusted
 private bool callMayLand()
 {
-    return blocks[curBlock].Btry !is null;
+    return ehPads.length || blocks[curBlock].Btry;
+}
+
+/* Start the range of the exception table a temporary being constructed is in
+ */
+@trusted
+private void startEhRange()
+{
+    ehRanges = true;
+    ehPads.push(newLabel());
+    auto i = emitIns(LOp.label, 0);
+    i.target = newLabel();
+    i.cond = LabelMark.rangeStart;
+}
+
+/* End the innermost range of the exception table at the OPddtor e: the code of the
+ * landing pad, then the code of e without an exception
+ */
+@trusted
+private void endEhRange(elem* e)
+{
+    if (!ehPads.length)
+    {
+        fail("ddtor without its range");
+        return;
+    }
+    const pad = ehPads[ehPads.length - 1];
+    ehPads.setLength(ehPads.length - 1);
+    const lnormal = newLabel();
+    jumpTo(lnormal);
+
+    // the landing pad, entered with the exception object in x0 and SP as at the call
+    auto lab = emitIns(LOp.label, 0);
+    lab.target = pad;
+    lab.cond = LabelMark.pad;
+    if (!ehRegs[0])
+    {
+        ehRegs[0] = newVreg(RC.gp, 8);
+        ehRegs[1] = newVreg(RC.gp, 8);
+    }
+    emitIns(LOp.copy, 8, ehRegs[0], phys(0));
+    emitIns(LOp.copy, 8, ehRegs[1], phys(1));
+    /* none of the CSEs made before is known to be made on the way here, from a call
+     * part way, nor are those it makes made on the other way
+     */
+    Barray!(elem*) elems;
+    Barray!Reg regs, his;
+    Barray!uint cblocks;
+    scope (exit) { elems.dtor(); regs.dtor(); his.dtor(); cblocks.dtor(); }
+    elems.setLength(cseElems.length);
+    elems[][] = cseElems[][];
+    regs.setLength(cseRegs.length);
+    regs[][] = cseRegs[][];
+    his.setLength(cseHis.length);
+    his[][] = cseHis[][];
+    cblocks.setLength(cseBlocks.length);
+    cblocks[][] = cseBlocks[][];
+    cseForget(0);
+    const m = enterCond();
+    ++padDepth;
+    genEffect(e.E1);
+    --padDepth;
+    leaveCond(m);
+    cseElems.setLength(elems.length);
+    cseElems[][] = elems[][];
+    cseRegs.setLength(regs.length);
+    cseRegs[][] = regs[][];
+    cseHis.setLength(his.length);
+    cseHis[][] = his[][];
+    cseBlocks.setLength(cblocks.length);
+    cseBlocks[][] = cblocks[][];
+    emitIns(LOp.brk, 0);        // the exception goes on from the pad, never coming back
+
+    placeLabel(lnormal);
+    ++normalDtors;
+    genEffect(e.E1);
+    --normalDtors;
 }
 
 /* The landing pad of the try block t: its catch block, or the landing pad of its
@@ -1745,6 +1875,8 @@ private void select()
     skipBlock[][] = false;
     foreach (bi, b; blocks[])
     {
+        if (ehPads.length)
+            fail("exception table range across blocks");
         curBlock = cast(uint)bi;
         if (bi)
             blockStart.push(cast(uint)ins.length);
@@ -1953,6 +2085,15 @@ private void genEffect(elem* e)
         case OPcomma:
             genEffect(e.E1);
             genEffect(e.E2);
+            return;
+
+        case OPinfo:
+            genEffect(e.E2);
+            startEhRange();
+            return;
+
+        case OPddtor:
+            endEhRange(e);
             return;
 
         case OPconst:
@@ -3999,6 +4140,7 @@ private void emitLibCall(Symbol* f, Reg[] args)
     }
     auto c = emitIns(LOp.call, 0, noReg, noReg, noReg, cast(long)argRegs);
     c.sym = f;
+    c.target = callPad();
 }
 
 /* For each block, by its index, whether no path to it from the function's entry
@@ -4605,6 +4747,13 @@ private Reg genx(elem* e)
         {
             if (e.Vsym.Sclass == SC.pseudo)
             {
+                // the code of an OPddtor without an exception does not use what it reads
+                if (normalDtors && !padDepth && !e.Voffset)
+                {
+                    Reg d = newVreg(rc, sz);
+                    emitIns(rc == RC.fp ? LOp.fmovi : LOp.movi, sz, d, noReg, noReg, 0);
+                    return d;
+                }
                 // x0 or x1 as the landing pad was entered with
                 if (!ehRegs[0] || e.Voffset)
                 {
@@ -4687,6 +4836,17 @@ private Reg genx(elem* e)
         case OPcomma:
             genEffect(e.E1);
             return gen(e.E2);
+
+        case OPinfo:
+        {
+            Reg r = gen(e.E2);
+            startEhRange();
+            return r;
+        }
+
+        case OPddtor:
+            endEhRange(e);
+            return noReg;
 
         case OPeq:
             return genAssign(e);
@@ -5437,7 +5597,8 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
 
     auto c = emitIns(LOp.call, 0, noReg, target, noReg, cast(long)argRegs);
     c.sym = sf;
-    if (wantTail && !stackArgs)
+    c.target = callPad();
+    if (wantTail && !stackArgs && !callMayLand())
     {
         *tail = true;
         c.flags |= F.tail;
@@ -6391,6 +6552,10 @@ private void computeLiveness()
     foreach (bi, b; blocks[])
         if (b.bc == BC.jcatch || b.bc == BC.lpad)
             pad(blockSeg[bi]);
+    if (ehRanges)
+        foreach (ref i; ins[])
+            if (i.op == LOp.label && i.cond == LabelMark.pad)
+                pad(labelSeg[i.target]);
 
     // build the ranges backward
     foreach_reverse (si; 0 .. ns)
@@ -6462,8 +6627,8 @@ private void buildSegments()
             }
             if (op == LOp.label)
                 labelSeg[ins[n].target] = cast(uint)(segStart.length - 1);
-            if (op == LOp.br || op == LOp.bcond || op == LOp.cbz)
-                start = true;
+            if (op == LOp.br || op == LOp.bcond || op == LOp.cbz || op == LOp.call && ins[n].target)
+                start = true;       // a call with a landing pad may go there
         }
         if (blockSeg[bi] == segStart.length)
         {
@@ -6508,9 +6673,23 @@ private void buildSegments()
         // where an exception thrown by what the segment calls goes
         if (block* t = blocks[bi].Btry)
             segSucc.push(blockSeg[landingPadOf(t).Bdfoidx]);
+        forPads(si, (uint t) { segSucc.push(t); });
     }
     segSuccStart[ns] = cast(uint)segSucc.length;
 
+}
+
+/* Calls fn(t) for the segment t of the landing pad of each call of segment si
+ * that has one
+ */
+@trusted
+private void forPads(size_t si, scope void delegate(uint) nothrow fn)
+{
+    if (!ehRanges)
+        return;
+    foreach (ref i; ins[segStart[si] .. segEnd(si)])
+        if (i.op == LOp.call && i.target)
+            fn(labelSeg[i.target - 1]);
 }
 
 /* The end of segment si: the next segment's start, or its block's end
@@ -7086,6 +7265,7 @@ private void physicalFlow(ref Barray!uint succStart, ref Barray!uint succ, ref B
                 succ.push(blockSeg[s.Bdfoidx]);
         if (block* t = blocks[bi].Btry)
             succ.push(blockSeg[landingPadOf(t).Bdfoidx]);
+        forPads(si, (uint t) { succ.push(t); });
     }
     succStart[ns] = cast(uint)succ.length;
     predStart.setLength(ns + 1);
@@ -14472,7 +14652,7 @@ private void shrinkWrap()
     wrappedProlog = null;
     sunk.setLength(0);
     const nb = blocks.length;
-    if (nb < 2 || env!"DMD_NEWCG_NOSHRINKWRAP")
+    if (nb < 2 || ehRanges || env!"DMD_NEWCG_NOSHRINKWRAP")
         return;
     foreach (b; blocks[])
         if (b.bc != BC.goto_ && b.bc != BC.iftrue && b.bc != BC.ret && b.bc != BC.retexp &&
@@ -14960,10 +15140,22 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
 
         case LOp.label:
         {
+            if (i.cond != LabelMark.none)
+            {
+                // the marks the exception table is made from, as cddctor() and cdddtor() make
+                code cs;
+                cs.Iop = i.cond == LabelMark.rangeStart ? PSOP.dctor : PSOP.ddtor;
+                cs.Iflags = CF.zero;
+                cs.IFL1 = i.cond == LabelMark.rangeStart ? FL.ctor : FL.dtor;
+                cdb.gen(&cs);
+            }
             // the label's code is a nop, which is not emitted
             code* c = labelCode[i.target];
             c.Iop = INSTR.nop;
             cdb.append(c);
+            // the unwinder enters a landing pad with SP as at the call that threw: MOV SP,X29
+            if (i.cond == LabelMark.pad)
+                cdb.gen1(0x9100_03BF);
             break;
         }
 
