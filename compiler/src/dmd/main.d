@@ -473,10 +473,19 @@ private int tryMain(const(char)[][] argv, out Param params)
         initializeTimeTrace(params.timeTraceGranularityUs, toCString(argv[0]).ptr);
     }
 
+    import dmd.compileserver : recordImports, rootsImported, rootsParsed, serverFinish = finish, serve,
+        serverStart = start;
+    {
+        int served;
+        if (serverStart(argv, params, served))
+            return served;
+    }
+
     // Create Modules
     Modules modules;
     if (createModules(files, libmodules, params, target, eSink, modules))
         fatal();
+    serve(modules);
 
     // Read files
     foreach (m; modules)
@@ -579,6 +588,8 @@ private int tryMain(const(char)[][] argv, out Param params)
     }
     }
 
+    rootsParsed();
+
     if (anydocfiles && modules.length && (driverParams.oneobj || params.objname))
     {
         eSink.error(Loc.initial, "conflicting Ddoc and obj generation options");
@@ -629,6 +640,7 @@ private int tryMain(const(char)[][] argv, out Param params)
             eSink.message(Loc.initial, "importall %s", m.toChars());
         m.importAll(null);
     }
+    rootsImported();
     if (global.errors)
         removeHdrFilesAndFail(params.dihdr.doOutput, modules);
 
@@ -664,6 +676,8 @@ private int tryMain(const(char)[][] argv, out Param params)
     runDeferredSemantic2();
     if (global.errors)
         removeHdrFilesAndFail(params.dihdr.doOutput, modules);
+
+    recordImports(modules);
 
     /* Split the rest of the compilation of the root modules across worker processes,
      * when nothing but code generation needs all of them
@@ -961,6 +975,7 @@ private int tryMain(const(char)[][] argv, out Param params)
     if (global.errors || global.warnings)
         removeHdrFilesAndFail(params.dihdr.doOutput, modules);
 
+    serverFinish(status);
     return status;
 }
 
@@ -1059,6 +1074,8 @@ bool parseCommandlineAndConfig(const(char)[][] argv, out Param params, ref Strin
         return true;
     getenv_setargv(readFromEnv(environment, "DFLAGS"), &arguments);
     updateRealEnvironment(environment);
+    import dmd.compileserver : noteArguments;
+    noteArguments(arguments);
     environment.reset(1); // don't need environment cache any more
 
     if (parseCommandLine(arguments, argc, params, files, target, driverParams, global.errorSink))

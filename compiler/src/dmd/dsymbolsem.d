@@ -83,6 +83,11 @@ import dmd.visitor;
 
 enum LOG = false;
 
+
+/// The root module an imported module is first imported from, when that is known
+/// before the root modules are analyzed (see `dmd.compileserver`), or null
+__gshared Module function(Module) knownImporter;
+
 /***************************************
  * Create a new scope from sc.
  * semantic, semantic2 and semantic3 will use this for aggregate members.
@@ -8786,7 +8791,10 @@ extern (D) bool load(Import imp, Scope* sc)
         }
     }
     if (imp.mod && !imp.mod.importedFrom)
-        imp.mod.importedFrom = sc ? sc._module.importedFrom : Module.rootModule;
+    {
+        auto from = knownImporter ? knownImporter(imp.mod) : null;
+        imp.mod.importedFrom = from ? from : sc ? sc._module.importedFrom : Module.rootModule;
+    }
     if (!imp.pkg)
     {
         if (imp.mod && imp.mod.isPackageFile)
