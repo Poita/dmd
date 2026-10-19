@@ -310,6 +310,23 @@ nothrow:
     }
 
     /**
+     * Calls `dg` with the name of each file whose contents are cached.
+     */
+    void eachFile(scope void delegate(const(char)[]) nothrow dg)
+    {
+        foreach (const sv; files)
+            dg(sv.toString());
+    }
+
+    /**
+     * Forgets which paths exist, so that they are looked up again.
+     */
+    void forgetPaths()
+    {
+        pathCache.pathStatus.reset();
+    }
+
+    /**
      * Adds the contents of a file to the table.
      * Params:
      *  filename = name of the file

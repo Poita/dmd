@@ -195,11 +195,24 @@ nothrow:
         return generateId(prefix[0 .. length], suffix);
     }
 
+    private extern (D) __gshared size_t suffixes;   // the suffixes generated so far
+
     // Generates a new, unique, suffix for an identifier.
     extern (D) private static size_t newSuffix()
     {
-        __gshared size_t i;
-        return ++i;
+        return ++suffixes;
+    }
+
+    /// The number of unique suffixes generated so far
+    extern (D) static size_t suffixCount()
+    {
+        return suffixes;
+    }
+
+    /// Continue generating unique suffixes after `n`
+    extern (D) static void suffixCount(size_t n)
+    {
+        suffixes = n;
     }
 
     extern(D) private static Identifier generateId(const(char)[] prefix, size_t suffix, bool isAnonymous)

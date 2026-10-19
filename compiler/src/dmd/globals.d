@@ -400,9 +400,15 @@ extern (C++) struct Global
         params.v.color = useAnsiColors();
 
         compileEnv.versionNumber = parseVersionNumber(versionString());
+        initDateTime();
+    }
 
-        /* Initialize date, time, and timestamp
-         */
+    /**
+     * Initialize the date, time and timestamp of the compilation from the current time,
+     * or from `SOURCE_DATE_EPOCH`.
+     */
+    extern (D) void initDateTime()
+    {
         import core.stdc.time;
         import core.stdc.stdlib : getenv;
 
