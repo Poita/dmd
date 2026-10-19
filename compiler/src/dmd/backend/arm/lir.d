@@ -13173,6 +13173,20 @@ private immutable ubyte[] fpOrderAll = [32+16,32+17,32+18,32+19,32+20,32+21,32+2
                                         32+8,32+9,32+10,32+11,32+12,32+13,32+14,32+15];
 
 private __gshared bool[2] scratchAllocated;     // by RC: the spill registers are allocated as others
+private __gshared ulong[2] allocatableMask;     // by RC: the registers of regOrder()
+
+/* Set the registers of regOrder() in allocatableMask
+ */
+@trusted
+private void setAllocatable()
+{
+    foreach (rc; 0 .. 2)
+    {
+        allocatableMask[rc] = 0;
+        foreach (p; regOrder(cast(RC)rc))
+            allocatableMask[rc] |= 1UL << p;
+    }
+}
 
 /* The registers allocated for values of class rc, in order of preference
  */
@@ -13300,9 +13314,8 @@ private void occupy(uint p, ref Barray!Range rs, Reg owner)
     }
 }
 
-/* Allocate the registers, first with the registers reserved for spilled values
- * allocated too, then again with them reserved for a class of which a register is
- * spilled
+/* Allocate the registers, the registers reserved for spilled values too until a
+ * register of their class is spilled
  */
 @trusted
 private void allocateAll()
@@ -13313,25 +13326,52 @@ private void allocateAll()
     foreach (ref i; ins[])
         if (i.op == LOp.popcnt)
             scratchAllocated[RC.fp] = false;
-    while (true)
+    setAllocatable();
+    allocate();
+}
+
+/* Reserve the spill registers of each class of which a register is spilled, adding
+ * the registers allocated them to order to be allocated again; whether any is
+ */
+@trusted
+private bool reserveSpillRegisters(ref Barray!Reg order)
+{
+    bool added;
+    foreach (rc; 0 .. 2)
     {
-        allocate();
-        bool again;
+        if (!scratchAllocated[rc])
+            continue;
+        bool spilled;
         foreach (ref v; vinfo[])
-            if (v.spilled && scratchAllocated[v.rc])
-            {
-                scratchAllocated[v.rc] = false;
-                again = true;
-            }
-        if (!again)
-            return;
-        foreach (ref v; vinfo[])
+            spilled |= v.spilled && v.rc == rc;
+        if (!spilled)
+            continue;
+        scratchAllocated[rc] = false;
+        foreach (p; rc == RC.fp ? fpScratch[] : gpScratch[])
         {
-            v.preg = uint.max;
-            v.spilled = false;
-            v.callSaved = false;
+            auto occ = &occupied[p];
+            size_t to;
+            foreach (o; (*occ)[])
+            {
+                if (!o.owner || o.owner == clobberOwner)
+                {
+                    (*occ)[to++] = o;
+                    continue;
+                }
+                auto v = vi(o.owner);
+                if (v.preg == p)
+                {
+                    v.preg = uint.max;
+                    v.callSaved = false;
+                    order.push(o.owner);
+                    added = true;
+                }
+            }
+            occ.setLength(to);
         }
     }
+    setAllocatable();
+    return added;
 }
 
 /// A register copied to or from another, and how often
@@ -13553,7 +13593,8 @@ private void allocate()
     }
     size_t evictions;
 
-    for (size_t oi = 0; oi < order.length; ++oi)
+    // when all are allocated, again those in the spill registers if any register is spilled
+    for (size_t oi = 0; oi < order.length || reserveSpillRegisters(order); ++oi)
     {
         const r = order[oi];
         auto v = vi(r);
@@ -13839,12 +13880,10 @@ private bool covers(ref Barray!Range rs, uint from, uint to)
     return false;
 }
 
+@trusted
 private bool allocatable(uint p, RC rc)
 {
-    foreach (q; regOrder(rc))
-        if (q == p)
-            return true;
-    return false;
+    return (allocatableMask[rc] >> p) & 1;
 }
 
 /// A spilled register held in a physical register through a loop
