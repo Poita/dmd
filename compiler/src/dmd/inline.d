@@ -2916,6 +2916,11 @@ private bool canInline(FuncDeclaration fd, bool hasThis, bool statementsToo, PAS
     {
         if (!fd.fbody)
             return false;
+        /* Only functions marked by pragma(inline, true) are inlined in this pass,
+         * so the body of one that cannot be marked is not analyzed
+         */
+        if (pass != PASS.inlineAll && fd.inlining == PINLINE.default_ && !mayHavePragmaInline(fd.fbody))
+            return false;
         if (!functionSemantic3(fd))
             return false;
         runDeferredSemantic3();
@@ -3103,6 +3108,101 @@ Lno:
 
 /// The functions a call was inlined into, and the functions enclosing them
 private __gshared bool[void*] inlinedInto;
+
+/***********************************************************
+ * Find, without analyzing it, whether the body of a function may have a
+ * pragma(inline) statement, which can mark the function to be inlined.
+ * Params:
+ *      s = the body, or a statement in it, not yet analyzed
+ * Returns:
+ *      false if `s` has no pragma(inline) statement; true if it has one, or
+ *      something not yet expanded, such as a mixin, could add one
+ */
+private bool mayHavePragmaInline(Statement s)
+{
+    if (!s)
+        return false;
+    final switch (s.stmt)
+    {
+        case STMT.Pragma:
+            auto ps = s.isPragmaStatement();
+            return ps.ident == Id.Pinline || mayHavePragmaInline(ps._body);
+
+        case STMT.Compound:
+        case STMT.CompoundDeclaration:
+        case STMT.CompoundAsm:
+            foreach (sx; (cast(CompoundStatement)s).statements[])
+                if (mayHavePragmaInline(sx))
+                    return true;
+            return false;
+
+        case STMT.UnrolledLoop:
+            foreach (sx; s.isUnrolledLoopStatement().statements[])
+                if (mayHavePragmaInline(sx))
+                    return true;
+            return false;
+
+        case STMT.Peel:         return mayHavePragmaInline(s.isPeelStatement().s);
+        case STMT.Scope:        return mayHavePragmaInline(s.isScopeStatement().statement);
+        case STMT.Forwarding:   return mayHavePragmaInline(s.isForwardingStatement().statement);
+        case STMT.While:        return mayHavePragmaInline(s.isWhileStatement()._body);
+        case STMT.Do:           return mayHavePragmaInline(s.isDoStatement()._body);
+        case STMT.For:
+            auto fs = s.isForStatement();
+            return mayHavePragmaInline(fs._init) || mayHavePragmaInline(fs._body);
+        case STMT.Foreach:      return mayHavePragmaInline(s.isForeachStatement()._body);
+        case STMT.ForeachRange: return mayHavePragmaInline(s.isForeachRangeStatement()._body);
+        case STMT.If:
+            auto ifs = s.isIfStatement();
+            return mayHavePragmaInline(ifs.ifbody) || mayHavePragmaInline(ifs.elsebody);
+        case STMT.Conditional:
+            auto cs = s.isConditionalStatement();
+            return mayHavePragmaInline(cs.ifbody) || mayHavePragmaInline(cs.elsebody);
+        case STMT.Switch:       return mayHavePragmaInline(s.isSwitchStatement()._body);
+        case STMT.Case:         return mayHavePragmaInline(s.isCaseStatement().statement);
+        case STMT.CaseRange:    return mayHavePragmaInline(s.isCaseRangeStatement().statement);
+        case STMT.Default:      return mayHavePragmaInline(s.isDefaultStatement().statement);
+        case STMT.Synchronized: return mayHavePragmaInline(s.isSynchronizedStatement()._body);
+        case STMT.With:         return mayHavePragmaInline(s.isWithStatement()._body);
+        case STMT.TryCatch:
+            auto tcs = s.isTryCatchStatement();
+            if (mayHavePragmaInline(tcs._body))
+                return true;
+            if (tcs.catches)
+                foreach (c; *tcs.catches)
+                    if (mayHavePragmaInline(c.handler))
+                        return true;
+            return false;
+        case STMT.TryFinally:
+            auto tfs = s.isTryFinallyStatement();
+            return mayHavePragmaInline(tfs._body) || mayHavePragmaInline(tfs.finalbody);
+        case STMT.ScopeGuard:   return mayHavePragmaInline(s.isScopeGuardStatement().statement);
+        case STMT.Debug:        return mayHavePragmaInline(s.isDebugStatement().statement);
+        case STMT.Label:        return mayHavePragmaInline(s.isLabelStatement().statement);
+
+        case STMT.Mixin:
+        case STMT.StaticForeach:
+            return true;
+
+        case STMT.Error:
+        case STMT.Exp:
+        case STMT.DtorExp:
+        case STMT.StaticAssert:
+        case STMT.GotoDefault:
+        case STMT.GotoCase:
+        case STMT.SwitchError:
+        case STMT.Return:
+        case STMT.Break:
+        case STMT.Continue:
+        case STMT.Throw:
+        case STMT.Goto:
+        case STMT.Asm:
+        case STMT.InlineAsm:
+        case STMT.GccAsm:
+        case STMT.Import:
+            return false;
+    }
+}
 
 /***********************************************************
  * Returns:
