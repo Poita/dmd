@@ -421,6 +421,8 @@ bool lirCodegen(ref CGstate cg)
     splitSpilled();
     rewriteSpills();
     pairMemoryOps();
+    if (env!"DMD_NEWCG_RASTATS")
+        printAllocationStats();
     emit(cg);
     finishVariables();
     if (hasTry)
@@ -13900,6 +13902,53 @@ private void rewriteSpills()
     saved.dtor();
     segOfIns.dtor();
     usesFrame = true;
+}
+
+/* Print what allocation leaves to do at run time: the copies between different
+ * registers and the loads and stores of stack slots of registers, each also weighted
+ * by the estimated frequency of its block
+ */
+@trusted
+private void printAllocationStats()
+{
+    Barray!(Symbol*) slots;
+    scope (exit) slots.dtor();
+    foreach (ref v; vinfo[])
+        if (v.slot)
+            slots.push(v.slot);
+    bool isSlot(const Symbol* s)
+    {
+        foreach (x; slots[])
+            if (x is s)
+                return true;
+        return false;
+    }
+    uint copies, loads, stores;
+    float wcopies = 0, wloads = 0, wstores = 0;
+    foreach (bi; 0 .. blocks.length)
+    {
+        const w = blockFreq[bi];
+        foreach (ref i; ins[blockStart[bi] .. blockStart[bi + 1]])
+        {
+            if (i.op == LOp.copy && pr(i.d) != pr(i.a))
+            {
+                ++copies;
+                wcopies += w;
+            }
+            else if (i.op == LOp.ld && i.sym && isSlot(i.sym))
+            {
+                ++loads;
+                wloads += w;
+            }
+            else if (i.op == LOp.st && i.sym && isSlot(i.sym))
+            {
+                ++stores;
+                wstores += w;
+            }
+        }
+    }
+    fprintf(stderr, "newcg-ra: copies %u %g loads %u %g stores %u %g %s\n",
+        copies, wcopies, loads, wloads, stores, wstores, funcsym_p.Sident.ptr);
 }
 
 /******************************* Emission ******************************/
