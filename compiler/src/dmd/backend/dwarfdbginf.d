@@ -462,6 +462,96 @@ static if (1)
         cfa_buf.writeuLEB128(cast(uint)sz);
     }
 
+    private __gshared
+    {
+        OutBuffer cfa_late;         // the CFA instructions of a prolog not at the start
+        uint cfa_late_location;     // the location they end at, from the prolog's start
+        size_t cfa_late_from;       // where they start in cfa_buf
+    }
+
+    /***********************************
+     * Start the CFA instructions of a prolog that does not start the function,
+     * located from the prolog's start, until dwarf_CFA_end_late().
+     */
+    public
+    void dwarf_CFA_begin_late()
+    {
+        assert(CFA_state_current.location == 0);
+        cfa_late_from = cfa_buf.length;
+    }
+
+    /***********************************
+     * End the CFA instructions of the prolog, set aside for
+     * dwarf_CFA_place_late() once where it goes is known.
+     */
+    public
+    void dwarf_CFA_end_late()
+    {
+        cfa_late.reset();
+        cfa_late.write(cfa_buf[][cfa_late_from .. $]);
+        cfa_buf.setsize(cfa_late_from);
+        cfa_late_location = cast(uint)CFA_state_current.location;
+        CFA_state_current.location = 0;
+    }
+
+    /***********************************
+     * Place the CFA instructions of the prolog.
+     * Params:
+     *      location = offset of the prolog from the start of the function
+     */
+    public
+    void dwarf_CFA_place_late(uint location)
+    {
+        dwarf_CFA_set_loc(location);
+        cfa_buf.write(cfa_late[]);
+        CFA_state_current.location = location + cfa_late_location;
+    }
+
+    /***********************************
+     * From location on, until dwarf_CFA_frame(), the code runs without the frame
+     * the prolog sets up: the CFA is SP, and the registers the prolog saves are
+     * where they are on entry.
+     * Params:
+     *      location = offset from the start of the function
+     *      saved = the registers the prolog saves
+     */
+    public
+    void dwarf_CFA_frameless(uint location, ulong saved)
+    {
+        assert(AArch64);
+        dwarf_CFA_set_loc(location);
+        cfa_buf.writeByte(DW_CFA_remember_state);
+        cfa_buf.writeByte(DW_CFA_def_cfa);
+        cfa_buf.writeuLEB128(dwarf_regno(INSTR.SP));
+        cfa_buf.writeuLEB128(0);
+        foreach (reg; 0 .. 64)
+        {
+            if (!(saved & (1UL << reg)))
+                continue;
+            const dw_reg = dwarf_regno(reg);
+            if (dw_reg < 0x40)
+                cfa_buf.writeByte(cast(ubyte)(DW_CFA_restore + dw_reg));
+            else
+            {
+                cfa_buf.writeByte(DW_CFA_restore_extended);
+                cfa_buf.writeuLEB128(dw_reg);
+            }
+        }
+    }
+
+    /***********************************
+     * From location on, the code runs with the frame again, as before the
+     * dwarf_CFA_frameless() it follows.
+     * Params:
+     *      location = offset from the start of the function
+     */
+    public
+    void dwarf_CFA_frame(uint location)
+    {
+        dwarf_CFA_set_loc(location);
+        cfa_buf.writeByte(DW_CFA_restore_state);
+    }
+
     struct Section
     {
         segidx_t seg = 0;
@@ -3427,6 +3517,11 @@ else
     void dwarf_CFA_set_loc(uint location) { }
     void dwarf_CFA_set_reg_offset(int reg, int offset) { }
     void dwarf_CFA_offset(int reg, int offset) { }
+    void dwarf_CFA_begin_late() { }
+    void dwarf_CFA_end_late() { }
+    void dwarf_CFA_place_late(uint location) { }
+    void dwarf_CFA_frameless(uint location, ulong saved) { }
+    void dwarf_CFA_frame(uint location) { }
     void dwarf_except_gentables(Funcsym* sfunc, uint startoffset, uint retoffset) { }
 }
 

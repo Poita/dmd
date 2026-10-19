@@ -60,7 +60,8 @@ extern(C) void qsort(void* base, size_t nmemb, size_t size, _compare_fp_t compar
 
 enum MARS = true;
 
-import dmd.backend.dwarfdbginf : dwarf_except_gentables;
+import dmd.backend.dwarfdbginf : dwarf_except_gentables, dwarf_CFA_begin_late, dwarf_CFA_end_late,
+    dwarf_CFA_place_late, dwarf_CFA_frameless, dwarf_CFA_frame;
 
 __gshared CGstate cgstate;     // state of code generator
 
@@ -357,9 +358,18 @@ void codgenx(ref CGstate cg, Symbol* sfunc)
     // Otherwise, jmp's to startblock will execute the prolog again
     assert(!bo.startblock.Bpred.length);
 
+    // a prolog placed after the start has its CFA instructions placed once its location is known
+    block* lateprolog = bo.startblock.Bflags & BFL.prolog ? null : bo.startblock;
+    while (lateprolog && !(lateprolog.Bflags & BFL.prolog))
+        lateprolog = lateprolog.Bnext;
+    const bool cfa = config.ehmethod == EHmethod.EH_DWARF || config.fulltypes == CVDWARF_C || config.fulltypes == CVDWARF_D;
+    if (lateprolog && cfa)
+        dwarf_CFA_begin_late();
     CodeBuilder cdbprolog; cdbprolog.ctor();
     prolog(cg, cdbprolog);           // gen function start code
     code* cprolog = cdbprolog.finish();
+    if (lateprolog && cfa)
+        dwarf_CFA_end_late();
     if (cprolog)
         pinholeopt(cprolog,null);       // optimize
 
@@ -448,6 +458,31 @@ void codgenx(ref CGstate cg, Symbol* sfunc)
 
     debug
     debugw && printf("code jump optimization complete\n");
+
+    if (lateprolog)
+    {
+        cg.startoffset = 0;     // the exception tables cover the code before it too
+        if (cfa)
+        {
+            /* The code laid out after the prolog's block that runs without the frame
+             * has the CFA instructions of the code before the prolog
+             */
+            dwarf_CFA_place_late(cast(uint)(lateprolog.Boffset - cg.funcoffset));
+            const regm_t saved = cg.fregsaved & ~cg.mfuncreg;
+            bool outside;
+            for (block* b = lateprolog.Bnext; b; b = b.Bnext)
+            {
+                if (!b.Bsize || !(b.Bflags & BFL.outsideprolog) == !outside)
+                    continue;
+                outside = !outside;
+                const location = cast(uint)(b.Boffset - cg.funcoffset);
+                if (outside)
+                    dwarf_CFA_frameless(location, saved | (cg.hasframe ? mask(29) | mask(30) : 0));
+                else
+                    dwarf_CFA_frame(location);
+            }
+        }
+    }
 
     if (cg.usednteh & NTEH_try)
     {

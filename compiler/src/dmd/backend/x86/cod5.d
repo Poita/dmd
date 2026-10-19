@@ -40,7 +40,8 @@ void cod5_prol_epi(block* startblock)
 {
 static if(1)
 {
-    cod5_noprol(startblock);
+    if (!cod5_lateprol(startblock))
+        cod5_noprol(startblock);
 }
 else
 {
@@ -144,6 +145,61 @@ else
         //printf("=============== prolog opt\n");
     }
 }
+}
+
+/**********************************************
+ * Place the prolog at the start of the block the AArch64 code generator
+ * chose, with the blocks needing no frame marked BFL.outsideprolog, when
+ * nothing else needs the frame on entry. The return blocks with the frame
+ * get the epilog, the others return directly.
+ * Returns:
+ *      true if done
+ */
+@trusted
+private bool cod5_lateprol(block* startblock)
+{
+    import dmd.backend.arm.lir : lirPrologBlock;
+    import dmd.backend.symbol : globsym, Symbol_Sisdead;
+    import dmd.backend.x86.cgcod : cgstate;
+    import core.stdc.stdlib : getenv;
+
+    if (!cgstate.AArch64)
+        return false;
+    block* bp = lirPrologBlock();
+    if (!bp)
+        return false;
+    if (config.ehmethod != EHmethod.EH_DWARF ||
+        cgstate.usednteh ||
+        cgstate.anyiasm ||
+        cgstate.Alloca.size ||
+        cgstate.enforcealign ||
+        cgstate.accessedTLS ||
+        config.flags & (CFGtrace | CFGstack) ||
+        funcsym_p.ty() & mTYnaked ||
+        funcsym_p.Sfunc.Fflags & Ffakeeh ||
+        variadic(funcsym_p.Stype))
+        return false;
+
+    // the prolog would copy parameters from the registers they are passed in
+    foreach (s; globsym[])
+    {
+        if (!(s.Sclass == SC.fastpar || s.Sclass == SC.shadowreg) || Symbol_Sisdead(*s, cgstate.anyiasm))
+            continue;
+        if (s.Sfl != FL.reg || s.Sreglsw != s.Spreg || s.Spreg2 != NOREG && s.Sregmsw != s.Spreg2)
+            return false;
+    }
+
+    for (block* b = startblock; b; b = b.Bnext)
+    {
+        b.Bflags &= ~(BFL.prolog | BFL.epilog);
+        if ((b.bc == BC.ret || b.bc == BC.retexp) && !(b.Bflags & BFL.outsideprolog))
+            b.Bflags |= BFL.epilog;
+    }
+    bp.Bflags |= BFL.prolog;
+
+    if (getenv("DMD_NEWCG_SWLOG"))
+        fprintf(stderr, "newcg-shrinkwrap: %s\n", funcsym_p.Sident.ptr);
+    return true;
 }
 
 /**********************************************

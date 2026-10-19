@@ -306,6 +306,7 @@ bool lirCodegen(ref CGstate cg)
 
     cgp = &cg;
     failed = false;
+    wrappedProlog = null;
     ins.setLength(0);
     foreach (ref v; vinfo[])
         v.ranges.dtor();
@@ -423,6 +424,7 @@ bool lirCodegen(ref CGstate cg)
     pairMemoryOps();
     if (env!"DMD_NEWCG_RASTATS")
         printAllocationStats();
+    shrinkWrap();
     emit(cg);
     finishVariables();
     if (hasTry)
@@ -14325,6 +14327,508 @@ private void printAllocationStats()
         copies, wcopies, loads, wloads, stores, wstores, funcsym_p.Sident.ptr);
 }
 
+/******************************* Shrink-wrapping ******************************/
+
+/* The prolog setting up the frame and saving the callee saved registers goes at the
+ * start of the first block on every path to the code needing them, where that is not
+ * the first block of the function: the paths not reaching it return without a frame.
+ * The copies of arguments and constants to callee saved registers those paths make are
+ * moved to the start of that block, and what reads the copies on them reads the
+ * arguments.
+ */
+
+private __gshared
+{
+    const(Symbol)* wrappedFunc;     // the function wrappedProlog is of
+    block* wrappedProlog;           // the block the prolog starts, or null for the first
+    Barray!LIns sunk;               // the instructions moved to the start of wrappedProlog
+}
+
+/// The block other than the first at whose start the prolog of the function being
+/// generated goes, with the blocks not needing the frame marked BFL.outsideprolog,
+/// or null
+@trusted
+block* lirPrologBlock()
+{
+    return wrappedFunc is funcsym_p ? wrappedProlog : null;
+}
+
+/* The registers the prolog saves: x19 .. x28, the frame record's x29 and x30, v8 .. v15
+ */
+private enum regm_t frameRegs = (0x3FFUL << 19) | (1UL << 29) | (1UL << 30) | (0xFFUL << 40);
+
+/* Whether i needs the frame, by what it does or by a register the prolog saves other
+ * than one in `copies` it reads
+ */
+@trusted
+private bool needsFrame(ref LIns i, regm_t copies)
+{
+    bool memory;
+    switch (i.op)
+    {
+        case LOp.call:
+            if (!(i.flags & F.tail))
+                return true;        // the call destroys x30
+            break;
+        case LOp.spsub: case LOp.spadd: case LOp.frameptr: case LOp.tlv:
+            return true;
+        case LOp.ld: case LOp.st: case LOp.lea:
+            if (i.sym && !isStatic(i.sym))
+                return true;        // a stack variable
+            memory = true;
+            break;
+        case LOp.ldp: case LOp.stp: case LOp.vld: case LOp.vst:
+            memory = true;
+            break;
+        default:
+            break;
+    }
+    foreach (k, r; [i.d, i.a, i.b, i.c])
+    {
+        if (!r)
+            continue;
+        const p = pr(r);
+        const read = k != 0 && !(k == 3 && i.op == LOp.ldp);
+        if (frameRegs & (1UL << p) && !(read && copies & (1UL << p)) || memory && p == 31)
+            return true;
+    }
+    return false;
+}
+
+/* Whether i, needing the frame only for its result in a callee saved register, may move
+ * to the start of the block with the prolog: a copy of a register the prolog does not
+ * save, or a constant
+ */
+@trusted
+private bool sinkable(ref LIns i)
+{
+    if (i.flags & F.condDef || !i.d || !(frameRegs & (1UL << pr(i.d))) || pr(i.d) == 29 || pr(i.d) == 30)
+        return false;
+    switch (i.op)
+    {
+        case LOp.copy:
+            return !(frameRegs & (1UL << pr(i.a))) && pr(i.a) != 31;
+        case LOp.movi: case LOp.fmovi:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* Calls fn(p) for each physical register i defines
+ */
+@trusted
+private void forPhysDefs(ref LIns i, scope void delegate(uint) nothrow fn)
+{
+    if (i.op == LOp.call || i.op == LOp.tlv)
+    {
+        foreach (p; 0 .. 64)
+            if (callClobbers & (1UL << p))
+                fn(p);
+    }
+    if (i.op == LOp.atomic)
+        fn(16);
+    if (i.d)
+        fn(pr(i.d));
+    if (i.op == LOp.ldp && i.c)
+        fn(pr(i.c));
+}
+
+/* Choose the block the prolog goes at, move the instructions there that only it needs,
+ * and mark the blocks without the frame, after register allocation
+ */
+@trusted
+private void shrinkWrap()
+{
+    wrappedFunc = funcsym_p;
+    wrappedProlog = null;
+    sunk.setLength(0);
+    const nb = blocks.length;
+    if (nb < 2 || env!"DMD_NEWCG_NOSHRINKWRAP")
+        return;
+    foreach (b; blocks[])
+        if (b.bc != BC.goto_ && b.bc != BC.iftrue && b.bc != BC.ret && b.bc != BC.retexp &&
+            b.bc != BC.exit && b.bc != BC.switch_)
+            return;         // exception handling
+
+    // the blocks' successors as the code goes
+    buildSegments();
+    Barray!uint psuccStart, psucc, ppredStart, ppreds;
+    scope (exit) { psuccStart.dtor(); psucc.dtor(); ppredStart.dtor(); ppreds.dtor(); }
+    physicalFlow(psuccStart, psucc, ppredStart, ppreds);
+    Barray!uint succStart, succ, predStart, preds;
+    scope (exit) { succStart.dtor(); succ.dtor(); predStart.dtor(); preds.dtor(); }
+    succStart.setLength(nb + 1);
+    foreach (bi; 0 .. nb)
+    {
+        succStart[bi] = cast(uint)succ.length;
+        foreach (si; blockSeg[bi] .. blockSeg[bi + 1])
+            foreach (t; psucc[psuccStart[si] .. psuccStart[si + 1]])
+            {
+                const tb = segBlock[t];
+                if (tb == bi && segStart[t] != blockStart[bi])
+                    continue;       // within the block
+                bool dup;
+                foreach (x; succ[succStart[bi] .. $])
+                    dup |= x == tb;
+                if (!dup)
+                    succ.push(tb);
+            }
+    }
+    succStart[nb] = cast(uint)succ.length;
+    predStart.setLength(nb + 1);
+    predStart[][] = 0;
+    foreach (t; succ[])
+        ++predStart[t + 1];
+    foreach (k; 1 .. nb + 1)
+        predStart[k] += predStart[k - 1];
+    preds.setLength(succ.length);
+    {
+        Barray!uint fill;
+        scope (exit) fill.dtor();
+        fill.setLength(nb);
+        fill[][] = 0;
+        foreach (bi; 0 .. nb)
+            foreach (t; succ[succStart[bi] .. succStart[bi + 1]])
+                preds[predStart[t] + fill[t]++] = cast(uint)bi;
+    }
+
+    // the immediate dominators, in reverse postorder from the first block
+    Barray!int idom;
+    Barray!uint rpo, order;
+    scope (exit) { idom.dtor(); rpo.dtor(); order.dtor(); }
+    {
+        Barray!uint stack, next, post;
+        scope (exit) { stack.dtor(); next.dtor(); post.dtor(); }
+        order.setLength(nb);
+        order[][] = uint.max;
+        next.setLength(nb);
+        next[][] = 0;
+        stack.push(0);
+        order[0] = 0;
+        while (stack.length)
+        {
+            const b = stack[stack.length - 1];
+            if (succStart[b] + next[b] < succStart[b + 1])
+            {
+                const t = succ[succStart[b] + next[b]++];
+                if (order[t] == uint.max)
+                {
+                    order[t] = 0;
+                    stack.push(t);
+                }
+                continue;
+            }
+            stack.setLength(stack.length - 1);
+            post.push(b);
+        }
+        foreach_reverse (b; post[])
+        {
+            order[b] = cast(uint)rpo.length;
+            rpo.push(b);
+        }
+    }
+    idom.setLength(nb);
+    idom[][] = -1;
+    int intersect(int a, int b)
+    {
+        while (a != b)
+        {
+            while (order[a] > order[b])
+                a = idom[a];
+            while (order[b] > order[a])
+                b = idom[b];
+        }
+        return a;
+    }
+    idom[0] = 0;
+    for (bool changed = true; changed; )
+    {
+        changed = false;
+        foreach (b; rpo[1 .. $])
+        {
+            int d = -1;
+            foreach (p; preds[predStart[b] .. predStart[b + 1]])
+                if (idom[p] >= 0)
+                    d = d < 0 ? cast(int)p : intersect(cast(int)p, d);
+            if (d != idom[b])
+            {
+                idom[b] = d;
+                changed = true;
+            }
+        }
+    }
+    bool reached(uint b) { return b == 0 || idom[b] >= 0; }
+    bool dominates(uint a, uint b)
+    {
+        for (uint x = b; ; x = idom[x])
+        {
+            if (x == a)
+                return true;
+            if (x == 0 || idom[x] < 0)
+                return false;
+        }
+    }
+    // code the flow found does not reach may be reached some way it does not know
+    foreach (bi; 1 .. nb)
+        if (!reached(cast(uint)bi))
+            foreach (ref i; ins[blockStart[bi] .. blockStart[bi + 1]])
+                if (i.op != LOp.nop && i.op != LOp.label)
+                    return;
+
+    // the blocks needing the frame, apart from the instructions that may move and the
+    // reads of the registers they define
+    regm_t candidates;
+    foreach (bi; 0 .. nb)
+        if (reached(cast(uint)bi))
+            foreach (n; blockStart[bi] .. blockStart[bi + 1])
+                if (sinkable(ins[n]))
+                    candidates |= 1UL << pr(ins[n].d);
+    Barray!bool need;
+    scope (exit) need.dtor();
+    need.setLength(nb);
+    need[][] = false;
+    foreach (bi; 0 .. nb)
+        if (reached(cast(uint)bi))
+            foreach (n; blockStart[bi] .. blockStart[bi + 1])
+                if (!sinkable(ins[n]) && needsFrame(ins[n], candidates))
+                    need[bi] = true;
+
+    Barray!bool seen;
+    scope (exit) seen.dtor();
+    seen.setLength(nb);
+    Barray!uint stack;
+    scope (exit) stack.dtor();
+    // whether a path from a successor of s comes back to s, or reaches a block s
+    // does not dominate
+    bool enclosed(uint s)
+    {
+        seen[][] = false;
+        stack.setLength(0);
+        foreach (t; succ[succStart[s] .. succStart[s + 1]])
+            stack.push(t);
+        while (stack.length)
+        {
+            const b = stack[stack.length - 1];
+            stack.setLength(stack.length - 1);
+            if (b == s || !dominates(s, b))
+                return false;
+            if (seen[b])
+                continue;
+            seen[b] = true;
+            foreach (t; succ[succStart[b] .. succStart[b + 1]])
+                stack.push(t);
+        }
+        return true;
+    }
+
+    Barray!uint moved;              // the instructions moving to the prolog's block
+    scope (exit) moved.dtor();
+    Barray!bool intact;             // by block: on entry, the instruction has been done since
+    scope (exit) intact.dtor();     // with the register it copies unchanged
+    intact.setLength(nb);
+    uint s;
+    while (1)
+    {
+        // the nearest block dominating all that need the frame, where no path loops back
+        int d = -1;
+        foreach (bi; 0 .. nb)
+            if (need[bi])
+                d = d < 0 ? cast(int)bi : intersect(cast(int)bi, d);
+        if (d <= 0)
+            return;
+        s = d;
+        while (s && !enclosed(s))
+            s = idom[s];
+        if (!s)
+            return;
+        // the blocks with the frame follow it, as the call frame information goes
+        foreach (bi; 0 .. s)
+            if (reached(cast(uint)bi) && dominates(s, cast(uint)bi))
+                return;
+
+        // the instructions of the blocks without the frame needing it, which may move
+        // when the register they define is used nowhere else there but where it can
+        // be the register copied, and they are done on every path to the prolog
+        moved.setLength(0);
+        bool again;
+        regm_t copies;          // the registers of the copies moving
+        foreach (bi; 0 .. nb)
+        {
+            if (!reached(cast(uint)bi) || dominates(s, cast(uint)bi))
+                continue;
+            foreach (n; blockStart[bi] .. blockStart[bi + 1])
+            {
+                if (!sinkable(ins[n]))
+                    continue;
+                if (!movable(n, s, intact, preds[], predStart[], rpo[], &reached, &dominates))
+                {
+                    need[bi] = true;
+                    again = true;
+                }
+                else
+                {
+                    moved.push(cast(uint)n);
+                    if (ins[n].op == LOp.copy)
+                        copies |= 1UL << pr(ins[n].d);
+                }
+            }
+        }
+        // the reads of the registers of the instructions staying
+        foreach (bi; 0 .. nb)
+        {
+            if (!reached(cast(uint)bi) || dominates(s, cast(uint)bi) || need[bi])
+                continue;
+            foreach (n; blockStart[bi] .. blockStart[bi + 1])
+            {
+                bool isMoved;
+                foreach (m; moved[])
+                    isMoved |= m == n;
+                if (!isMoved && needsFrame(ins[n], copies))
+                {
+                    need[bi] = true;
+                    again = true;
+                    break;
+                }
+            }
+        }
+        if (!again)
+            break;
+    }
+
+    // move them, reading the registers they copy in place of theirs
+    foreach (n; moved[])
+    {
+        LIns i = ins[n];
+        const r = pr(i.d);
+        if (i.op == LOp.copy)
+        {
+            const src = phys(pr(i.a));
+            foreach (bi; 0 .. nb)
+            {
+                if (!reached(cast(uint)bi) || dominates(s, cast(uint)bi))
+                    continue;
+                foreach (k; blockStart[bi] .. blockStart[bi + 1])
+                {
+                    LIns* x = &ins[k];
+                    if (k == n)
+                        continue;
+                    foreach (o; [&x.a, &x.b, &x.c])
+                        if (*o && pr(*o) == r)
+                            *o = src;
+                    if (x.op == LOp.call)
+                        assert(!(x.imm & (1UL << r)));
+                }
+            }
+        }
+        sunk.push(i);
+        ins[n].op = LOp.nop;
+        ins[n].d = ins[n].a = ins[n].b = ins[n].c = noReg;
+    }
+    foreach (bi, b; blocks[])
+    {
+        if (reached(cast(uint)bi) && dominates(s, cast(uint)bi))
+            b.Bflags &= ~BFL.outsideprolog;
+        else
+            b.Bflags |= BFL.outsideprolog;
+    }
+    wrappedProlog = blocks[s];
+}
+
+/* Whether the instruction n, in a block not dominated by the prolog's block s, may move
+ * to the start of s: the register it defines is defined nowhere else in the blocks s does
+ * not dominate, and where it is used there, and at the start of s, the instruction has
+ * been done on every path since the start, and the register it copies not changed since
+ */
+@trusted
+private bool movable(uint n, uint s, ref Barray!bool intact, const(uint)[] preds, const(uint)[] predStart,
+    const(uint)[] rpo, scope bool delegate(uint) nothrow reached, scope bool delegate(uint, uint) nothrow dominates)
+{
+    const nb = blocks.length;
+    const LIns* c = &ins[n];
+    const r = pr(c.d);
+    const src = c.op == LOp.copy ? pr(c.a) : uint.max;
+    bool outside(uint bi) { return reached(bi) && !dominates(s, bi); }
+
+    // the state after the instructions of block bi from k on, starting from st
+    bool transfer(uint bi, size_t from, bool st)
+    {
+        foreach (k; from .. blockStart[bi + 1])
+        {
+            if (k == n)
+            {
+                st = true;
+                continue;
+            }
+            forPhysDefs(ins[k], (uint p) { if (p == src) st = false; });
+        }
+        return st;
+    }
+
+    // the other definitions of the register
+    foreach (bi; 0 .. nb)
+    {
+        if (!outside(cast(uint)bi))
+            continue;
+        foreach (k; blockStart[bi] .. blockStart[bi + 1])
+        {
+            if (k == n)
+                continue;
+            bool defines;
+            forPhysDefs(ins[k], (uint p) { defines |= p == r; });
+            if (defines)
+                return false;
+        }
+    }
+
+    // intact on entry to each block, as the greatest solution
+    foreach (bi; 0 .. nb)
+        intact[bi] = bi != 0;
+    for (bool changed = true; changed; )
+    {
+        changed = false;
+        foreach (b; rpo)
+        {
+            if (!outside(b) || b == 0)
+                continue;
+            bool st = true;
+            foreach (p; preds[predStart[b] .. predStart[b + 1]])
+                if (outside(p))
+                    st &= transfer(p, blockStart[p], intact[p]);
+            if (st != intact[b])
+            {
+                intact[b] = st;
+                changed = true;
+            }
+        }
+    }
+    foreach (p; preds[predStart[s] .. predStart[s + 1]])
+        if (outside(p) && !transfer(p, blockStart[p], intact[p]))
+            return false;
+
+    // the uses, of a copy of all the 64 bits of the register copied
+    foreach (bi; 0 .. nb)
+    {
+        if (!outside(cast(uint)bi))
+            continue;
+        bool st = intact[bi];
+        foreach (k; blockStart[bi] .. blockStart[bi + 1])
+        {
+            if (k == n)
+            {
+                st = true;
+                continue;
+            }
+            bool uses;
+            forUses(ins[k], (Reg u) { uses |= pr(u) == r; });
+            if (uses && (!st || c.op != LOp.copy || c.sz != 8))
+                return false;
+            forPhysDefs(ins[k], (uint p) { if (p == src) st = false; });
+        }
+    }
+    return true;
+}
+
 /******************************* Emission ******************************/
 
 @trusted
@@ -14381,6 +14885,9 @@ private void emit(ref CGstate cg)
         // below its place for arguments on the stack: MOV SP,X29, the frame having no more
         if (b.bc == BC.jcatch || b.bc == BC.lpad)
             cdb.gen1(0x9100_03BF);
+        if (b is wrappedProlog)
+            foreach (ref i; sunk[])
+                emitOne(cdb, i, labelCode, used);
         foreach (n; blockStart[bi] .. blockStart[bi + 1])
         {
             LIns* i = &ins[n];
