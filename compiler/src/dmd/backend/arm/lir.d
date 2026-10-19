@@ -13557,6 +13557,8 @@ private void allocate()
     {
         const r = order[oi];
         auto v = vi(r);
+        if (v.preg != uint.max)
+            continue;       // given the register of what it is copied to or from
         const(ubyte)[] prefs = regOrder(v.rc);
         const affs = affinities[affStart[r - firstVreg] .. affStart[r - firstVreg + 1]];
         uint chosen = uint.max;
@@ -13742,6 +13744,29 @@ private void allocate()
         }
         v.preg = chosen;
         occupy(chosen, v.ranges, r);
+
+        /* what r is copied to or from, yet to be allocated, given the same register
+         * now where it is free for them, and so on for what they are copied to or from
+         */
+        Barray!Reg group;
+        group.push(r);
+        for (size_t gi = 0; gi < group.length; ++gi)
+        {
+            const g = group[gi];
+            foreach (ref e; affinities[affStart[g - firstVreg] .. affStart[g - firstVreg + 1]])
+            {
+                if (isPhys(e.r))
+                    continue;
+                auto vm = vi(e.r);
+                if (vm.preg != uint.max || vm.spilled || vm.rc != v.rc || !vm.ranges.length ||
+                    !allowedFor(chosen, vm) || overlaps(occupied[chosen], vm.ranges, occupiedMaxLen[chosen]))
+                    continue;
+                vm.preg = chosen;
+                occupy(chosen, vm.ranges, e.r);
+                group.push(e.r);
+            }
+        }
+        group.dtor();
     }
     density.dtor();
     span.dtor();
