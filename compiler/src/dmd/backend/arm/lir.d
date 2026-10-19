@@ -9885,6 +9885,19 @@ private struct LoopVec
             return v;
         if (inLoop[r - firstVreg])
             return -1;      // carried, but not as an induction or reduction
+        // a copy of a register set once, as that
+        if (ndefs[r - firstVreg] == 1)
+        {
+            const LIns* d = &ins[defIns[r - firstVreg]];
+            if (d.op == LOp.copy && d.a && !isPhys(d.a) && d.a - firstVreg < nregs && rcOf(d.a) == rcOf(r) &&
+                rcOf(r) == RC.gp && ndefs[d.a - firstVreg] == 1 && !inLoop[d.a - firstVreg])
+            {
+                const n = val(d.a);
+                if (n >= 0)
+                    setVal(r, n);
+                return n;
+            }
+        }
         // defined only before the loop
         LvVal x;
         x.kind = LvVal.Kind.uni;
@@ -9956,8 +9969,10 @@ private struct LoopVec
         }
         if (c < 0 || c > 0x10000)
             return false;
+        // below a constant bound under 2^31 an induction counting up without wrapping is not negative
+        const smallBound = cond == COND.cc && boundIsImm && cast(uint)boundImm < 0x8000_0000;
         if (x.term == ivTerm && ivSize == 4 && c == 1 && (x.k == 0 || x.k == 1) &&
-            cond == (signed ? COND.lt : COND.cc))
+            (cond == (signed ? COND.lt : COND.cc) || signed && smallBound))
         {
             t = term(signed ? LvT.sext : LvT.zext, ivTerm, -1, 0, noReg);
             k = x.k;
@@ -9965,13 +9980,16 @@ private struct LoopVec
         }
         // from the value at the start, c in each of the iterations left stays in range
         t = term(signed ? LvT.sext : LvT.zext, x.term, -1, x.k, noReg);
+        foreach (ref nw; noWrap[])
+            if (nw.v == v && nw.signed == signed)
+                return true;
         Reg e = newVreg(RC.gp, 8);
         emitTo(checks, signed ? LOp.sext : LOp.zext, 8, e, x.pre, noReg, 32);
-        noWrap.push(NoWrap(e, c, signed));
+        noWrap.push(NoWrap(e, c, signed, v));
         return true;
     }
 
-    static struct NoWrap { Reg start; long c; bool signed; }
+    static struct NoWrap { Reg start; long c; bool signed; int v; }
     static struct Offset { int v; ubyte ext, shift; Reg r; }
     static struct Loaded { int term; long k; ubyte size; bool signed; int val; }
     Barray!Loaded loaded;       // the vector loads since the last store
@@ -12746,6 +12764,14 @@ private bool hoistInvariants()
 
     Barray!bool defInLoop;
     defInLoop.setLength(vinfo.length);
+    // the constants put into vectors, moved with the vectors made of them
+    Barray!bool vecConst;
+    scope (exit) vecConst.dtor();
+    vecConst.setLength(vinfo.length);
+    vecConst[][] = false;
+    foreach (ref i; ins[])
+        if (i.op == LOp.vqg && !isPhys(i.a))
+            vecConst[i.a - firstVreg] = true;
     Barray!Reg witnessed;       // the base registers the preheader loads through
     bool any;
     foreach (ref lp; loops[])
@@ -12849,7 +12875,8 @@ private bool hoistInvariants()
                     if (moveTo[n] != uint.max)
                         continue;
                     LIns* i = &ins[n];
-                    if (!(pureOp(*i) || movableLoad(*i)) || !i.d || isPhys(i.d) || ndefs[i.d - firstVreg] != 1)
+                    if (!(pureOp(*i) || movableLoad(*i) || i.op == LOp.movi && !isPhys(i.d) && vecConst[i.d - firstVreg]) ||
+                        !i.d || isPhys(i.d) || ndefs[i.d - firstVreg] != 1)
                         continue;
                     bool inv = true;
                     void check(Reg r)
