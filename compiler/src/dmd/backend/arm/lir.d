@@ -2029,6 +2029,19 @@ private void select()
                 if (tyaggregate(ty))
                 {
                     const a = aarch64Aggregate(funcsym_p.Stype.Tnext);
+                    /* a scalar as the aggregate of one register it is the bytes of, as a
+                     * pointer returned as a struct wrapping it, is returned as the scalar is
+                     */
+                    if (!tyaggregate(e.Ety) && scalarType(e.Ety) && a.nregs == 1 &&
+                        (a.kind == AggregateABI.Kind.gpr && !tyfloating(e.Ety) && tysize(e.Ety) == a.size ||
+                         a.kind == AggregateABI.Kind.hfa && tyfloating(e.Ety) && tysize(e.Ety) == a.esz))
+                    {
+                        const hfa = a.kind == AggregateABI.Kind.hfa;
+                        Reg r = gen(e);
+                        emitIns(LOp.copy, hfa ? a.esz : 8, phys(hfa ? 32 : 0), r);
+                        hintCopy(r, phys(hfa ? 32 : 0));
+                        break;
+                    }
                     AggVal v = genAgg(e);
                     Reg[4] r = aggParts(v, a);
                     const hfa = a.kind == AggregateABI.Kind.hfa;
