@@ -479,6 +479,22 @@ private elem* fixconvop(elem* e)
         return e;
     }
 
+    /* A shift's result has the type of its promoted left operand whatever
+     * the type of the count, so a left operand widened to 64 bits only for
+     * the count's sake shifts in its own width:
+     * (s32_64 e) >>>= e2  =>  e >>>= e2
+     */
+    if ((e.Eoper == OPshlass || e.Eoper == OPshrass || e.Eoper == OPashrass) &&
+        (cop == OPs32_64 || cop == OPu32_64))
+    {
+        if (cop == OPu32_64 && e.Eoper == OPashrass)
+            e.Eoper = OPshrass;
+        if (_tysize[tybasic(tyme)] == _tysize[tybasic(tym)])
+            return e;
+        e.Ety = tym;
+        return el_una(cop, tyme, e);
+    }
+
     /* Oh well, just split up the op and the =.                     */
     const op = opeqtoop(e.Eoper); // convert op= to op
     e.Eoper = OPeq;                  // just plain =
