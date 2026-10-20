@@ -3224,6 +3224,9 @@ private void elimbasivs(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
         }
         else if (refcount == 0)                 /* if no uses of IV in loop  */
         {
+            // a catch or finally block may read it after a throw leaves the loop
+            if (catchRef(bo, X, l))
+                continue;
             /* Eliminate the basic IV if it is not live on any successor */
             for (uint i = 0; (i = cast(uint) vec_index(i, l.Lexit)) < bo.dfo.length; ++i)  // for each exit block
             {
@@ -3287,7 +3290,11 @@ private void elimopeqs(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
         if (pref != null && refcount <= 1)
         { }
         else if (refcount == 0)                 // if no uses of IV in loop
-        {   // Eliminate the basic IV if it is not live on any successor
+        {
+            // a catch or finally block may read it after a throw leaves the loop
+            if (catchRef(bo, X, l))
+                continue;
+            // Eliminate the basic IV if it is not live on any successor
             uint i;
             for (i = 0; (i = cast(uint) vec_index(i, l.Lexit)) < bo.dfo.length; ++i)  // for each exit block
             {
