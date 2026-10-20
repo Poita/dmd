@@ -2034,13 +2034,11 @@ private void findUnusedNested(FuncDeclaration fd)
     bool[void*] referred;
     void refer(FuncDeclaration f)
     {
-        if (!f)
+        // each function once, as the template arguments can refer back to it
+        if (!f || cast(void*)f in referred)
             return;
-        if (!(cast(void*)f in referred))
-        {
-            referred[cast(void*)f] = true;
-            work.push(f);
-        }
+        referred[cast(void*)f] = true;
+        work.push(f);
         // the functions given to a template instance it is in, which its code refers to
         for (auto ti = f.isInstantiated(); ti; ti = ti.tinst)
         {
