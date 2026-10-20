@@ -39,6 +39,20 @@ pragma(inline, false) int optHoist(S* s, int n)
     return s.y;
 }
 
+// s.x is the same on every iteration, and s is gone through on the way to the
+// loop, before the branch ahead of it
+pragma(inline, false) int pick(int n) { return n + 1; }
+pragma(inline, false) int optHoistDominated(S* s, int n, bool b)
+{
+    s.y = 0;
+    int k = n;
+    if (b)
+        k = pick(n);
+    foreach (i; 0 .. k)
+        s.y += s.x * i;
+    return s.y;
+}
+
 // the long is read back from the store made of it
 pragma(inline, false) long optForwardLong(S* s, long v, int w)
 {
@@ -55,5 +69,6 @@ void main()
     check(optReuse(&s) == 16);
     s.x = 3;
     check(optHoist(&s, 4) == 18);
+    check(optHoistDominated(&s, 3, true) == 18 && optHoistDominated(&s, 3, false) == 9);
     check(optForwardLong(&s, 1L << 40, -2) == (1L << 40) - 2);
 }
