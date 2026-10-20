@@ -5442,12 +5442,13 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
         if (sz == 0)
             sz = 1;
         uint alignsize = el_alignsize(p.e);
-        if (holdsAggregate(p.e.Ety, p.e.ET) && !tyaggregate(p.e.Ety))
+        if (holdsAggregate(p.e.Ety, p.e.ET))
         {
-            // an aggregate painted as an integer takes the stack space of the aggregate
-            sz = cast(uint)type_size(p.e.ET);
-            alignsize = type_alignsize(p.e.ET);
-            p.size = sz;
+            // an aggregate, also one painted as an integer, takes the stack space of the aggregate
+            import dmd.backend.arm.cod1 : aarch64StackAggregate;
+            aarch64StackAggregate(p.e.ET, sz, alignsize);
+            if (!tyaggregate(p.e.Ety))
+                p.size = cast(uint)type_size(p.e.ET);
         }
         if (alignsize > 16)
             alignsize = 16;

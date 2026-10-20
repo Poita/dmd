@@ -1343,6 +1343,7 @@ void stackoffsets(ref CGstate cg, ref symtab_t symtab, bool estimate)
 
             case SC.shadowreg:  // only on EX_WIN64
             case SC.parameter:
+                uint paramSlot = 0;     // stack space of the parameter if not its size
                 if (config.exe == EX_WIN64)
                 {
                     assert((cg.Para.offset & 7) == 0);
@@ -1352,10 +1353,19 @@ void stackoffsets(ref CGstate cg, ref symtab_t symtab, bool estimate)
                 }
                 if (osx_aarch64)
                 {
-                    /* Alignment on OSX64 AArch64 is the same as for struct fields.
+                    /* Alignment on OSX64 AArch64 is the same as for struct fields, except
+                     * for aggregates other than HFAs, which take 8 byte aligned slots of a
+                     * multiple of 8 bytes.
                      * If it is a variadic function, the last parameter (lastPar) is aligned on 8 bytes.
                      * Match behavior in backend.arm.cod1.cdfunc()
                      */
+                    if (tyaggregate(s.ty()))
+                    {
+                        import dmd.backend.arm.cod1 : aarch64StackAggregate;
+                        uint slot;
+                        aarch64StackAggregate(s.Stype, slot, alignsize);
+                        paramSlot = slot;
+                    }
                     if (s is lastParam)
                         cg.Para.offset = _align(REGSIZE,cg.Para.offset); /* align on register size */
                     else
@@ -1375,7 +1385,8 @@ void stackoffsets(ref CGstate cg, ref symtab_t symtab, bool estimate)
 
                 s.Soffset = cg.Para.offset;
                 //printf("[%d] %s param offset =  x%x, alignsize = %d\n", si, s.Sident.ptr, cast(int) s.Soffset, cast(int) alignsize);
-                cg.Para.offset += (s.Sflags & SFLdouble)
+                cg.Para.offset += paramSlot ? paramSlot
+                            : (s.Sflags & SFLdouble)
                             ? type_size(tstypes[TYdouble])   // float passed as double
                             : type_size(s.Stype);
                 break;

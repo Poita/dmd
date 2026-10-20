@@ -1988,6 +1988,27 @@ struct AggregateABI
     uint size;      // size of the aggregate
 }
 
+/**
+ * The stack space of an argument of aggregate type `t` that is not passed in
+ * registers: by AAPCS64 its size rounded up to 8 bytes, aligned to at least 8;
+ * Apple's variant keeps an HFA at its own size and alignment.
+ * Params:
+ *      t = the aggregate type
+ *      size = set to the bytes the argument takes
+ *      alignment = set to the alignment of its offset
+ */
+@trusted
+void aarch64StackAggregate(type* t, out uint size, out uint alignment)
+{
+    size = cast(uint)type_size(t);
+    alignment = type_alignsize(t);
+    if (config.exe == EX_OSX64 && aarch64Aggregate(t).kind == AggregateABI.Kind.hfa)
+        return;
+    size = (size + 7) & ~7;
+    if (alignment < 8)
+        alignment = 8;
+}
+
 /// ditto
 @trusted
 AggregateABI aarch64Aggregate(type* t)
@@ -2522,20 +2543,12 @@ void cdfunc(ref CGstate cg, ref CodeBuilder cdb, elem* e, ref regm_t pretregs)
             sz++;               // can't handle 0 length structs
 
         uint alignsize = el_alignsize(ep);
-        if (holdsAggregate(ep.Ety, ep.ET) && !tyaggregate(ep.Ety))
+        if (holdsAggregate(ep.Ety, ep.ET))
         {
-            /* An aggregate painted as an integer takes the stack space of the aggregate:
-             * its own size and alignment on OSX, rounded up to 8 bytes by AAPCS64
-             */
-            sz = cast(uint)type_size(ep.ET);
-            alignsize = type_alignsize(ep.ET);
-            if (!osx_aapcs64)
-            {
-                sz = (sz + 7) & ~7;
-                if (alignsize < 8)
-                    alignsize = 8;
-            }
-            p.size = sz;
+            // an aggregate, also one painted as an integer, takes the stack space of the aggregate
+            aarch64StackAggregate(ep.ET, sz, alignsize);
+            if (!tyaggregate(ep.Ety))
+                p.size = osx_aapcs64 ? cast(uint)type_size(ep.ET) : sz;
         }
         if (alignsize > STACKALIGN)
             alignsize = STACKALIGN;         // no point if the stack is less aligned
