@@ -6902,7 +6902,12 @@ private bool mayAlias(ref const Footprint x, ref const Footprint y, bool sameBas
     const xv = x.kind == K.frame || x.kind == K.global;
     const yv = y.kind == K.frame || y.kind == K.global;
     if (xv && yv)
-        return x.sym is y.sym && !disjoint();
+    {
+        if (x.sym is y.sym)
+            return !disjoint();
+        // static variables declared more than once under the one name are the same memory
+        return x.kind == K.global && y.kind == K.global && strcmp(x.sym.Sident.ptr, y.sym.Sident.ptr) == 0;
+    }
     // a local whose address is not taken is reached only by its name
     if (x.kind == K.frame && !localEscapes(x.sym) || y.kind == K.frame && !localEscapes(y.sym))
         return false;
