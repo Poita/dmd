@@ -442,7 +442,8 @@ bool lirCodegen(ref CGstate cg)
         return false;
     }
     estimateFrequencies();
-    computeLiveness();
+    if (!fast || !computeHulls())
+        computeLiveness();
     allocateAll();
     if (env!"DMD_NEWCG_DUMP")
         dump();
@@ -6676,6 +6677,116 @@ private void computeLiveness()
             forUses(*i, &use);
         }
     }
+}
+
+/* The live range of each register as one range, from its first definition to its
+ * last use in the order of the code, widened over the loops it is live around.
+ * That holds what each is live through where every register is defined before it
+ * is used in the order of the code, as code without optimization has it, but for
+ * exception handling, whose ways to landing pads are not branches.
+ * Returns:
+ *      false, with nothing changed, if the code is not such
+ */
+@trusted
+private bool computeHulls()
+{
+    if (ehRanges)
+        return false;
+    foreach (b; blocks[])
+        if (b.bc == BC.jcatch || b.bc == BC.lpad || b.bc == BC.try_ || b.bc == BC.finally_)
+            return false;
+
+    const nv = vinfo.length;
+    Barray!uint lo, hi;
+    scope (exit) { lo.dtor(); hi.dtor(); }
+    lo.setLength(nv);
+    hi.setLength(nv);
+    lo[][] = uint.max;
+    hi[][] = 0;
+    void see(Reg r, uint pos)
+    {
+        if (isPhys(r))
+            return;
+        const k = r - firstVreg;
+        if (pos < lo[k])
+            lo[k] = pos;
+        if (pos + 1 > hi[k])
+            hi[k] = pos + 1;
+    }
+    // the instruction each label is at, for the branches back
+    Barray!uint labelAt;
+    scope (exit) labelAt.dtor();
+    labelAt.setLength(nlabels);
+    foreach (n, ref i; ins[])
+    {
+        if (i.op == LOp.nop)
+            continue;
+        if (i.op == LOp.label)
+            labelAt[i.target] = cast(uint)n;
+        forUses(i, (Reg r) { see(r, usePos(n)); });
+        if (i.d)
+            see(i.d, defPos(n));
+    }
+    // a register used before it is defined is live around a loop the code does not show
+    foreach (k; 0 .. nv)
+        if (lo[k] != uint.max && !(lo[k] & 1))
+            return false;
+
+    // the branches back: a register live where one goes to is live through to it
+    static struct Back { uint to, from; }
+    Barray!Back backs;
+    scope (exit) backs.dtor();
+    foreach (n, ref i; ins[])
+    {
+        if (i.op != LOp.br && i.op != LOp.bcond && i.op != LOp.cbz)
+            continue;
+        const t = i.flags & F.toLabel ? labelAt[i.target] : blockStart[i.target];
+        if (t <= n)
+            backs.push(Back(usePos(t), usePos(n) + 1));
+    }
+    bool changed = backs.length != 0;
+    while (changed)
+    {
+        changed = false;
+        foreach (ref e; backs[])
+            foreach (k; 0 .. nv)
+            {
+                if (lo[k] >= hi[k] || hi[k] <= e.to || lo[k] >= e.from)
+                    continue;       // not live in the loop
+                if (lo[k] < e.to && hi[k] < e.from)
+                {
+                    // live into the loop: through all of it
+                    hi[k] = e.from;
+                    changed = true;
+                }
+                if (hi[k] > e.from && lo[k] > e.to)
+                {
+                    // made in the loop and live after the branch back: from its start
+                    lo[k] = e.to;
+                    changed = true;
+                }
+            }
+    }
+
+    clearNops();
+    foreach (n, ref i; ins[])
+        if (i.d && !isPhys(i.d))
+        {
+            auto v = vi(i.d);
+            ++v.ndefs;
+            v.copyOf = i.op == LOp.copy && !isPhys(i.a) && !(i.flags & F.condDef) ? i.a : noReg;
+            v.rematIns = v.ndefs == 1 && cheapConstant(i) ? cast(uint)n : uint.max;
+        }
+    foreach (k, ref v; vinfo[])
+    {
+        v.ranges.setLength(0);
+        if (lo[k] < hi[k])
+        {
+            v.ranges.push(Range(lo[k], hi[k]));
+            v.cost = 1;
+        }
+    }
+    return true;
 }
 
 /* Split the code of each block into segments at labels and after branches, so the
