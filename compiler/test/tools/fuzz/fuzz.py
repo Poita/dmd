@@ -282,7 +282,8 @@ def abi_seed(args, seed):
             failed = True
             continue
         exe = os.path.join(d, 't')
-        st, out = run([args.cc, '-o', exe] + [objs[p] for p in parts], cwd=d)
+        # dmd links, so that druntime provides the helpers -betterC code can still call
+        st, out = run([args.dmd, '-of' + exe] + [objs[p] for p in parts], cwd=d)
         if st != 0:
             msgs.append('seed %d: %s link failed: %s' % (seed, label, out[:500]))
             failed = True
