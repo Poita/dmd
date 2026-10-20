@@ -255,6 +255,17 @@ void recordImports(ref Modules modules)
         }
         const(char)[] how = name ? "import" : "package";
         const(char)[] n = name ? *name : m.toPrettyChars().toDString();
+        // a root module that is also a package of an imported module must be in the
+        // package tree before it, so it has to be parsed first
+        foreach (r; modules)
+        {
+            const rn = r.toPrettyChars().toDString();
+            if (isWithin(n, rn) || isWithin(m.toPrettyChars().toDString(), rn))
+            {
+                startable = false;
+                return;
+            }
+        }
         int from = -1;
         foreach (i, r; modules)
             if (r is m.importedFrom)
@@ -1077,6 +1088,12 @@ const(char)[][] splitLines(const(char)[] s)
         s = s[nl + 1 .. $];
     }
     return lines;
+}
+
+/// Whether the module `name` is in the package `pkg`, at any depth
+bool isWithin(const(char)[] name, const(char)[] pkg)
+{
+    return name.length > pkg.length && name[0 .. pkg.length] == pkg && name[pkg.length] == '.';
 }
 
 ptrdiff_t indexOf(const(char)[] s, char c)

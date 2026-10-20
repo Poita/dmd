@@ -90,8 +90,9 @@ int main()
             rmdirRecurse(d);
     mkdirRecurse(serverDir);
     mkdirRecurse(src ~ "/imp/pkg");
+    mkdirRecurse(src ~ "/imp/outer/pkgroot");
     foreach (f; ["app.d", "imp/lib.d", "imp/old.d", "imp/renamed.d", "imp/pkg/package.d", "imp/pkg/sub.d",
-            "banner.txt"])
+            "banner.txt", "pkgroot.d", "imp/outer/pkgroot/sub.d"])
         copy(EXTRA_FILES ~ "/compile_server/" ~ f, src ~ "/" ~ f);
     environment["DMD_SERVER"] = serverDir;
     environment.remove("DMD_SERVER_VERIFY");
@@ -126,5 +127,15 @@ int main()
     std.file.write(src ~ "/banner.txt", "b2");
     expectOutput("app2 2 6 10 b2");
     assert(logs.count("served 0") == 2, logs);
+
+    // a root module named like a package of its imports is parsed before them, so no
+    // server starts for it
+    const pkgroot = "$DMD -m$MODEL -c -I" ~ src ~ "/imp -of" ~ OUTPUT_BASE ~ "/pkgroot.o " ~ src ~ "/pkgroot.d";
+    run(pkgroot);
+    run(pkgroot);
+    const deadline = MonoTime.currTime + 5.seconds;
+    while (logs.count("ready ") < 3 && MonoTime.currTime < deadline)
+        Thread.sleep(20.msecs);
+    run(pkgroot);
     return 0;
 }
