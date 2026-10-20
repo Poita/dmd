@@ -91,6 +91,33 @@ private regm_t readOnlyRegs2(elem* e1, elem* e2, regm_t posregs, regm_t retregs1
 }
 
 /*****************************
+ * Evaluate the operands of an operator fused with a shift: `eother` into
+ * `retregs1` and the shift's operand `x` into `retregs2`, both only read.
+ * When the shift is the left operand, `x` is evaluated first, keeping the
+ * tree's evaluation order that side effects and common subexpressions
+ * depend on.
+ */
+@trusted
+private void evalShiftOperands(ref CGstate cg, ref CodeBuilder cdb, elem* eother, elem* x, bool shiftFirst,
+    out regm_t retregs1, out regm_t retregs2)
+{
+    if (shiftFirst)
+    {
+        retregs2 = cg.allregs;
+        codelem(cg, cdb, x, retregs2, !el_sideeffect(eother));
+        retregs1 = readOnlyRegs2(x, eother, cg.allregs, retregs2);
+        scodelem(cg, cdb, eother, retregs1, retregs2, true);
+    }
+    else
+    {
+        retregs1 = cg.allregs;
+        codelem(cg, cdb, eother, retregs1, !el_sideeffect(x));
+        retregs2 = readOnlyRegs2(eother, x, cg.allregs, retregs1);
+        scodelem(cg, cdb, x, retregs2, retregs1, true);
+    }
+}
+
+/*****************************
  * Handle operators which are more or less orthogonal
  * OPadd, OPmin, OPand, OPor, OPxor
  */
@@ -279,11 +306,9 @@ void cdorth(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
                 x = xx;
             }
             const PSW = pretregs & mPSW;
-            regm_t retregs1 = cg.allregs;
-            codelem(cg, cdb, eadd, retregs1, !el_sideeffect(x));
+            regm_t retregs1, retregs2;
+            evalShiftOperands(cg, cdb, eadd, x, esh == e1, retregs1, retregs2);
             const reg_t Rn = findreg(retregs1);
-            regm_t retregs2 = readOnlyRegs2(eadd, x, cg.allregs, retregs1);
-            scodelem(cg, cdb, x, retregs2, retregs1, true);
             const reg_t Rm = findreg(retregs2);
             regm_t retregs = pretregs & cg.allregs;
             if (retregs == 0)
@@ -325,11 +350,9 @@ void cdorth(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
             const uint shiftType = esh.Eoper == OPshl ? 0 : esh.Eoper == OPshr ? 1 : 2;   // LSL, LSR, ASR
             elem* x = esh.E1;
             const PSW = pretregs & mPSW;
-            regm_t retregs1 = cg.allregs;
-            codelem(cg, cdb, eother, retregs1, !el_sideeffect(x));
+            regm_t retregs1, retregs2;
+            evalShiftOperands(cg, cdb, eother, x, esh == e1, retregs1, retregs2);
             const reg_t Rn = findreg(retregs1);
-            regm_t retregs2 = readOnlyRegs2(eother, x, cg.allregs, retregs1);
-            scodelem(cg, cdb, x, retregs2, retregs1, true);
             const reg_t Rm = findreg(retregs2);
             regm_t retregs = pretregs & cg.allregs;
             if (retregs == 0)
