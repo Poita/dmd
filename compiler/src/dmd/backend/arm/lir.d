@@ -333,7 +333,8 @@ bool lirCodegen(ref CGstate cg)
     switchesFibers = callsFiberSwitch();
     condDepth = 0;
 
-    if (splitReturnConds())
+    const split = splitReturnConds();
+    if (mergeReturnSelects() || split)
         compdfo(bo.dfo, bo.startblock);     // for code generation without virtual registers too
     for (block* b = bo.startblock; b; b = b.Bnext)
         blocks.push(b);
@@ -4427,9 +4428,10 @@ private void findNoLocalAddress(bool hasTry)
  */
 struct BlockChange
 {
-    enum Kind : ubyte { returnCall, splitCond }
+    enum Kind : ubyte { returnCall, splitCond, mergeReturns }
     Kind kind;
     block* b, r, b1, b2;
+    block* prev1, prev2;    // mergeReturns: the blocks before b1 and b2 in the list
     elem** pe;      // where in b's tree e was
     elem* e;        // the assignment of the call, or the conditional
 }
@@ -4467,6 +4469,24 @@ void lirUndoBlockChanges()
                 {
                     n.Belem = null;
                     n.Bpred.setLength(0);
+                }
+                break;
+
+            case BlockChange.Kind.mergeReturns:
+                // b2 was taken out of the list after b1
+                u.b2.Bnext = u.prev2.Bnext;
+                u.prev2.Bnext = u.b2;
+                u.b1.Bnext = u.prev1.Bnext;
+                u.prev1.Bnext = u.b1;
+                u.b.Belem = u.e;
+                u.b.bc = BC.iftrue;
+                u.b.Bsucc.setLength(0);
+                block*[2] nb = [u.b1, u.b2];
+                foreach (n; nb)
+                {
+                    u.b.Bsucc.push(n);
+                    n.Bpred.setLength(0);
+                    n.Bpred.push(u.b);
                 }
                 break;
         }
@@ -4531,6 +4551,69 @@ private bool splitReturnConds()
         split = true;
     }
     return split;
+}
+
+/* Make a block whose comparison chooses between two blocks only it reaches, each
+ * returning a cheap value, return the select of the values, returning whether any is.
+ * A select of what the arms may be is done in place of the branch, as for the
+ * ?: of them
+ */
+@trusted
+private bool mergeReturnSelects()
+{
+    if (!(config.flags4 & CFG4optimized))
+        return false;
+    const tyf = tybasic(funcsym_p.Stype.Tnext.Tty);
+    if (!scalarType(tyf) || pairType(tyf) || tyaggregate(tyf))
+        return false;
+    bool merged;
+    // again while any are, as a block merged may be an arm of one before it
+    for (bool again = true; again; )
+    {
+      again = false;
+      for (block* b = bo.startblock; b; b = b.Bnext)
+      {
+        if (b.bc != BC.iftrue || b.Btry || !b.Belem || b.Bsucc.length != 2)
+            continue;
+        elem* c = b.Belem;
+        block* bt = b.Bsucc[0];
+        block* bf = b.Bsucc[1];
+        if (c.Eoper < OPle || c.Eoper > OPne || !scalarType(c.E1.Ety) || pairType(c.E1.Ety) ||
+            bt == bf || bt == b || bf == b)
+            continue;
+        bool returnsCheap(block* r)
+        {
+            return r.bc == BC.retexp && !r.Btry && r.Belem && !r.Belem.Ecount && r.Bpred.length == 1 &&
+                   r.Bpred[0] == b && tybasic(r.Belem.Ety) == tyf;
+        }
+        if (!returnsCheap(bt) || !returnsCheap(bf))
+            continue;
+        // as selectable() has it for the ?: of the values
+        int budget = 7;
+        if (!cheapArm(bt.Belem, budget) || !cheapArm(bf.Belem, budget))
+            continue;
+        block* prev(block* x)
+        {
+            block* p = bo.startblock;
+            while (p.Bnext != x)
+                p = p.Bnext;
+            return p;
+        }
+        BlockChange u = { kind: BlockChange.Kind.mergeReturns, b: b, b1: bt, b2: bf, e: c };
+        u.prev1 = prev(bt);
+        u.prev1.Bnext = bt.Bnext;
+        u.prev2 = prev(bf);
+        u.prev2.Bnext = bf.Bnext;
+        blockChanges.push(u);
+        b.Belem = el_bin(OPcond, bt.Belem.Ety, c, el_bin(OPcolon, bt.Belem.Ety, bt.Belem, bf.Belem));
+        b.bc = BC.retexp;
+        b.Bsucc.setLength(0);
+        bt.Bpred.setLength(0);
+        bf.Bpred.setLength(0);
+        merged = again = true;
+      }
+    }
+    return merged;
 }
 
 /* The optimizer has the returns of a function share a block, which returns a
