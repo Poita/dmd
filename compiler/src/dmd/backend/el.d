@@ -1704,7 +1704,12 @@ elem* el_ctor_dtor(elem* ec, elem* ed, out elem* pedtor)
     {
         /* Construct (note that OPinfo is evaluated RTOL):
          *  er = (OPdctor OPinfo (__flag = 0, ec))
-         *  edtor = __flag = 1, (OPddtor ((__exception_object = _EAX), ed, (!__flag && _Unsafe_Resume(__exception_object))))
+         *  edtor = __flag = 1, (OPddtor ((__exception_object = _EAX), ed, (!__flag && _Unsafe_Resume(__exception_object)))), __flag = 0
+         *
+         * The landing pad covers code a ?: or && may run without constructing,
+         * so __flag is clear whenever the normal path is not passing through
+         * the OPddtor: clearing it again afterwards keeps a later trip through
+         * a loop from unwinding with the flag of the earlier one.
          */
 
         /* Declare __flag, __EAX, __exception_object variables.
@@ -1749,7 +1754,9 @@ elem* el_ctor_dtor(elem* ec, elem* ed, out elem* pedtor)
 
         edtor.E1 = el_combine(el_combine(e_eax, ed), eu);
 
-        pedtor = el_combine(e_flag_1, edtor);
+        c.Vint = 0;
+        elem* e_flag_clear = el_bin(OPeq, TYvoid, el_var(sflag), el_const(TYbool, c));  // __flag = 0
+        pedtor = el_combine(el_combine(e_flag_1, edtor), e_flag_clear);
     }
     else
     {
