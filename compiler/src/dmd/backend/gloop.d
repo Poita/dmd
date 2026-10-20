@@ -1681,6 +1681,8 @@ Lnextlis:
 
                 if (el_sideeffect(n.E2)) goto L3;              // case 5
 
+                if (ehLive(bo, v, l)) goto L3;
+
                 // If case 1 or case 2 is not satisfied, return
 
                 if (!(pdomexit & 1))                   // if not case 1
@@ -2980,6 +2982,8 @@ private void elimbasivs(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
 
         Symbol* X = biv.IVbasic;
         assert(symbol_isintab(X));
+        if (ehLive(bo, X, l))
+            continue;
         tym_t ty = X.ty();
         int refcount;
         elem** pref = onlyref(bo, X,l,einc,refcount);
@@ -3308,6 +3312,8 @@ private void elimopeqs(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
 
         X = biv.IVbasic;
         assert(symbol_isintab(X));
+        if (ehLive(bo, X, l))
+            continue;
         pref = onlyref(bo, X,l,*biv.IVincr,refcount);
 
         // if only ref of X is of the form (X) or (X relop e) or (e relop X)
@@ -3518,6 +3524,78 @@ private bool catchRef(ref BlockOpt bo, Symbol* x, ref Loop l)
             return true;
     }
 
+    return false;
+}
+
+/*********************************
+ * A block of a loop in a guarded body can throw to the handlers of each try
+ * enclosing it, which the flow graph has no edges for, so a handler sees each
+ * variable as it is at the throw: a definition of a variable a handler reads
+ * can be neither moved out of the loop nor eliminated.
+ * Params:
+ *      x = variable
+ *      l = loop
+ * Returns:
+ *      true if a handler of a try enclosing a block of l can read x
+ */
+@trusted
+private bool ehLive(ref BlockOpt bo, Symbol* x, ref Loop l)
+{
+    if (!symbol_isintab(x))
+        return false;
+    bool inDfo(const block* b) { return b.Bdfoidx < bo.dfo.length && bo.dfo[b.Bdfoidx] is b; }
+    vec_t seen = null;
+    scope (exit) vec_free(seen);
+
+    /* Whether the finally body entered from the landing pad of BC.finally_
+     * block bf refers to x. The exception goes on from the BC.finRet block
+     * that tests bf's flag, so what follows the try is not reached on this
+     * path. A BC.finRet block that no longer tests the flag is walked past.
+     */
+    bool finallyRefs(block* bf)
+    {
+        if (!seen)
+            seen = vec_calloc(bo.dfo.length);
+        else
+            vec_clear(seen);
+        Symbol* flag = bf.flag;
+        const flagKnown = flag && symbol_isintab(flag);
+        bool walk(block* b)
+        {
+            if (!inDfo(b) || vec_testbit(b.Bdfoidx, seen))
+                return false;
+            vec_setbit(b.Bdfoidx, seen);
+            if (b.Belem && refs(x, b.Belem, null))
+                return true;
+            if (b.bc == BC.finRet && flagKnown && b.Belem && refs(flag, b.Belem, null))
+                return false;
+            foreach (bs; b.Bsucc[])
+                if (walk(bs))
+                    return true;
+            return false;
+        }
+        return walk(bf.Bsucc[0]);
+    }
+
+    foreach (i; VecRange(l.Lloop))
+    {
+        for (block* bt = bo.dfo[i].Btry; bt; bt = bt.Btry)
+        {
+            // a try optimized out of the flow graph has no handlers left
+            if (!inDfo(bt))
+                continue;
+            foreach (bh; bt.Bsucc[1 .. $])
+            {
+                if (bh.bc == BC.finally_ && bh.Bsucc.length && bh.Bsucc[0].bc == BC.lpad)
+                {
+                    if (finallyRefs(bh))
+                        return true;
+                }
+                else if (vec_testbit(x.Ssymnum, bh.Binlv))
+                    return true;
+            }
+        }
+    }
     return false;
 }
 
