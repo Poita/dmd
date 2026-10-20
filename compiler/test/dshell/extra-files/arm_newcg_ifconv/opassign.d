@@ -62,6 +62,13 @@ int sel0_mulIf(int x, int c)
     return x;
 }
 
+int sel0_subScaled(int s, int v, int c)
+{
+    if (c > 0)
+        s -= v * 3;
+    return s;
+}
+
 // the divisions may fault, so are not done unless chosen
 int divIf(int x, int c)
 {
@@ -90,6 +97,9 @@ void main()
     if (sel0_stepIf(arr.ptr, 0) != arr.ptr) assert(0);
     if (sel0_mulIf(int.max, 2) != -2) assert(0);
     if (sel0_mulIf(3, 5) != 3) assert(0);
+    if (sel0_subScaled(10, 4, 1) != -2) assert(0);
+    if (sel0_subScaled(10, 4, 0) != 10) assert(0);
+    if (sel0_subScaled(int.min, 1, 1) != int.max - 2) assert(0);
     if (divIf(7, 0) != 7) assert(0);
     if (divIf(7, 2) != 3) assert(0);
 }
