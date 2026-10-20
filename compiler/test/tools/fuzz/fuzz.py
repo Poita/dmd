@@ -3,6 +3,9 @@
 
   fuzz.py prog SEEDS   random programs (progfuzz.py) compiled by dmd with each
                        configuration in PROG_CONFIGS, compared with ldc2
+  fuzz.py bounds SEEDS programs indexing arrays in and out of bounds
+                       (boundsfuzz.py), compiled and compared like prog with
+                       the configurations that keep the bounds checks
   fuzz.py abi SEEDS    calling convention tests (abifuzz.py): objects built by
                        dmd's old and new code generators, without -O, and by
                        the C compiler, linked with each other, compared with
@@ -210,13 +213,18 @@ def minimize_prog(args, src, cfg, outpath, log):
 
 
 def prog_seed(args, seed):
+    bounds = args.mode == 'bounds'
     d = tempfile.mkdtemp(prefix='fzp%d-' % seed, dir=args.work)
     src = os.path.join(d, 'fz%d.d' % seed)
-    st, text = run([sys.executable, os.path.join(HERE, 'progfuzz.py'), str(seed), '--size', args.size])
+    gen = 'boundsfuzz.py' if bounds else 'progfuzz.py'
+    st, text = run([sys.executable, os.path.join(HERE, gen), str(seed), '--size', args.size])
     with open(src, 'w') as f:
         f.write(text)
     case = ProgCase(args, d)
     configs = [c for c in PROG_CONFIGS if not args.configs or c[0] in args.configs]
+    if bounds:
+        # the programs rely on the bounds checks
+        configs = [c for c in configs if '-boundscheck=off' not in c[2]]
     bad, err = case.failures(src, configs)
     msgs = []
     if bad is None:
@@ -228,7 +236,7 @@ def prog_seed(args, seed):
         os.makedirs(faildir, exist_ok=True)
         for cfg, ref, out in bad:
             name, env, flags = cfg
-            base = os.path.join(faildir, 'prog-%d-%s' % (seed, name))
+            base = os.path.join(faildir, '%s-%d-%s' % (args.mode, seed, name))
             shutil.copy(src, base + '.d')
             with open(base + '.txt', 'w') as f:
                 f.write('%s %s %s %s.d\n' % (envtext(env), args.dmd, ' '.join(flags), base))
@@ -238,7 +246,7 @@ def prog_seed(args, seed):
         if args.minimize:
             cfg = bad[0][0]
             log = (lambda m: print(m, file=sys.stderr)) if args.verbose else (lambda m: None)
-            minimize_prog(args, src, cfg, os.path.join(faildir, 'prog-%d-%s.min.d' % (seed, cfg[0])), log)
+            minimize_prog(args, src, cfg, os.path.join(faildir, '%s-%d-%s.min.d' % (args.mode, seed, cfg[0])), log)
     shutil.rmtree(d, ignore_errors=True)
     return msgs, bool(bad)
 
@@ -305,7 +313,7 @@ def abi_seed(args, seed):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('mode', choices=['prog', 'abi'])
+    ap.add_argument('mode', choices=['prog', 'bounds', 'abi'])
     ap.add_argument('seeds')
     ap.add_argument('--dmd', default=os.environ.get('FUZZ_DMD', DEFAULT_DMD))
     ap.add_argument('--ldc', default=os.environ.get('FUZZ_LDC', 'ldc2'))
@@ -321,7 +329,7 @@ def main():
     args.work = os.path.abspath(args.work)
     os.makedirs(args.work, exist_ok=True)
     seeds = parse_seeds(args.seeds)
-    fn = prog_seed if args.mode == 'prog' else abi_seed
+    fn = abi_seed if args.mode == 'abi' else prog_seed
     t0 = time.time()
     nfail = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as ex:

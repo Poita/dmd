@@ -7,8 +7,10 @@ anything that is allowed to vary.
 | file | what it does |
 |------|--------------|
 | `progfuzz.py SEED` | prints a random D program: integer and floating point arithmetic, casts, shifts, division by constants and variables, control flow (if, loops, switch, break/continue, early returns), static and dynamic arrays and slices, structs passed and returned by value, closures and nested functions, templates, exceptions with `finally`, calls between the generated functions |
+| `boundsfuzz.py SEED` | prints a random D program of `@safe` functions indexing arrays in loops and under guards, sometimes out of bounds: bounds from the lengths or off by one, indices offset by constants, counting up and down, `size_t` wraparound, signed indices, nested loops, arrays, indices and globals changed in the loop directly, through `ref` and by called functions; `main` catches each `RangeError` and prints its line |
 | `abifuzz.py SEED DIR` | writes a calling convention test: functions with random parameter lists (integers, `bool`, `float`, `double`, structs of them, nested structs, static arrays, HFAs, many arguments so some go on the stack, C variadics) as `extern(D)`, `extern(C)` and in C, with callers in D and in C, and the output they must print |
 | `fuzz.py prog SEEDS` | compiles each program with ldc2 (the reference) and with dmd in each configuration of `PROG_CONFIGS` (no flags, `-inline`, `-O` with the new and the old AArch64 code generator, `-O -inline`, `-O -inline -release`, `-boundscheck=off`), runs them and compares the output |
+| `fuzz.py bounds SEEDS` | the same for the programs of `boundsfuzz.py`, without the configurations that turn the bounds checks off |
 | `fuzz.py abi SEEDS` | compiles each ABI test with dmd without `-O`, with `-O` by the old code generator (`DMD_NEWCG=0`) and by the new one, with `-O -inline -release`, and with the C compiler, links every caller with every callee and compares with the expected output |
 | `nightly.sh` | runs both over a seed range that changes every day, minimizing failing programs |
 
