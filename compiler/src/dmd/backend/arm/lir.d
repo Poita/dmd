@@ -376,6 +376,7 @@ bool lirCodegen(ref CGstate cg)
         numberValues();
         reuseInvariantLoads();
         reuseDominatingMemory();
+        promoteLoopMemory();
         removeBoundsChecks();
         if (!env!"DMD_NEWCG_NOIFCONV")
         {
@@ -7623,6 +7624,221 @@ private void reuseDominatingMemory()
             i.b = value(i.b);
             i.c = value(i.c);
         }
+}
+
+/* In a loop without calls or barriers, memory read through a base register the
+ * loop does not change, or a variable by name, that only stores of the same
+ * bytes in the loop may write, is read before the loop into a register kept equal
+ * to it: each store there also sets the register, and each load there takes it.
+ * The stores stay, so memory is as before throughout.
+ */
+@trusted
+private void promoteLoopMemory()
+{
+    if (env!"DMD_NEWCG_NOMEMOPT")
+        return;
+    buildSegments();
+    const ns = segStart.length - 1;
+    if (ns < 2)
+        return;
+    Barray!uint predStart, preds;
+    Barray!Loop loops;
+    findLoops(predStart, preds, loops);
+    scope (exit)
+    {
+        foreach (ref lp; loops[])
+            mem_free(lp.body.ptr);
+        loops.dtor(); predStart.dtor(); preds.dtor();
+    }
+    if (!loops.length)
+        return;
+    analyzeMemory();
+    Barray!bool inLoop, defInLoop, done;
+    Barray!Footprint writes;
+    Barray!uint writeIns, group;
+    Barray!Insert inserts;
+    scope (exit)
+    {
+        inLoop.dtor(); defInLoop.dtor(); done.dtor(); writes.dtor(); writeIns.dtor(); group.dtor();
+        inserts.dtor();
+    }
+    inLoop.setLength(ns);
+    defInLoop.setLength(vinfo.length);
+    done.setLength(ins.length);
+    /* Whether base is gone through by a load or store, and not changed after, in the
+     * preheader pre or the segments before it each entered only from the one before,
+     * so that the memory reached through it is there before the loop
+     */
+    bool witnessed(uint pre, Reg base)
+    {
+        if (!base)
+            return false;
+        uint[8] chain;
+        uint nchain = 1;
+        chain[0] = pre;
+        while (nchain < chain.length)
+        {
+            const c = chain[nchain - 1];
+            if (predStart[c + 1] - predStart[c] != 1)
+                break;
+            const p = preds[predStart[c]];
+            bool seen;
+            foreach (x; chain[0 .. nchain])
+                seen |= x == p;
+            if (seen || inLoop[p])
+                break;
+            chain[nchain++] = p;
+        }
+        bool w;
+        foreach_reverse (c; chain[0 .. nchain])
+            foreach (n; segStart[c] .. segEnd(c))
+            {
+                const i = &ins[n];
+                if (i.d == base)
+                    w = false;
+                if (i.op == LOp.ld && i.a == base && !i.b && !i.sym || i.op == LOp.st && i.b == base && !i.c && !i.sym)
+                    w = true;
+            }
+        return w;
+    }
+    // the instructions changed, so that a loop enclosing one done does not change them again
+    done[][] = false;
+    foreach (ref lp; loops[])
+    {
+        inLoop[][] = false;
+        foreach (v; lp.body)
+            inLoop[v] = true;
+        uint pre = uint.max;
+        bool bad;
+        foreach (p; preds[predStart[lp.header] .. predStart[lp.header + 1]])
+            if (!inLoop[p])
+            {
+                bad |= pre != uint.max;
+                pre = p;
+            }
+        if (bad || pre == uint.max)
+            continue;
+        const pend = segEnd(pre);
+        if (pend <= segStart[pre])
+            continue;
+        const lastOp = ins[pend - 1].op;
+        const skips = lastOp == LOp.bcond || lastOp == LOp.cbz;    // the preheader may branch past the loop
+        const at = lastOp == LOp.br || skips ? pend - 1 : pend;
+        writes.setLength(0);
+        writeIns.setLength(0);
+        defInLoop[][] = false;
+        bool barrier;
+        foreach (v; lp.body)
+            foreach (n; segStart[v] .. segEnd(v))
+            {
+                const i = &ins[n];
+                if (i.d && !isPhys(i.d))
+                    defInLoop[i.d - firstVreg] = true;
+                if (writesMemory(*i) || i.op == LOp.call)
+                {
+                    barrier |= memoryBarrier(*i) || i.op == LOp.call || done[n];
+                    writes.push(footprint(*i));
+                    writeIns.push(cast(uint)n);
+                }
+            }
+        if (barrier)
+            continue;
+        foreach (v; lp.body)
+            foreach (n; segStart[v] .. segEnd(v))
+            {
+                const l = &ins[n];
+                if (l.op != LOp.ld || done[n] || l.b || l.flags & (F.volatile_ | F.condDef) || !l.d || isPhys(l.d) ||
+                    (l.sym ? l.a != noReg : !l.a || isPhys(l.a) || defInLoop[l.a - firstVreg]))
+                    continue;
+                const f = footprint(*l);
+                // every write in the loop that may reach it stores the same bytes
+                bool ok = true, stored;
+                foreach (w, ref wf; writes[])
+                {
+                    if (!mayAlias(wf, f))
+                        continue;
+                    const s = &ins[writeIns[w]];
+                    if (s.op != LOp.st || s.c || s.b != l.a || s.sym !is l.sym || s.imm != l.imm || s.sz != l.sz ||
+                        !s.a || isPhys(s.a) || rcOf(s.a) != rcOf(l.d))
+                    {
+                        ok = false;
+                        break;
+                    }
+                    stored = true;
+                }
+                if (!ok || !stored)
+                    continue;
+                // the loads of it in the loop, all alike
+                group.setLength(0);
+                foreach (v2; lp.body)
+                    foreach (m; segStart[v2] .. segEnd(v2))
+                    {
+                        const x = &ins[m];
+                        if (x.op == LOp.ld && x.a == l.a && x.b == l.b && x.sym is l.sym && x.imm == l.imm &&
+                            x.sz == l.sz)
+                        {
+                            if (x.flags != l.flags || x.cond != l.cond || !x.d || isPhys(x.d) || rcOf(x.d) != rcOf(l.d))
+                                ok = false;
+                            group.push(cast(uint)m);
+                        }
+                    }
+                if (!ok)
+                    continue;
+                /* What is loaded before the loop is loaded on entering it: the header reads or
+                 * writes it before anything else can leave the loop, unless the preheader may
+                 * branch past the loop, when only a variable is sure to be there
+                 */
+                bool safe = f.kind == Footprint.Kind.frame || f.kind == Footprint.Kind.global ||
+                    witnessed(pre, l.a);
+                if (!safe && !skips)
+                    foreach (m; segStart[lp.header] .. segEnd(lp.header))
+                    {
+                        const x = &ins[m];
+                        const same = x.op == LOp.ld ? x.a == l.a && !x.b : x.op == LOp.st && x.b == l.a && !x.c;
+                        if (same && x.sym is l.sym && x.imm == l.imm && x.sz == l.sz)
+                        {
+                            safe = true;
+                            break;
+                        }
+                    }
+                if (!safe)
+                    continue;
+                const RC rc = rcOf(l.d);
+                const Reg r = newVreg(rc, rc == RC.fp ? l.sz : 8);
+                LIns first = *cast(LIns*)l;
+                first.d = r;
+                inserts.push(Insert(at, first, false));
+                foreach (m; group[])
+                {
+                    LIns* x = &ins[m];
+                    LIns c;
+                    c.op = LOp.copy;
+                    c.sz = rc == RC.fp ? x.sz : 8;
+                    c.d = x.d;
+                    c.a = r;
+                    *x = c;
+                    done[m] = true;
+                }
+                foreach (w; writeIns[])
+                {
+                    const s = &ins[w];
+                    if (s.op != LOp.st)
+                        continue;
+                    const sf = footprint(*s);
+                    if (!mayAlias(sf, f))
+                        continue;
+                    LIns c = first;
+                    if (!loadStored(c, *s))
+                        assert(0);
+                    c.flags |= F.condDef;
+                    inserts.push(Insert(w + 1, c, false));
+                    done[w] = true;
+                }
+                if (env!"DMD_NEWCG_MEMOPT")
+                    fprintf(stderr, "newcg-memopt: promote %s\n", funcsym_p.Sident.ptr);
+            }
+    }
+    applyInserts(inserts);
 }
 
 /* Whether cmp and the branch br after it branch when unsigned l > x, as cmp l, x; b.hi or
