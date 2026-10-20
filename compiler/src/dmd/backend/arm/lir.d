@@ -382,6 +382,7 @@ bool lirCodegen(ref CGstate cg)
             removeUnreachable();
             ifConvertBranches();
         }
+        removeRedundantExtensions();
         if (!env!"DMD_NEWCG_NOCOPYPROP")
             propagateCopies();
         // the vectors made may be of values the same throughout a loop
@@ -6903,6 +6904,152 @@ private void numberValues()
     ndefs.dtor();
     subst.dtor();
     ver.dtor();
+}
+
+/* Make copies of the extensions of registers whose every definition leaves them
+ * extended already, as the narrow loads into a variable do. Each register gets the
+ * number of low bits its 64 bit value can have set, at most, as the greatest of what
+ * its definitions make: found by raising the bits of all from none until they agree
+ */
+@trusted
+private void removeRedundantExtensions()
+{
+    const nv = vinfo.length;
+    bool anyExt;
+    foreach (ref i; ins[])
+        anyExt |= (i.op == LOp.zext || i.op == LOp.sext) && i.a && !isPhys(i.a);
+    if (!anyExt)
+        return;
+    Barray!ubyte bits;
+    Barray!bool defined;
+    scope (exit) { bits.dtor(); defined.dtor(); }
+    bits.setLength(nv);
+    bits[][] = 0;
+    defined.setLength(nv);
+    defined[][] = false;
+    foreach (ref i; ins[])
+    {
+        if (i.d && !isPhys(i.d))
+            defined[i.d - firstVreg] = true;
+        if (i.op == LOp.ldp && i.c && !isPhys(i.c))
+            bits[i.c - firstVreg] = 64;
+    }
+    // a register never defined here holds what it is given, which is not known
+    foreach (k; 0 .. nv)
+        if (!defined[k])
+            bits[k] = 64;
+
+    static uint bitLength(ulong v)
+    {
+        uint n;
+        while (v)
+        {
+            ++n;
+            v >>= 1;
+        }
+        return n;
+    }
+    uint bitsOf(Reg r)
+    {
+        return !r || isPhys(r) || rcOf(r) != RC.gp ? 64 : bits[r - firstVreg];
+    }
+    // the bits the definition i makes
+    uint made(ref const LIns i)
+    {
+        uint n;
+        switch (i.op)
+        {
+            case LOp.ld:
+                if (i.flags & F.signed)
+                    return i.flags & F.toX || i.sz >= 4 && i.sz != 4 ? 64 : 32;
+                return i.sz * 8;
+            case LOp.zext:
+                n = cast(uint)i.imm < bitsOf(i.a) ? cast(uint)i.imm : bitsOf(i.a);
+                break;
+            case LOp.movi:
+                n = bitLength(i.sz == 4 ? cast(uint)i.imm : cast(ulong)i.imm);
+                break;
+            case LOp.cset:
+                return 1;
+            case LOp.copy:
+                n = bitsOf(i.a);
+                break;
+            case LOp.csel:
+                n = bitsOf(i.a) > bitsOf(i.b) ? bitsOf(i.a) : bitsOf(i.b);
+                break;
+            case LOp.andi:
+                n = bitLength(i.sz == 4 ? cast(uint)i.imm : cast(ulong)i.imm);
+                if (bitsOf(i.a) < n)
+                    n = bitsOf(i.a);
+                break;
+            case LOp.and_:
+                if (i.flags & F.shifted)
+                    goto default;
+                n = bitsOf(i.a) < bitsOf(i.b) ? bitsOf(i.a) : bitsOf(i.b);
+                break;
+            case LOp.orr, LOp.eor:
+                if (i.flags & F.shifted)
+                    goto default;
+                n = bitsOf(i.a) > bitsOf(i.b) ? bitsOf(i.a) : bitsOf(i.b);
+                break;
+            case LOp.lsri:
+                n = bitsOf(i.a);
+                n = n > i.imm ? cast(uint)(n - i.imm) : 0;
+                break;
+            default:
+                n = 64;
+                break;
+        }
+        // the 32 bit operations zero the upper half
+        if (i.sz == 4 && n > 32)
+        {
+            switch (i.op)
+            {
+                case LOp.add: .. case LOp.rorv:
+                case LOp.addi: .. case LOp.rori:
+                case LOp.msub, LOp.madd, LOp.neg, LOp.mvn, LOp.sext, LOp.zext:
+                case LOp.fcvtzs, LOp.fcvtzu:
+                case LOp.movi, LOp.csel:
+                    n = 32;
+                    break;
+                default:
+                    break;
+            }
+        }
+        return n;
+    }
+    for (bool changed = true; changed; )
+    {
+        changed = false;
+        foreach (ref i; ins[])
+        {
+            if (!i.d || isPhys(i.d) || rcOf(i.d) != RC.gp)
+                continue;
+            const k = i.d - firstVreg;
+            if (bits[k] >= 64)
+                continue;
+            const n = made(i);
+            if (n > bits[k])
+            {
+                bits[k] = cast(ubyte)(n > 64 ? 64 : n);
+                changed = true;
+            }
+        }
+    }
+    foreach (ref i; ins[])
+    {
+        if (i.op != LOp.zext && i.op != LOp.sext || !i.a || isPhys(i.a) || !i.d || isPhys(i.d) ||
+            rcOf(i.a) != RC.gp || rcOf(i.d) != RC.gp || i.imm >= 64)
+            continue;
+        const n = bitsOf(i.a);
+        // a value of fewer bits is the same zero extended, and if its top bit is clear, sign extended
+        if (i.op == LOp.zext ? n <= i.imm : n < i.imm)
+        {
+            i.op = LOp.copy;
+            i.sz = 8;
+            i.imm = 0;
+        }
+    }
 }
 
 /* A register defined once by a copy of another, all of whose uses come after
