@@ -159,6 +159,7 @@ struct LIns
     long imm;
     Symbol* sym;
     uint target;        // block or label number
+    uint loc;           // index in locs of the source position it is of, 0 if none
 }
 
 /// A live range [from, to) in instruction positions
@@ -227,6 +228,8 @@ private __gshared
     Barray!uint tlvBlocks;      // in these blocks
     uint condDepth;             // number of conditionally evaluated regions being selected
     bool usesFrame;             // the code refers to locals or parameters in memory
+    Barray!Srcpos locs;         // the source positions of the instructions, 0 being none
+    uint curLoc;                // the index in locs of the instructions being selected
 }
 
 /// The value of the environment variable `name`, looked up once
@@ -308,6 +311,8 @@ bool lirCodegen(ref CGstate cg)
     failed = false;
     wrappedProlog = null;
     ins.setLength(0);
+    locs.setLength(1);
+    curLoc = 0;
     foreach (ref v; vinfo[])
         v.ranges.dtor();
     vinfo.setLength(0);
@@ -1418,8 +1423,35 @@ private LIns* emitIns(LOp op, uint sz, Reg d = noReg, Reg a = noReg, Reg b = noR
     i.a = a;
     i.b = b;
     i.imm = imm;
+    i.loc = curLoc;
     ins.push(i);
     return &ins[ins.length - 1];
+}
+
+/* Make the source position of e, if it has one, that of the instructions
+ * selected from here on.
+ * Returns:
+ *      the position before, to restore once e is done
+ */
+private uint enterLoc(const(elem)* e)
+{
+    return enterLoc(e.Esrcpos);
+}
+
+/// ditto
+@trusted
+private uint enterLoc(ref const Srcpos p)
+{
+    const before = curLoc;
+    if (!config.addlinenumbers || !p.Slinnum)
+        return before;
+    const cur = &locs[curLoc];
+    if (cur.Slinnum != p.Slinnum || cur.Sfilename != p.Sfilename)
+    {
+        locs.push(p);
+        curLoc = cast(uint)(locs.length - 1);
+    }
+    return before;
 }
 
 @trusted
@@ -1885,6 +1917,8 @@ private void select()
         blockAssigned.setLength(0);
         if (b.Belem)
             collectAssigned(b.Belem);
+        curLoc = 0;
+        enterLoc(b.Bsrcpos);
         block* next = bi + 1 < blocks.length ? blocks[bi + 1] : null;
         if (b.bc == BC.jcatch || b.bc == BC.lpad)
         {
@@ -2080,6 +2114,8 @@ private void knownExtended(Reg d, uint bits, bool signed, uint toSize)
 @trusted
 private void genEffect(elem* e)
 {
+    const outerLoc = enterLoc(e);
+    scope (exit) curLoc = outerLoc;
     switch (e.Eoper)
     {
         case OPcomma:
@@ -2248,6 +2284,8 @@ private void genCondBlock(elem* e, bool jumpIfTrue, block* t)
 @trusted
 private void genCond(elem* e, bool jumpIfTrue, uint l, block* t = null)
 {
+    const outerLoc = enterLoc(e);
+    scope (exit) curLoc = outerLoc;
     void jump(COND cond)
     {
         if (t)
@@ -2890,6 +2928,8 @@ private bool blockDominates(uint a, uint b)
 @trusted
 private Reg gen(elem* e)
 {
+    const outerLoc = enterLoc(e);
+    scope (exit) curLoc = outerLoc;
     if (e.Ecount)
     {
         if (Reg r = cseLookup(e))
@@ -3014,6 +3054,8 @@ struct Pair
 @trusted
 private Pair genPair(elem* e)
 {
+    const outerLoc = enterLoc(e);
+    scope (exit) curLoc = outerLoc;
     if (e.Ecount)
     {
         foreach (i, x; cseElems[])
@@ -3303,6 +3345,8 @@ private bool aggregateLvalue(const(elem)* e)
 @trusted
 private AggVal genAgg(elem* e)
 {
+    const outerLoc = enterLoc(e);
+    scope (exit) curLoc = outerLoc;
     AggVal v;
     switch (e.Eoper)
     {
@@ -4393,6 +4437,8 @@ private bool tailCallable(block* b, elem* e, bool isVoid)
 @trusted
 private Reg genTail(elem* e, ref bool tail)
 {
+    const outerLoc = enterLoc(e);
+    scope (exit) curLoc = outerLoc;
     while (e.Eoper == OPcomma)
     {
         genEffect(e.E1);
@@ -15097,12 +15143,26 @@ private void emit(ref CGstate cg)
         // below its place for arguments on the stack: MOV SP,X29, the frame having no more
         if (b.bc == BC.jcatch || b.bc == BC.lpad)
             cdb.gen1(0x9100_03BF);
+        uint lastLoc;
+        void emitLoc(ref const LIns i)
+        {
+            // a line number entry where the code of another source position starts
+            if (i.loc && i.loc != lastLoc && i.op != LOp.nop && i.op != LOp.label)
+            {
+                cdb.genlinnum(locs[i.loc]);
+                lastLoc = i.loc;
+            }
+        }
         if (b is wrappedProlog)
             foreach (ref i; sunk[])
+            {
+                emitLoc(i);
                 emitOne(cdb, i, labelCode, used);
+            }
         foreach (n; blockStart[bi] .. blockStart[bi + 1])
         {
             LIns* i = &ins[n];
+            emitLoc(*i);
             emitOne(cdb, *i, labelCode, used);
         }
         b.Bcode = cdb.finish();
