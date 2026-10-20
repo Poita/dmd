@@ -260,7 +260,7 @@ bool newCodegenEnabled()
 }
 
 /// Whether code generated without optimization is generated through virtual registers
-/// too, unless DMD_NEWCG_FAST is 0
+/// too, when DMD_NEWCG_FAST is set and not 0
 @trusted
 bool lirFastEnabled()
 {
@@ -268,7 +268,7 @@ bool lirFastEnabled()
     if (enabled < 0)
     {
         auto p = getenv("DMD_NEWCG_FAST");
-        enabled = newCodegenEnabled() && !(p && *p == '0');
+        enabled = newCodegenEnabled() && p && *p != '0';
     }
     return enabled != 0;
 }

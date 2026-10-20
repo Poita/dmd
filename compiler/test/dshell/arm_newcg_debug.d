@@ -1,6 +1,7 @@
-// Without -O the new AArch64 code generator generates every function of each
-// program in extra-files/arm_newcg_coverage and extra-files/arm_newcg_debug,
-// which run correctly, with the source line of each statement in the line table.
+// Without -O, with DMD_NEWCG_FAST=1, the new AArch64 code generator generates
+// every function of each program in extra-files/arm_newcg_coverage and
+// extra-files/arm_newcg_debug, which run correctly, with the source line of each
+// statement in the line table.
 module test.dshell.arm_newcg_debug;
 
 import dshell;
@@ -34,7 +35,7 @@ int main()
             {
                 auto f = File(log, "w");
                 run("$DMD -m$MODEL " ~ flags ~ " -of" ~ exe ~ " " ~ src, stdout, f,
-                    ["DMD_NEWCG": "1", "DMD_NEWCG_WHY": "1", "DMD_NEWCG_LOG": "1"]);
+                    ["DMD_NEWCG": "1", "DMD_NEWCG_FAST": "1", "DMD_NEWCG_WHY": "1", "DMD_NEWCG_LOG": "1"]);
             }
             bool generated;
             foreach (line; readText(log).lineSplitter)
@@ -58,7 +59,7 @@ int main()
     // each statement of lines.d starts a row of the line table
     const obj = OUTPUT_BASE ~ "_lines" ~ OBJ;
     run("$DMD -m$MODEL -g -c -of" ~ obj ~ " " ~ shellExpand("$EXTRA_FILES/arm_newcg_debug/lines.d"),
-        stdout, stderr, ["DMD_NEWCG": "1"]);
+        stdout, stderr, ["DMD_NEWCG": "1", "DMD_NEWCG_FAST": "1"]);
     auto r = execute(["dwarfdump", "--debug-line", obj]);
     if (r.status == 0)
     {
