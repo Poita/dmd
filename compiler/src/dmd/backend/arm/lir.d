@@ -78,7 +78,7 @@ enum LOp : ubyte
     cmpi,           // flags = a - imm
     tsti,           // flags = a & imm
     cset,           // d = cond
-    csel,           // d = cond ? a : b
+    csel,           // d = cond ? a : b, or with imm 1, 2 or 3, b + 1, ~b or -b for b
     fadd, fsub, fmul, fdiv,                                        // d = a op b
     fneg, fabs, fsqrt,                                             // d = op a
     fcmp,           // flags = a <=> b
@@ -400,6 +400,7 @@ bool lirCodegen(ref CGstate cg)
         fuseSignTests();
         fuseMultiplyAdds();
         fuseCompareChains();
+        foldSelectOperations();
     }
     if (failed)
     {
@@ -6987,6 +6988,82 @@ private void numberValues()
     ndefs.dtor();
     subst.dtor();
     ver.dtor();
+}
+
+/* A select of a register and of it plus one, inverted or negated, made just for the
+ * select from the register as it is there, is a CSINC, CSINV or CSNEG of the register
+ * alone. Done last, as nothing before knows these forms of csel
+ */
+@trusted
+private void foldSelectOperations()
+{
+    buildSegments();
+    const ns = segStart.length - 1;
+    Barray!uint nuses, ndefs;
+    scope (exit) { nuses.dtor(); ndefs.dtor(); }
+    nuses.setLength(vinfo.length);
+    ndefs.setLength(vinfo.length);
+    nuses[][] = 0;
+    ndefs[][] = 0;
+    foreach (ref i; ins[])
+    {
+        if (i.d && !isPhys(i.d))
+            ++ndefs[i.d - firstVreg];
+        void use(Reg r) { if (!isPhys(r)) ++nuses[r - firstVreg]; }
+        forUses(i, &use);
+    }
+    foreach (si; 0 .. ns)
+    {
+        const start = segStart[si], end = segEnd(si);
+        foreach (n; start .. end)
+        {
+            LIns* c = &ins[n];
+            if (c.op != LOp.csel || c.imm || c.cond >= COND.al || !c.a || !c.b || isPhys(c.a) || isPhys(c.b) || c.a == c.b ||
+                rcOf(c.a) != RC.gp || rcOf(c.b) != RC.gp)
+                continue;
+            // the operand made from the other, by an instruction earlier in the segment
+            foreach (k; 0 .. 2)
+            {
+                const Reg made = k ? c.b : c.a, x = k ? c.a : c.b;
+                if (ndefs[made - firstVreg] != 1 || nuses[made - firstVreg] != 1)
+                    continue;
+                uint at = uint.max;
+                foreach_reverse (m; start .. n)
+                {
+                    if (ins[m].d == made)
+                    {
+                        at = cast(uint)m;
+                        break;
+                    }
+                    // x the same where the operation reads it as at the select
+                    if (ins[m].d == x || ins[m].op == LOp.ldp && ins[m].c == x)
+                        break;
+                }
+                if (at == uint.max)
+                    continue;
+                LIns* o = &ins[at];
+                if (o.a != x || o.sz != c.sz || o.flags)
+                    continue;
+                long kind;
+                if (o.op == LOp.addi && o.imm == 1)
+                    kind = 1;
+                else if (o.op == LOp.mvn)
+                    kind = 2;
+                else if (o.op == LOp.neg)
+                    kind = 3;
+                else
+                    continue;
+                // cond ? f(x) : x is !cond ? x : f(x)
+                if (!k)
+                    c.cond ^= 1;
+                c.a = c.b = x;
+                c.imm = kind;
+                o.op = LOp.nop;
+                o.d = o.a = noReg;
+                break;
+            }
+        }
+    }
 }
 
 /* Make copies of the extensions of registers whose every definition leaves them
@@ -15865,7 +15942,8 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
         {
             const d = pr(i.d);
             def(d);
-            cdb.gen1(INSTR.csel(sf, pr(i.b), i.cond, pr(i.a), d));
+            // CSEL, CSINC, CSINV or CSNEG
+            cdb.gen1(INSTR.condsel(sf, i.imm >= 2, 0, pr(i.b), i.cond, cast(uint)(i.imm & 1), pr(i.a), d));
             break;
         }
 
