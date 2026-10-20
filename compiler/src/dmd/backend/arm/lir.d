@@ -13829,6 +13829,12 @@ private void allocate()
             }
     }
 
+    if (fast)
+    {
+        allocateInOrder();
+        return;
+    }
+
     // allocate the most costly first
     Barray!Reg order;
     foreach (k; 0 .. vinfo.length)
@@ -14108,6 +14114,100 @@ private void allocate()
     copyNext.dtor();
 }
 
+/* Allocate the registers by a linear scan over the code: each holds its register
+ * from its first definition or use to its last, the register it is copied to or
+ * from if that is free then, else the first free in order of preference, else it
+ * is kept in memory. Once one of a class is, the spill registers of the class are
+ * kept for that and the scan is done again.
+ */
+@trusted
+private void allocateInOrder()
+{
+    // the registers with live ranges, in order of where they start, by a counting sort
+    const npos = usePos(ins.length) + 2;
+    Barray!uint count;
+    count.setLength(npos + 1);
+    count[][] = 0;
+    uint nr;
+    foreach (ref v; vinfo[])
+        if (v.ranges.length)
+        {
+            ++count[v.ranges[0].from + 1];
+            ++nr;
+        }
+    foreach (k; 1 .. npos + 1)
+        count[k] += count[k - 1];
+    Barray!Reg order;
+    order.setLength(nr);
+    foreach (k, ref v; vinfo[])
+        if (v.ranges.length)
+            order[count[v.ranges[0].from]++] = cast(Reg)(firstVreg + k);
+    count.dtor();
+
+    while (1)
+    {
+        uint[64] busyUntil = 0;     // the end of the last value given each register
+        size_t[64] cursor = 0;      // the first fixed range of each register that may be reached yet
+        bool[2] spilled;
+        foreach (r; order[])
+        {
+            auto v = vi(r);
+            v.preg = uint.max;
+            v.spilled = false;
+            const from = v.ranges[0].from;
+            const to = v.ranges[v.ranges.length - 1].to;
+            bool free(uint p)
+            {
+                if ((p >= 32) != (v.rc == RC.fp) || !allowedFor(p, v) || busyUntil[p] > from)
+                    return false;
+                auto occ = &occupied[p];
+                size_t c = cursor[p];
+                while (c < occ.length && (*occ)[c].to <= from)
+                    ++c;
+                cursor[p] = c;
+                // sorted by where they start
+                for (; c < occ.length && (*occ)[c].from < to; ++c)
+                    if ((*occ)[c].to > from)
+                        return false;
+                return true;
+            }
+            uint chosen = uint.max;
+            if (Reg h = v.hint)
+            {
+                const p = isPhys(h) ? physOf(h) : vi(h).preg;
+                if (p != uint.max && free(p))
+                    chosen = p;
+            }
+            if (chosen == uint.max)
+                foreach (p; regOrder(v.rc))
+                    if (free(p))
+                    {
+                        chosen = p;
+                        break;
+                    }
+            if (chosen == uint.max)
+            {
+                v.spilled = true;
+                spilled[v.rc] = true;
+                continue;
+            }
+            v.preg = chosen;
+            busyUntil[chosen] = to;
+        }
+        bool again;
+        foreach (rc; 0 .. 2)
+            if (spilled[rc] && scratchAllocated[rc])
+            {
+                scratchAllocated[rc] = false;
+                again = true;
+            }
+        if (!again)
+            break;
+        setAllocatable();
+    }
+    order.dtor();
+}
+
 /* Whether r can share register p with h, as one is a copy of the other or both are
  * copies of one register: wherever r overlaps what p holds, both hold that value
  */
@@ -14198,6 +14298,8 @@ private void splitSpilled()
     foreach (ref sp; splits[])
         mem_free(sp.inLoop.ptr);
     splits.setLength(0);
+    if (fast)
+        return;     // the registers allocated are not recorded in occupied
     bool any;
     foreach (ref v; vinfo[])
         if (v.spilled && v.rematIns == uint.max)
