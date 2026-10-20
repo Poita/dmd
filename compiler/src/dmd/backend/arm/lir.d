@@ -6706,16 +6706,231 @@ private uint segEnd(size_t si)
     return si + 1 < ns && segBlock[si + 1] == bi ? segStart[si + 1] : blockStart[bi + 1];
 }
 
+/******************************* Memory ******************************/
+
+/* The memory an instruction reads or writes, for telling whether two
+ * instructions may reach the same bytes. Only addresses are reasoned about,
+ * never types, as D lets any memory be read as any type: distinct variables do
+ * not overlap, locals whose address is never taken are reached only by name,
+ * and offsets from the same base register are compared
+ */
+private struct Footprint
+{
+    enum Kind : ubyte
+    {
+        any,        // anywhere
+        frame,      // sym + off, a variable of the frame
+        global,     // sym + off, a static variable
+        reg,        // base + off
+    }
+    Kind kind;
+    Reg base;
+    const(Symbol)* sym;
+    long off;
+    long size;
+}
+
+private __gshared
+{
+    Barray!uint memDef;                 // by register: its only definition, or uint.max
+    Barray!(const(Symbol)*) escaped;    // the locals whose address is taken
+    bool frameEscapes;                  // the frame is referred to as a whole
+}
+
+/* Find what the memory reasoning needs: the only definition of each register,
+ * and the locals whose address is taken, which then may be reached through any
+ * pointer
+ */
+@trusted
+private void analyzeMemory()
+{
+    memDef.setLength(vinfo.length);
+    memDef[][] = uint.max;
+    Barray!uint ndefs;
+    scope (exit) ndefs.dtor();
+    ndefs.setLength(vinfo.length);
+    ndefs[][] = 0;
+    escaped.setLength(0);
+    frameEscapes = false;
+    foreach (n, ref i; ins[])
+    {
+        if (i.d && !isPhys(i.d))
+        {
+            const k = i.d - firstVreg;
+            memDef[k] = ++ndefs[k] == 1 && !(i.flags & F.condDef) ? cast(uint)n : uint.max - 1;
+        }
+        if (i.op == LOp.frameptr)
+            frameEscapes = true;
+        // a local named other than as the whole address of a load or store has its address taken
+        if (i.sym && !isStatic(i.sym))
+        {
+            bool access;
+            switch (i.op)
+            {
+                case LOp.ld, LOp.ldp, LOp.vld:
+                    access = !i.a && !i.b;
+                    break;
+                case LOp.st, LOp.stp, LOp.vst:
+                    access = !i.b && !i.c;
+                    break;
+                default:
+                    break;
+            }
+            if (!access)
+            {
+                bool known;
+                foreach (s; escaped[])
+                    known |= s is i.sym;
+                if (!known)
+                    escaped.push(i.sym);
+            }
+        }
+    }
+    foreach (ref d; memDef[])
+        if (d == uint.max - 1)
+            d = uint.max;
+}
+
+/* Whether the address of the local s may be held in a register
+ */
+@trusted
+private bool localEscapes(const(Symbol)* s)
+{
+    if (frameEscapes)
+        return true;
+    foreach (e; escaped[])
+        if (e is s)
+            return true;
+    return false;
+}
+
+/* If r always holds the address of a variable plus a constant, the variable,
+ * with the constant added to off
+ */
+@trusted
+private const(Symbol)* addressOf(Reg r, ref long off)
+{
+    foreach (depth; 0 .. 8)
+    {
+        if (!r || isPhys(r) || r - firstVreg >= memDef.length)
+            return null;
+        const n = memDef[r - firstVreg];
+        if (n == uint.max)
+            return null;
+        const i = &ins[n];
+        switch (i.op)
+        {
+            case LOp.lea:
+                off += i.imm;
+                return i.sym;
+            case LOp.addi:
+                if (i.sz != 8)
+                    return null;
+                off += i.imm;
+                break;
+            case LOp.subi:
+                if (i.sz != 8)
+                    return null;
+                off -= i.imm;
+                break;
+            case LOp.copy:
+                if (i.sz != 8 || rcOf(i.a) != RC.gp)
+                    return null;
+                break;
+            default:
+                return null;
+        }
+        r = i.a;
+    }
+    return null;
+}
+
+/* The memory i reaches, of the kind any for what is not a load or store
+ */
+@trusted
+private Footprint footprint(ref const LIns i)
+{
+    Footprint f;
+    Reg base, index;
+    long size;
+    switch (i.op)
+    {
+        case LOp.ld:  base = i.a; index = i.b; size = i.sz; break;
+        case LOp.st:  base = i.b; index = i.c; size = i.sz; break;
+        case LOp.vld: base = i.a; index = i.b; size = i.sz; break;
+        case LOp.vst: base = i.b; index = i.c; size = i.sz; break;
+        case LOp.ldp: base = i.a; size = 2 * i.sz; break;
+        case LOp.stp: base = i.b; size = 2 * i.sz; break;
+        default:
+            return f;
+    }
+    if (index || i.sym && base)
+        return f;           // somewhere in what an unknown offset reaches
+    f.size = size;
+    f.off = i.imm;
+    if (i.sym)
+        f.sym = i.sym;
+    else if (!base || isPhys(base))
+        return f;
+    else
+    {
+        f.sym = addressOf(base, f.off);
+        if (!f.sym)
+        {
+            f.kind = Footprint.Kind.reg;
+            f.base = base;
+            return f;
+        }
+    }
+    // a variable is known only by what is within it
+    const vsize = type_size(cast(type*)f.sym.Stype);
+    if (f.off < 0 || f.off + f.size > vsize)
+        return Footprint.init;
+    f.kind = isStatic(f.sym) ? Footprint.Kind.global : Footprint.Kind.frame;
+    return f;
+}
+
+/* Whether x and y may reach the same bytes, where a base register that is the
+ * same in both holds the same address for both when sameBase
+ */
+@trusted
+private bool mayAlias(ref const Footprint x, ref const Footprint y, bool sameBase = true)
+{
+    alias K = Footprint.Kind;
+    bool disjoint() { return x.off + x.size <= y.off || y.off + y.size <= x.off; }
+    const xv = x.kind == K.frame || x.kind == K.global;
+    const yv = y.kind == K.frame || y.kind == K.global;
+    if (xv && yv)
+        return x.sym is y.sym && !disjoint();
+    // a local whose address is not taken is reached only by its name
+    if (x.kind == K.frame && !localEscapes(x.sym) || y.kind == K.frame && !localEscapes(y.sym))
+        return false;
+    if (x.kind == K.reg && y.kind == K.reg && x.base == y.base && sameBase)
+        return !disjoint();
+    return true;
+}
+
+/* Whether i is a barrier no memory access is moved across or matched over
+ */
+private bool memoryBarrier(ref const LIns i)
+{
+    return i.op == LOp.atomic || i.op == LOp.spsub || i.op == LOp.spadd;
+}
+
 /******************************* Addresses ******************************/
 
 /* Within each segment, an instruction without side effects, or a load with no store
- * since, computing what an earlier one did into a register defined only there
- * is removed, and its result taken from the earlier one
+ * to the same memory since, computing what an earlier one did into a register
+ * defined only there is removed, and its result taken from the earlier one. A load
+ * of what a store put in memory, with nothing stored there since, takes the value
+ * stored
  */
 @trusted
 private void numberValues()
 {
     buildSegments();
+    analyzeMemory();
+    const precise = !env!"DMD_NEWCG_NOMEMOPT";
     const ns = segStart.length - 1;
     Barray!uint ndefs;
     ndefs.setLength(vinfo.length);
@@ -6740,12 +6955,27 @@ private void numberValues()
     uint verOf(Reg r) { return r && !isPhys(r) ? ver[r - firstVreg] : 0; }
 
     /* A hash table of the instructions seen in the segment: an entry is current while
-     * its generation is the segment's, and a load's while its memory epoch is current
+     * its generation is the segment's, and a load's until a store that may reach its memory
      */
-    static struct Entry { uint gen; uint epoch; uint n; uint va, vb, vc; }
+    static struct Entry { uint gen; uint n; uint va, vb, vc; bool killed; uint writes; Footprint fp; }
     enum tableSize = 512;
     Entry[tableSize] table;
-    uint gen = 0, epoch = 0;
+    uint gen = 0;
+    uint nwrites;                   // the number of instructions writing memory so far
+    Barray!uint liveLoads;          // the entries of the loads not yet killed
+    // the stores whose values may be read back: the store, the versions of its base and value
+    static struct Stored { uint n; uint vb, va; Footprint fp; }
+    Barray!Stored stored;
+    scope (exit) { liveLoads.dtor(); stored.dtor(); }
+    // whether the write w, of what f reaches, may change what the load with base version va reached
+    bool kills(ref const LIns w, ref const Footprint f, ref const Footprint lf, uint va)
+    {
+        if (!precise || memoryBarrier(w))
+            return true;
+        const same = f.kind == Footprint.Kind.reg && lf.kind == Footprint.Kind.reg && f.base == lf.base &&
+            verOf(f.base) == va;
+        return mayAlias(f, lf, same);
+    }
     static size_t hashOf(ref const LIns i)
     {
         size_t h = i.op * 31 + i.sz;
@@ -6756,6 +6986,50 @@ private void numberValues()
         h = h * 131 + cast(size_t)cast(void*)i.sym;
         h = h * 131 + i.flags * 7 + i.cond;
         return h ^ (h >> 17);
+    }
+    /* Make the load i, of the bytes a store put in memory with nothing stored
+     * there since, the value stored, extended as the load extends it
+     */
+    bool forwardStore(ref LIns i)
+    {
+        if (i.flags & F.volatile_)
+            return false;
+        foreach_reverse (ref st; stored[])
+        {
+            const s = &ins[st.n];
+            if (s.sym !is i.sym || s.b != i.a || s.imm != i.imm || st.vb != verOf(i.a))
+                continue;
+            // the latest store there, as one of the same bytes made earlier is forgotten by it
+            if (s.sz != i.sz || st.va != verOf(s.a) || rcOf(s.a) != rcOf(i.d))
+                return false;
+            LIns c;
+            c.d = i.d;
+            c.a = s.a;
+            if (rcOf(i.d) == RC.fp || i.sz == 8)
+            {
+                c.op = LOp.copy;
+                c.sz = i.sz;
+            }
+            else if (i.flags & F.signed && (i.sz < 4 || i.flags & F.toX))
+            {
+                // LDRSB, LDRSH into a W register, or LDRSW, LDRSB, LDRSH into an X register
+                c.op = LOp.sext;
+                c.sz = i.flags & F.toX ? 8 : 4;
+                c.imm = i.sz * 8;
+            }
+            else
+            {
+                // the other loads zero extend to 64 bits
+                c.op = LOp.zext;
+                c.sz = 8;
+                c.imm = i.sz * 8;
+            }
+            i = c;
+            if (env!"DMD_NEWCG_MEMOPT")
+                fprintf(stderr, "newcg-memopt: forward %s\n", funcsym_p.Sident.ptr);
+            return true;
+        }
+        return false;
     }
     bool any;
     // what is known flows on into a segment entered only from the one before
@@ -6769,6 +7043,8 @@ private void numberValues()
         {
             ++gen;
             count = 0;
+            liveLoads.setLength(0);
+            stored.setLength(0);
         }
         foreach (n; segStart[si] .. segEnd(si))
         {
@@ -6776,12 +7052,48 @@ private void numberValues()
             i.a = value(i.a);
             i.b = value(i.b);
             i.c = value(i.c);
-            if (i.op == LOp.st || i.op == LOp.stp || i.op == LOp.call || i.op == LOp.spsub || i.op == LOp.spadd ||
-                i.op == LOp.atomic)
-                ++epoch;        // what memory held may have changed
+            if (i.op == LOp.st || i.op == LOp.stp || i.op == LOp.vst || i.op == LOp.call || i.op == LOp.spsub ||
+                i.op == LOp.spadd || i.op == LOp.atomic)
+            {
+                // what memory held may have changed
+                ++nwrites;
+                const f = footprint(*i);
+                size_t k = 0;
+                foreach (slot; liveLoads[])
+                {
+                    auto x = &table[slot];
+                    if (x.gen != gen || x.killed)
+                        continue;
+                    if (kills(*i, f, x.fp, x.va))
+                        x.killed = true;
+                    else
+                        liveLoads[k++] = slot;
+                }
+                liveLoads.setLength(k);
+                k = 0;
+                foreach (ref st; stored[])
+                    if (!kills(*i, f, st.fp, st.vb))
+                        stored[k++] = st;
+                stored.setLength(k);
+                if (precise && i.op == LOp.st && !i.c && i.a && !isPhys(i.a) && (i.b ? !isPhys(i.b) && !i.sym : i.sym !is null))
+                {
+                    if (stored.length == 32)
+                    {
+                        foreach (m; 1 .. stored.length)
+                            stored[m - 1] = stored[m];
+                        stored.setLength(31);
+                    }
+                    stored.push(Stored(cast(uint)n, verOf(i.b), verOf(i.a), f));
+                }
+            }
             const candidate = i.d && !isPhys(i.d) && ndefs[i.d - firstVreg] == 1 &&
                 !(i.flags & F.condDef) && (pureOp(*i) || i.op == LOp.ld && !(i.flags & F.volatile_)) &&
                 !(i.a && isPhys(i.a)) && !(i.b && isPhys(i.b)) && !(i.c && isPhys(i.c));
+            if (candidate && i.op == LOp.ld && !i.b && forwardStore(*i))
+            {
+                ++ver[i.d - firstVreg];
+                continue;
+            }
             if (candidate)
             {
                 const isLoad = i.op == LOp.ld;
@@ -6795,7 +7107,12 @@ private void numberValues()
                         // a free slot: remember this one, unless the table is getting full
                         if (count < tableSize / 2)
                         {
-                            *x = Entry(gen, epoch, cast(uint)n, verOf(i.a), verOf(i.b), verOf(i.c));
+                            *x = Entry(gen, cast(uint)n, verOf(i.a), verOf(i.b), verOf(i.c), false, nwrites);
+                            if (isLoad)
+                            {
+                                x.fp = footprint(*i);
+                                liveLoads.push(cast(uint)((h + probe) & (tableSize - 1)));
+                            }
                             ++count;
                         }
                         break;
@@ -6804,8 +7121,18 @@ private void numberValues()
                     if (k.op == i.op && k.sz == i.sz && k.cond == i.cond && k.flags == i.flags &&
                         k.a == i.a && k.b == i.b && k.c == i.c && k.imm == i.imm && k.sym == i.sym &&
                         x.va == verOf(i.a) && x.vb == verOf(i.b) && x.vc == verOf(i.c) &&
-                        rcOf(k.d) == rcOf(i.d) && (!isLoad || x.epoch == epoch))
+                        rcOf(k.d) == rcOf(i.d))
                     {
+                        if (isLoad && x.killed)
+                        {
+                            // what is in memory now is read here instead
+                            *x = Entry(gen, cast(uint)n, verOf(i.a), verOf(i.b), verOf(i.c), false, nwrites);
+                            x.fp = footprint(*i);
+                            liveLoads.push(cast(uint)((h + probe) & (tableSize - 1)));
+                            break;
+                        }
+                        if (isLoad && x.writes != nwrites && env!"DMD_NEWCG_MEMOPT")
+                            fprintf(stderr, "newcg-memopt: reuse %s\n", funcsym_p.Sident.ptr);
                         subst[i.d - firstVreg] = k.d;
                         i.op = LOp.nop;
                         i.d = noReg;
