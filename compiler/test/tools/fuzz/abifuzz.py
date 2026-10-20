@@ -349,7 +349,7 @@ class Gen:
                     self.hash_stmts(t, 'a%d' % j, lang, body, '    ')
                 body.append('    fz_last%s = h;' % ('' if lang == 'd' else '_c'))
                 if ret != 'void':
-                    body.append('    %s r;' % (ret if lang == 'd' else self.ctype(ret)))
+                    body.append(('    %s r = void;' if lang == 'd' else '    %s r;') % (ret if lang == 'd' else self.ctype(ret)))
                     self.build_stmts(ret, 'r', lang, body, '    ')
                     body.append('    return r;')
                 body.append('}')
