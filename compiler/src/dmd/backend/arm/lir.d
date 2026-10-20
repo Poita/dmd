@@ -14821,7 +14821,23 @@ private bool hoistInvariants()
                 d = idom[d];
             }
         }
-        bool movableLoad(ref const LIns i)
+        /* The preheader goes on only into the header, so a load in the header before
+         * any call or trap there is made whenever the preheader's end is reached,
+         * through the same base register when the loop does not change it
+         */
+        uint enteredEnd = segStart[lp.header];
+        if (!viaDominator && segSuccStart[pre + 1] - segSuccStart[pre] == 1 &&
+            segSucc[segSuccStart[pre]] == lp.header)
+        {
+            enteredEnd = segEnd(lp.header);
+            foreach (n; segStart[lp.header] .. segEnd(lp.header))
+                if (ins[n].op == LOp.call || ins[n].op == LOp.brk)
+                {
+                    enteredEnd = cast(uint)n;
+                    break;
+                }
+        }
+        bool movableLoad(ref const LIns i, size_t n)
         {
             if (i.op != LOp.ld || viaDominator || i.flags & (F.volatile_ | F.condDef) || i.b ||
                 loopWrites && (!precise || loopBarrier))
@@ -14833,7 +14849,7 @@ private bool hoistInvariants()
                     return false;
             bool ok = f.kind == Footprint.Kind.frame || f.kind == Footprint.Kind.global;
             if (!ok && !i.sym && i.a)
-                ok = witnessCovers(witnessed[], i.a, i.imm, i.sz);
+                ok = witnessCovers(witnessed[], i.a, i.imm, i.sz) || segOf[n] == lp.header && n < enteredEnd;
             return ok;
         }
 
@@ -14847,7 +14863,7 @@ private bool hoistInvariants()
                     if (moveTo[n] != uint.max)
                         continue;
                     LIns* i = &ins[n];
-                    if (!(pureOp(*i) || movableLoad(*i) || i.op == LOp.movi && !isPhys(i.d) && vecConst[i.d - firstVreg]) ||
+                    if (!(pureOp(*i) || movableLoad(*i, n) || i.op == LOp.movi && !isPhys(i.d) && vecConst[i.d - firstVreg]) ||
                         !i.d || isPhys(i.d) || ndefs[i.d - firstVreg] != 1)
                         continue;
                     bool inv = true;
