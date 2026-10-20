@@ -12919,23 +12919,62 @@ private void findLoops(ref Barray!uint predStart, ref Barray!uint preds, ref Bar
             }
         }
     }
+    /* Number the dominator tree in depth first order, so that `a` dominates `b` when
+     * `b`'s interval of numbers lies within `a`'s
+     */
+    Barray!uint enter, leave;
+    enter.setLength(ns);
+    leave.setLength(ns);
+    {
+        Barray!uint childStart, children, fill;
+        childStart.setLength(ns + 1);
+        childStart[][] = 0;
+        foreach (v; rpo[][1 .. rpo.length])
+            ++childStart[idom[v] + 1];
+        foreach (k; 1 .. ns + 1)
+            childStart[k] += childStart[k - 1];
+        children.setLength(childStart[ns]);
+        fill.setLength(ns);
+        fill[][] = 0;
+        foreach (v; rpo[][1 .. rpo.length])
+            children[childStart[idom[v]] + fill[idom[v]]++] = v;
+
+        Barray!uint stack, next;
+        next.setLength(ns);
+        next[][] = 0;
+        uint clock;
+        stack.push(0);
+        enter[0] = clock++;
+        while (stack.length)
+        {
+            const v = stack[stack.length - 1];
+            const k = childStart[v] + next[v];
+            if (k < childStart[v + 1])
+            {
+                ++next[v];
+                const c = children[k];
+                enter[c] = clock++;
+                stack.push(c);
+            }
+            else
+            {
+                leave[v] = clock++;
+                stack.setLength(stack.length - 1);
+            }
+        }
+        childStart.dtor(); children.dtor(); fill.dtor(); stack.dtor(); next.dtor();
+    }
     bool dominates(uint a, uint b)
     {
-        if (order[b] == uint.max)
+        if (order[a] == uint.max || order[b] == uint.max)
             return false;
-        while (true)
-        {
-            if (a == b)
-                return true;
-            if (b == 0)
-                return false;
-            b = idom[b];
-        }
+        return enter[a] <= enter[b] && leave[b] <= leave[a];
     }
 
     // the loops, one for each header with the segments of all its back edges, smallest first
     Barray!bool inLoop;
     inLoop.setLength(ns);
+    inLoop[][] = false;
     Barray!bool isHeader;
     isHeader.setLength(ns);
     isHeader[][] = false;
@@ -12948,7 +12987,6 @@ private void findLoops(ref Barray!uint predStart, ref Barray!uint preds, ref Bar
             if (!isHeader[h])
                 continue;
             // the segments reaching a back edge to h without passing through h
-            inLoop[][] = false;
             inLoop[h] = true;
             Barray!uint work;
             Barray!uint body;
@@ -12979,6 +13017,8 @@ private void findLoops(ref Barray!uint predStart, ref Barray!uint preds, ref Bar
             lp.body = (cast(uint*)mem_malloc(body.length * uint.sizeof))[0 .. body.length];
             lp.body[] = body[];
             loops.push(lp);
+            foreach (v; body[])
+                inLoop[v] = false;
             work.dtor();
             body.dtor();
         }
@@ -12991,6 +13031,7 @@ private void findLoops(ref Barray!uint predStart, ref Barray!uint preds, ref Bar
     if (loops.length > 1)
         qsort(loops[].ptr, loops.length, Loop.sizeof, &bySize);
     inLoop.dtor(); isHeader.dtor();
+    enter.dtor(); leave.dtor();
     idom.dtor(); rpo.dtor(); order.dtor();
 }
 
