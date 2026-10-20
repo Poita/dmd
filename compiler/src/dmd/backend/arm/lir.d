@@ -6958,6 +6958,38 @@ private bool memoryBarrier(ref const LIns i)
     return i.op == LOp.atomic || i.op == LOp.spsub || i.op == LOp.spadd;
 }
 
+/// The bytes [lo, hi) from a base register that a load or store went through
+private struct Witness { Reg base; long lo, hi; }
+
+/* The witness of the load or store i through a base register, with base noReg for
+ * any other instruction
+ */
+private Witness witnessOf(ref const LIns i)
+{
+    if (i.op == LOp.ld && i.a && !isPhys(i.a) && !i.b && !i.sym)
+        return Witness(i.a, i.imm, i.imm + i.sz);
+    if (i.op == LOp.st && i.b && !isPhys(i.b) && !i.c && !i.sym)
+        return Witness(i.b, i.imm, i.imm + i.sz);
+    return Witness.init;
+}
+
+/* Whether the size bytes at off from base are accessible, given the accesses ws
+ * made through it. Memory is accessible or not by pages of at least 4096 bytes,
+ * so bytes lying between two bytes accessed at most that far apart are accessible
+ * too; nothing is known of other bytes, however near
+ */
+private bool witnessCovers(const(Witness)[] ws, Reg base, long off, long size)
+{
+    long lo = long.max, hi = long.min;
+    foreach (ref w; ws)
+        if (w.base == base)
+        {
+            lo = w.lo < lo ? w.lo : lo;
+            hi = w.hi > hi ? w.hi : hi;
+        }
+    return lo <= off && off + size <= hi && hi - lo <= 4096;
+}
+
 /******************************* Addresses ******************************/
 
 /* Within each segment, an instruction without side effects, or a load with no store
@@ -7657,10 +7689,11 @@ private void promoteLoopMemory()
     Barray!Footprint writes;
     Barray!uint writeIns, group;
     Barray!Insert inserts;
+    Barray!Witness ws;
     scope (exit)
     {
         inLoop.dtor(); defInLoop.dtor(); done.dtor(); writes.dtor(); writeIns.dtor(); group.dtor();
-        inserts.dtor();
+        inserts.dtor(); ws.dtor();
     }
     inLoop.setLength(ns);
     defInLoop.setLength(vinfo.length);
@@ -7669,7 +7702,7 @@ private void promoteLoopMemory()
      * preheader pre or the segments before it each entered only from the one before,
      * so that the memory reached through it is there before the loop
      */
-    bool witnessed(uint pre, Reg base)
+    bool witnessed(uint pre, Reg base, long off, long size)
     {
         if (!base)
             return false;
@@ -7689,17 +7722,19 @@ private void promoteLoopMemory()
                 break;
             chain[nchain++] = p;
         }
-        bool w;
+        ws.setLength(0);
         foreach_reverse (c; chain[0 .. nchain])
             foreach (n; segStart[c] .. segEnd(c))
             {
                 const i = &ins[n];
-                if (i.d == base)
-                    w = false;
-                if (i.op == LOp.ld && i.a == base && !i.b && !i.sym || i.op == LOp.st && i.b == base && !i.c && !i.sym)
-                    w = true;
+                // a call may release memory gone through before it
+                if (i.d == base || i.op == LOp.call)
+                    ws.setLength(0);
+                const w = witnessOf(*i);
+                if (w.base == base)
+                    ws.push(w);
             }
-        return w;
+        return witnessCovers(ws[], base, off, size);
     }
     // the instructions changed, so that a loop enclosing one done does not change them again
     done[][] = false;
@@ -7789,7 +7824,7 @@ private void promoteLoopMemory()
                  * branch past the loop, when only a variable is sure to be there
                  */
                 bool safe = f.kind == Footprint.Kind.frame || f.kind == Footprint.Kind.global ||
-                    witnessed(pre, l.a);
+                    witnessed(pre, l.a, l.imm, l.sz);
                 if (!safe && !skips)
                     foreach (m; segStart[lp.header] .. segEnd(lp.header))
                     {
@@ -13857,7 +13892,51 @@ private bool hoistInvariants()
     foreach (ref i; ins[])
         if (i.op == LOp.vqg && !isPhys(i.a))
             vecConst[i.a - firstVreg] = true;
-    Barray!Reg witnessed;       // the base registers the preheader loads through
+    Barray!Witness witnessed;   // what the preheader loads or stores through base registers
+    scope (exit) witnessed.dtor();
+    // the segments that call, as a call may release memory gone through before it
+    Barray!bool segCalls, region;
+    Barray!uint regionWork, regionSegs;
+    scope (exit) { segCalls.dtor(); region.dtor(); regionWork.dtor(); regionSegs.dtor(); }
+    segCalls.setLength(ns);
+    segCalls[][] = false;
+    region.setLength(ns);
+    region[][] = false;
+    foreach (si; 0 .. ns)
+        foreach (n; segStart[si] .. segEnd(si))
+            segCalls[si] |= ins[n].op == LOp.call;
+    /* Whether no call is on a way from the end of d to the end pend of pre, which d
+     * dominates
+     */
+    bool noCallBetween(uint d, uint pre, uint pend)
+    {
+        foreach (v; regionSegs[])
+            region[v] = false;
+        regionSegs.setLength(0);
+        foreach (n; segStart[pre] .. pend)
+            if (ins[n].op == LOp.call)
+                return false;
+        regionWork.setLength(0);
+        regionWork.push(pre);
+        region[pre] = true;
+        regionSegs.push(pre);
+        while (regionWork.length)
+        {
+            const v = regionWork[regionWork.length - 1];
+            regionWork.setLength(regionWork.length - 1);
+            foreach (p; preds[predStart[v] .. predStart[v + 1]])
+            {
+                if (p == d || region[p])
+                    continue;
+                if (segCalls[p] || regionSegs.length == 256)
+                    return false;
+                region[p] = true;
+                regionSegs.push(p);
+                regionWork.push(p);
+            }
+        }
+        return true;
+    }
     bool any;
     foreach (ref lp; loops[])
     {
@@ -13950,39 +14029,39 @@ private bool hoistInvariants()
         foreach (n; segStart[c] .. (c == pre ? pend : segEnd(c)))
         {
             LIns* i = &ins[n];
+            if (i.op == LOp.call)
+                witnessed.setLength(0);
             if (i.d && !isPhys(i.d))
             {
                 // a base redefined after its load or store is not the one gone through
                 size_t k = 0;
-                foreach (r; witnessed[])
-                    if (r != i.d)
-                        witnessed[k++] = r;
+                foreach (w; witnessed[])
+                    if (w.base != i.d)
+                        witnessed[k++] = w;
                 witnessed.setLength(k);
             }
-            if (i.op == LOp.ld && i.a && !isPhys(i.a) && !i.b && !i.sym)
-                witnessed.push(i.a);
-            if (i.op == LOp.st && i.b && !isPhys(i.b) && !i.c && !i.sym)
-                witnessed.push(i.b);
+            const w = witnessOf(*i);
+            if (w.base)
+                witnessed.push(w);
         }
         /* A base register defined once outside any loop holds the same address from its
          * definition on, so it is gone through too by a load or store after that definition
-         * in a segment dominating the preheader
+         * in a segment dominating the preheader, with no call after it on the way there
          */
         {
             uint d = pre;
             foreach (up; 0 .. 16)
             {
-                if (d == uint.max || inLoop[d])
+                if (d == uint.max || inLoop[d] || d != pre && !noCallBetween(d, pre, pend))
                     break;
-                foreach (n; segStart[d] .. segEnd(d))
+                foreach_reverse (n; segStart[d] .. (d == pre ? pend : segEnd(d)))
                 {
                     const i = &ins[n];
-                    Reg r;
-                    if (i.op == LOp.ld && !i.b && !i.sym)
-                        r = i.a;
-                    else if (i.op == LOp.st && !i.c && !i.sym)
-                        r = i.b;
-                    if (!r || isPhys(r) || ndefs[r - firstVreg] != 1)
+                    if (i.op == LOp.call)
+                        break;
+                    const w = witnessOf(*i);
+                    const r = w.base;
+                    if (!r || ndefs[r - firstVreg] != 1)
                         continue;
                     const def = memDef[r - firstVreg];
                     if (def == uint.max || inAnyLoop[segOf[def]])
@@ -14000,7 +14079,7 @@ private bool hoistInvariants()
                             }
                         }
                     if (dom)
-                        witnessed.push(r);
+                        witnessed.push(w);
                 }
                 if (d == 0)
                     break;
@@ -14019,8 +14098,7 @@ private bool hoistInvariants()
                     return false;
             bool ok = f.kind == Footprint.Kind.frame || f.kind == Footprint.Kind.global;
             if (!ok && !i.sym && i.a)
-                foreach (r; witnessed[])
-                    ok |= r == i.a;
+                ok = witnessCovers(witnessed[], i.a, i.imm, i.sz);
             return ok;
         }
 
@@ -14138,7 +14216,7 @@ private bool hoistInvariants()
     foreach (ref lp; loops[])
         mem_free(lp.body.ptr);
     loops.dtor(); inLoop.dtor(); defInLoop.dtor(); moveTo.dtor(); segOf.dtor(); ndefs.dtor();
-    preds.dtor(); predStart.dtor(); inAnyLoop.dtor(); witnessed.dtor();
+    preds.dtor(); predStart.dtor(); inAnyLoop.dtor();
     return again;
 }
 
