@@ -3942,6 +3942,24 @@ private void genMemOp(elem* e)
         fillLoop(s, v8, n);
         return;
     }
+    if (esize == 2)
+    {
+        // the element repeated in 8 bytes, stored over the bytes of the count of elements
+        Reg s = gen(e.E1);
+        Reg n = newVreg(RC.gp, 8);
+        emitIns(LOp.lsli, 8, n, gen(enumbytes), noReg, 1);
+        Reg v = extendFrom(asClass(gen(evalue), RC.gp, 2), 16, false, 8);
+        foreach (shift; 4 .. 6)
+        {
+            Reg w = newVreg(RC.gp, 8);
+            auto i = emitIns(LOp.orr, 8, w, v, v, 1 << shift);     // 16, then 32
+            i.flags |= F.shifted;
+            i.cond = 0;         // LSL
+            v = w;
+        }
+        fillLoop(s, v, n, 2);
+        return;
+    }
     if (esize != 1)
     {
         fail("memset of elements");
@@ -3998,16 +4016,16 @@ private void copyLoop(Reg d, Reg s, Reg n)
 /* Store the byte repeated in v8 at s .. s + n
  */
 @trusted
-private void fillLoop(Reg s, Reg v8, Reg n)
+private void fillLoop(Reg s, Reg v8, Reg n, uint unit = 1)
 {
-    blockLoop(s, noReg, v8, n);
+    blockLoop(s, noReg, v8, n, unit);
 }
 
 /* Copy n bytes from src to dst, or with src noReg store v8 to them: 8 bytes at a
- * time while there are 8, then 4, then 1
+ * time while there are 8, then 4, then 1, or with unit 2, n even, the 2 left
  */
 @trusted
-private void blockLoop(Reg dst, Reg src, Reg v8, Reg n)
+private void blockLoop(Reg dst, Reg src, Reg v8, Reg n, uint unit = 1)
 {
     const lend = newLabel();
     const l4 = newLabel();
@@ -4055,6 +4073,13 @@ private void blockLoop(Reg dst, Reg src, Reg v8, Reg n)
     placeLabel(l1t);
     emitIns(LOp.cmp, 8, noReg, n, i);
     jumpTo(lend, COND.eq);
+    if (unit == 2)
+    {
+        step(2);
+        placeLabel(l1);
+        placeLabel(lend);
+        return;
+    }
     placeLabel(l1);
     step(1);
     emitIns(LOp.cmp, 8, noReg, n, i);
