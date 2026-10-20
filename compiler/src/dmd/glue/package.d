@@ -1051,6 +1051,19 @@ void FuncDeclaration_toObjFile(FuncDeclaration fd, bool multiobj)
 
     bx.curblock.bc = BC.ret;
 
+    /* The flag el_ctor_dtor() makes for a temporary destroyed if an exception
+     * leaves its construction is read by the landing pad also where a ?: or &&
+     * did not construct it, so it starts out clear
+     */
+    if (config.ehmethod == EHmethod.EH_DWARF)
+        foreach (sf; f.Flocsym[])
+            if (sf.Sclass == SC.auto_ && strcmp(sf.Sident.ptr, "__flag") == 0 &&
+                tybasic(sf.Stype.Tty) == TYbool && sf.Stype.Tty & mTYvolatile)
+            {
+                elem* e0 = el_bin(OPeq, TYvoid, el_var(sf), el_long(TYbool, 0));
+                bx.startblock.Belem = el_combine(e0, bx.startblock.Belem);
+            }
+
     f.Fstartblock = bx.startblock;
 //  einit = el_combine(einit,bx.init);
 
