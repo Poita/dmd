@@ -113,9 +113,16 @@ class Compiler:
         logpath = os.path.join(wdir, "time.log")
         flags = MODE_FLAGS[(self.kind, mode)] + self.serial
         script = f"""#!/usr/bin/env python3
-import os, re, sys
+import os, re, shlex, sys
 drop = re.compile({DROPPED_FLAG.pattern!r})
-args = [a for a in sys.argv[1:] if not drop.match(a)]
+args = []
+for a in sys.argv[1:]:
+    # dub passes the flags in a response file
+    if a.startswith("@") and os.path.isfile(a[1:]):
+        args += shlex.split(open(a[1:]).read())
+    else:
+        args.append(a)
+args = [a for a in args if not drop.match(a)]
 # only a compiling invocation gets the mode's flags; a version query stays as it is
 if not any(a in ("--version", "-v", "--help", "-h") for a in args):
     args = {flags!r} + args
@@ -328,15 +335,25 @@ def item_whiteout(args, comp, mode, work):
     wo = os.path.join(work, "whiteout")
     os.makedirs(wo)
     src = args.whiteout
+    # the sources and build files are copied, the large data the run reads is linked,
+    # and what earlier builds left is skipped
     for n in os.listdir(src):
         p = os.path.join(src, n)
-        if n in ("source", "dub.sdl", "dub.selections.json"):
-            (shutil.copytree if os.path.isdir(p) else shutil.copy)(p, os.path.join(wo, n))
-        elif n in ("data", "assets", "shaders"):
+        if n in ("data", "assets", "shaders", "docs", "harness") or n.endswith(".dylib"):
             os.symlink(p, os.path.join(wo, n))
+        elif n.startswith(".") or n.endswith(".app"):
+            continue
+        elif os.path.isdir(p):
+            copy_tree(p, os.path.join(wo, n))
+        elif os.path.isfile(p):
+            with open(p, "rb") as f:
+                if f.read(8).startswith(MACHO):
+                    continue
+            shutil.copy(p, os.path.join(wo, n))
     cy = os.path.join(os.path.dirname(os.path.abspath(src)), "cydonia")
+    # with its .git, a file naming the checkout, for the build's check of the pinned revision
     shutil.copytree(cy, os.path.join(work, "cydonia"), symlinks=True,
-                    ignore=shutil.ignore_patterns(".dub", ".git", "*.o", "*.a"))
+                    ignore=shutil.ignore_patterns(".dub", "*.o", "*.a"))
     home = dub_home_with(work, "dubhome", {p: None for p in WHITEOUT_PACKAGES})
     wdir, tlog = comp.wrapper(mode, work)
     env = dict(os.environ, DUB_HOME=home)
