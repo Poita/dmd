@@ -220,6 +220,40 @@ pragma(inline, false) int globalInLoop(int* p, int n)
     return sum;
 }
 
+pragma(inline, false) int dominatedTrap(S* s, int* q, bool b)
+{
+    int r = s.y;
+    if (b)
+        *q = 9;
+    else
+        r += 1;
+    return r + s.y;
+}
+
+pragma(inline, false) int dominatedCall(S* s, bool b)
+{
+    const r = s.x;
+    if (b)
+        writeThrough(&s.x);
+    return r + s.x;
+}
+
+pragma(inline, false) int dominatedLoop(S* s, int* q, int n)
+{
+    const r = s.y;
+    foreach (i; 0 .. n)
+        q[i & 1] = i;
+    return r + s.y;
+}
+
+pragma(inline, false) int dominatedStore(S* s, int* q, bool b, int v)
+{
+    s.y = v;
+    if (b)
+        *q = 1;
+    return s.y;
+}
+
 void main()
 {
     int a;
@@ -276,4 +310,17 @@ void main()
     G = 7;
     int other;
     check(globalInLoop(&other, 3) == 21);
+
+    s = S.init;
+    s.y = 2;
+    check(dominatedTrap(&s, &s.y, true) == 11);
+    s.y = 2;
+    check(dominatedTrap(&s, &s.y, false) == 5);
+    check(dominatedTrap(&s, &s.x, true) == 4);
+    s.x = 1;
+    check(dominatedCall(&s, true) == 4);
+    s.y = 5;
+    check(dominatedLoop(&s, &s.x, 2) == 6);
+    check(dominatedStore(&s, &s.y, true, 7) == 1);
+    check(dominatedStore(&s, &s.x, true, 7) == 7);
 }
