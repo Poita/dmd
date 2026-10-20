@@ -5320,16 +5320,18 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
     }
 
     /* An aggregate argument the optimizer replaced with a plain value gets its
-     * type back from the prototype, as cdfunc() does, as that decides how it is passed
+     * type back from the prototype, as cdfunc() does, as that decides how it is passed.
+     * The declared parameters come first among the arguments, in the order of the
+     * declaration for a function taking them left to right, else reversed.
      */
     if (e.E1.Eoper == OPvar && tyfunc(e.E1.Vsym.Stype.Tty) &&
         e.E1.Vsym.Stype.Tparamtypes && !variadic(e.E1.Vsym.Stype))
     {
-        foreach (i, ref pt; (*e.E1.Vsym.Stype.Tparamtypes)[])
+        auto ptypes = (*e.E1.Vsym.Stype.Tparamtypes)[];
+        const leftToRight = tyrevfunc(e.E1.Vsym.Stype.Tty) != 0;
+        foreach (i, ref pt; ptypes.length <= np ? ptypes : null)
         {
-            if (i >= np)
-                break;
-            elem* ep = params[i].e;
+            elem* ep = params[leftToRight ? i : ptypes.length - 1 - i].e;
             type* t = pt.Ptype;
             if (!ep.ET && t && tyaggregate(t.Tty) && !tyaggregate(ep.Ety) &&
                 tysize(ep.Ety) >= type_size(t))

@@ -2442,16 +2442,17 @@ void cdfunc(ref CGstate cg, ref CodeBuilder cdb, elem* e, ref regm_t pretregs)
 
     /* An aggregate argument the optimizer replaced with a plain value (a constant,
      * a copy) gets its type back from the prototype, as that decides how it is passed.
-     * The declared parameters come first among the arguments.
+     * The declared parameters come first among the arguments, in the order of the
+     * declaration for a function taking them left to right, else reversed.
      */
     if (e.E1.Eoper == OPvar && tyfunc(e.E1.Vsym.Stype.Tty) &&
         e.E1.Vsym.Stype.Tparamtypes && !variadic(e.E1.Vsym.Stype))
     {
-        foreach (i, ref pt; (*e.E1.Vsym.Stype.Tparamtypes)[])
+        auto ptypes = (*e.E1.Vsym.Stype.Tparamtypes)[];
+        const leftToRight = tyrevfunc(e.E1.Vsym.Stype.Tty) != 0;
+        foreach (i, ref pt; ptypes.length <= np ? ptypes : null)
         {
-            if (i >= np)
-                break;
-            elem* ep = parameters[i].e;
+            elem* ep = parameters[leftToRight ? i : ptypes.length - 1 - i].e;
             type* t = pt.Ptype;
             if (!ep.ET && t && tyaggregate(t.Tty) && !tyaggregate(ep.Ety) &&
                 _tysize[tybasic(ep.Ety)] >= type_size(t))
