@@ -105,6 +105,9 @@ struct Symbol
     SYMFLGS Sflags;             // flag bits (SFLxxxx)
 
     bool SpregLost;             // fastpar, not a register variable: accessed in memory rather than its register
+    DbgLoc SdbgLoc;             // FL.reg: where debug info locates the variable
+    reg_t SdbgReg;              // DbgLoc.other: the register holding it
+    Symbol* SdbgSlot;           // DbgLoc.slot: the stack slot holding it
     vec_t       Srange;         // live range, if any
     vec_t       Slvreg;         // when symbol is in register
     targ_size_t Ssize;          // tyfunc: size of function
@@ -145,6 +148,15 @@ struct Symbol
      */
     char[1] Sident;
 
+}
+
+/// Where debug info locates a register variable
+enum DbgLoc : ubyte
+{
+    reg,        // the register Sreglsw
+    other,      // the register SdbgReg
+    slot,       // the stack slot SdbgSlot
+    none,       // nowhere throughout its life, so optimized out
 }
 
 @nogc

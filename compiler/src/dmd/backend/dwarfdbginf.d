@@ -2186,12 +2186,22 @@ static if (1)
                         debug_info.buf.writeuLEB128(sa.lposscopestart.Scharnum);    // DW_AT_decl_column
                         soffset = cast(uint)debug_info.buf.length();
                         debug_info.buf.writeByte(2);                  // DW_FORM_block1
-                        if (sa.Sfl == FL.reg || sa.Sclass == SC.pseudo)
+                        if (sa.Sfl == FL.reg && sa.SdbgLoc == DbgLoc.none)
+                        {
+                            // an empty location: optimized out
+                        }
+                        else if (sa.Sfl == FL.reg && sa.SdbgLoc == DbgLoc.slot)
+                        {
+                            debug_info.buf.writeByte(DW_OP_fbreg);
+                            const paraBias = config.target_cpu == TARGET_AArch64 ? 0 : cgstate.Para.size;
+                            debug_info.buf.writesLEB128(cast(int)(cgstate.Auto.size + cgstate.BPoff - paraBias + sa.SdbgSlot.Soffset));
+                        }
+                        else if (sa.Sfl == FL.reg || sa.Sclass == SC.pseudo)
                         {
                             // BUG: register pairs not supported in Dwarf?
                             if (config.target_cpu == TARGET_AArch64)
                             {
-                                const dwreg = dwarf_regno(sa.Sreglsw);
+                                const dwreg = dwarf_regno(sa.Sfl == FL.reg && sa.SdbgLoc == DbgLoc.other ? sa.SdbgReg : sa.Sreglsw);
                                 if (dwreg < 32)
                                     debug_info.buf.writeByte(cast(ubyte)(DW_OP_reg0 + dwreg));
                                 else

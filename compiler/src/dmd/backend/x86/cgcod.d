@@ -104,6 +104,8 @@ void codgenx(ref CGstate cg, Symbol* sfunc)
     const tryLir = config.target_cpu == TARGET_AArch64 && config.flags4 & CFG4optimized;
     if (!tryLir)
         cgreg_init();
+    foreach (s; globsym[])
+        s.SdbgLoc = DbgLoc.reg;     // where Sreglsw says, unless the code generator finds otherwise
     CSE.initialize();
 
     cg.Alloca.initialize();
