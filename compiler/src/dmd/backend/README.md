@@ -27,6 +27,7 @@ Optimisations
 * **go.d**            global optimizer main loop
 * **goh.d**           global optimizer declarations
 * **gother.d**        other global optimizations
+* **grange.d**        removal of conditions, such as bounds checks, that known relations prove
 * **gsroa.d**         SROA structured replacement of aggregate optimization
 * **evalu8.d**        constant folding
 * **divcoeff.d**      convert divisions to multiplications
