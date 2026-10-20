@@ -1219,19 +1219,6 @@ void stackoffsets(ref CGstate cg, ref symtab_t symtab, bool estimate)
 
     bool osx_aarch64 = (config.exe & EX_OSX64 && config.target_cpu == TARGET_AArch64);
 
-    bool isVariadic = variadic(funcsym_p.Stype);
-
-    Symbol* lastParam;  // if variadic function, this is index of last parameter that goes on stack
-    if (osx_aarch64 && isVariadic)
-    {
-        foreach (s; symtab[])
-        {
-            if (s.Sclass == SC.parameter)
-                lastParam = s;
-        }
-    }
-    //if (lastParam) printf("lastParam: %s\n", lastParam.Sident.ptr);
-
     // Set if doing optimization of auto layout
     bool doAutoOpt = estimate && config.flags4 & CFG4optimized;
 
@@ -1355,9 +1342,8 @@ void stackoffsets(ref CGstate cg, ref symtab_t symtab, bool estimate)
                 {
                     /* Alignment on OSX64 AArch64 is the same as for struct fields, except
                      * for aggregates other than HFAs, which take 8 byte aligned slots of a
-                     * multiple of 8 bytes.
-                     * If it is a variadic function, the last parameter (lastPar) is aligned on 8 bytes.
-                     * Match behavior in backend.arm.cod1.cdfunc()
+                     * multiple of 8 bytes, also for the last named parameter of a variadic
+                     * function. Match behavior in backend.arm.cod1.cdfunc()
                      */
                     if (tyaggregate(s.ty()))
                     {
@@ -1366,10 +1352,7 @@ void stackoffsets(ref CGstate cg, ref symtab_t symtab, bool estimate)
                         aarch64StackAggregate(s.Stype, slot, alignsize);
                         paramSlot = slot;
                     }
-                    if (s is lastParam)
-                        cg.Para.offset = _align(REGSIZE,cg.Para.offset); /* align on register size */
-                    else
-                        cg.Para.offset = (cg.Para.offset + (alignsize - 1)) & ~(alignsize - 1);
+                    cg.Para.offset = (cg.Para.offset + (alignsize - 1)) & ~(alignsize - 1);
                 }
                 else if (alignsize >= 16 &&
                          (I64 || (config.exe == EX_OSX &&
