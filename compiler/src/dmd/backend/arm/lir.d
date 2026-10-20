@@ -2605,12 +2605,6 @@ private COND compare(elem* e)
 
         if (pairType(ty))
         {
-            // equal if both halves are: CMP of the low halves, then CCMP of the high ones if equal
-            if (c != eq && c != ne)
-            {
-                fail("pair ordering");
-                return c;
-            }
             Pair a = genPair(e1);
             if (el_sideeffect(e2))
             {
@@ -2620,6 +2614,29 @@ private COND compare(elem* e)
                 emitIns(LOp.copy, 8, t.hi, a.hi);
                 a = t;
             }
+            if (c != eq && c != ne)
+            {
+                /* ordered as the high halves are if they differ, else as the low halves
+                 * are, unsigned:
+                 * CMP lo,lo; CSET t,lo cond; CMP hi,hi; CSET u,hi cond; CSEL r,t,u,EQ; CMP r,#0
+                 */
+                Pair b = genPair(e2);
+                const op = e.Eoper;
+                const COND clo = op == OPlt ? COND.cc : op == OPle ? COND.ls : op == OPgt ? COND.hi : COND.cs;
+                const bool less = op == OPlt || op == OPle;
+                const COND chi = i == 1 ? (less ? COND.cc : COND.hi) : (less ? COND.lt : COND.gt);
+                emitIns(LOp.cmp, 8, noReg, a.lo, b.lo);
+                Reg t = newVreg(RC.gp, 4);
+                emitIns(LOp.cset, 4, t).cond = clo;
+                emitIns(LOp.cmp, 8, noReg, a.hi, b.hi);
+                Reg u = newVreg(RC.gp, 4);
+                emitIns(LOp.cset, 4, u).cond = chi;
+                Reg r = newVreg(RC.gp, 4);
+                emitIns(LOp.csel, 4, r, t, u).cond = eq;
+                emitIns(LOp.cmpi, 4, noReg, r, noReg, 0);
+                return ne;
+            }
+            // equal if both halves are: CMP of the low halves, then CCMP of the high ones if equal
             Pair b = genPair(e2);
             emitIns(LOp.cmp, 8, noReg, a.lo, b.lo);
             auto cc = emitIns(LOp.ccmp, 8, noReg, a.hi, b.hi);
@@ -5031,6 +5048,17 @@ private Reg genx(elem* e)
                     i.cond = c;
                     return d;
                 }
+            }
+            if (pairType(e1.Ety))
+            {
+                // a slice or delegate is nonzero if either half is
+                Pair p = genPair(e1);
+                Reg o = newVreg(RC.gp, 8);
+                emitIns(LOp.orr, 8, o, p.lo, p.hi);
+                emitIns(LOp.cmpi, 8, noReg, o, noReg, 0);
+                Reg d = newVreg(RC.gp, sz);
+                emitIns(LOp.cset, 4, d).cond = op == OPnot ? COND.eq : COND.ne;
+                return d;
             }
             Reg a = gen(e1);
             if (tyfloating(e1.Ety))
