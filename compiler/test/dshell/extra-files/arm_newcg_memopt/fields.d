@@ -30,6 +30,15 @@ pragma(inline, false) int optReuse(S* s)
     return s.y * 2 + s.x;
 }
 
+// s.x is the same on every iteration, as the loop stores only s.y
+pragma(inline, false) int optHoist(S* s, int n)
+{
+    s.y = 0;
+    foreach (i; 0 .. n)
+        s.y += s.x * i;
+    return s.y;
+}
+
 // the long is read back from the store made of it
 pragma(inline, false) long optForwardLong(S* s, long v, int w)
 {
@@ -44,5 +53,7 @@ void main()
     check(optForward(&s, 1.5f) == 3.0f && s.x == 4);
     s.y = 5;
     check(optReuse(&s) == 16);
+    s.x = 3;
+    check(optHoist(&s, 4) == 18);
     check(optForwardLong(&s, 1L << 40, -2) == (1L << 40) - 2);
 }

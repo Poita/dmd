@@ -13331,6 +13331,10 @@ private bool hoistInvariants()
     Barray!uint predStart, preds;
     Barray!Loop loops;
     findLoops(predStart, preds, loops);
+    analyzeMemory();
+    const precise = !env!"DMD_NEWCG_NOMEMOPT";
+    Barray!Footprint loopStores;    // what the loop's stores and calls may reach
+    scope (exit) loopStores.dtor();
     Barray!bool inLoop;
     inLoop.setLength(ns);
     // the segments in loops
@@ -13430,40 +13434,71 @@ private bool hoistInvariants()
                 defInLoop[i.d - firstVreg] = true;
         }
 
-        /* A load can be moved if the loop writes no memory, and the preheader loads
-         * through the same base register, so the memory is there: what it reads is
-         * a field of what is already read
+        /* A load can be moved if nothing the loop writes may reach its memory, and
+         * that memory is there: a variable, or what the preheader loads through the
+         * same base register, so that what it reads is a field of what is already read
          */
-        bool loopWrites;
+        bool loopWrites, loopBarrier;
+        loopStores.setLength(0);
         foreach (v; lp.body)
             foreach (n; segStart[v] .. segEnd(v))
-                loopWrites |= writesMemory(ins[n]);
-        witnessed.setLength(0);
-        if (!loopWrites)
-            foreach (n; segStart[pre] .. pend)
-            {
-                LIns* i = &ins[n];
-                if (i.d && !isPhys(i.d))
+                if (writesMemory(ins[n]))
                 {
-                    // a base redefined after its load is not the one loaded through
-                    size_t k = 0;
-                    foreach (r; witnessed[])
-                        if (r != i.d)
-                            witnessed[k++] = r;
-                    witnessed.setLength(k);
+                    loopWrites = true;
+                    loopBarrier |= memoryBarrier(ins[n]);
+                    loopStores.push(footprint(ins[n]));
                 }
-                if (i.op == LOp.ld && i.a && !isPhys(i.a) && !i.b && !i.sym)
-                    witnessed.push(i.a);
+        witnessed.setLength(0);
+        // the preheader and the segments before it each entered only from the one before
+        uint[8] chain;
+        uint nchain = 1;
+        chain[0] = pre;
+        while (nchain < chain.length)
+        {
+            const c = chain[nchain - 1];
+            if (predStart[c + 1] - predStart[c] != 1)
+                break;
+            const p = preds[predStart[c]];
+            bool seen;
+            foreach (x; chain[0 .. nchain])
+                seen |= x == p;
+            if (seen || inLoop[p])
+                break;
+            chain[nchain++] = p;
+        }
+        foreach_reverse (c; chain[0 .. nchain])
+        foreach (n; segStart[c] .. (c == pre ? pend : segEnd(c)))
+        {
+            LIns* i = &ins[n];
+            if (i.d && !isPhys(i.d))
+            {
+                // a base redefined after its load or store is not the one gone through
+                size_t k = 0;
+                foreach (r; witnessed[])
+                    if (r != i.d)
+                        witnessed[k++] = r;
+                witnessed.setLength(k);
             }
+            if (i.op == LOp.ld && i.a && !isPhys(i.a) && !i.b && !i.sym)
+                witnessed.push(i.a);
+            if (i.op == LOp.st && i.b && !isPhys(i.b) && !i.c && !i.sym)
+                witnessed.push(i.b);
+        }
         bool movableLoad(ref const LIns i)
         {
-            if (i.op != LOp.ld || loopWrites || viaDominator || i.flags & (F.volatile_ | F.condDef) || i.b ||
-                i.sym || !i.a)
+            if (i.op != LOp.ld || viaDominator || i.flags & (F.volatile_ | F.condDef) || i.b ||
+                loopWrites && (!precise || loopBarrier))
                 return false;
-            foreach (r; witnessed[])
-                if (r == i.a)
-                    return true;
-            return false;
+            // the base register is the same throughout the loop when the load is moved
+            const f = footprint(i);
+            foreach (ref w; loopStores[])
+                if (mayAlias(w, f))
+                    return false;
+            bool ok = f.kind == Footprint.Kind.frame || f.kind == Footprint.Kind.global;
+            if (!ok && !i.sym && i.a)
+                foreach (r; witnessed[])
+                    ok |= r == i.a;
+            return ok;
         }
 
         bool progress = true;
@@ -13489,6 +13524,8 @@ private bool hoistInvariants()
                     if (!inv)
                         continue;
                     moveTo[n] = at;
+                    if (i.op == LOp.ld && loopWrites && env!"DMD_NEWCG_MEMOPT")
+                        fprintf(stderr, "newcg-memopt: hoist %s\n", funcsym_p.Sident.ptr);
                     if (env!"DMD_NEWCG_LICM")
                     {
                         fprintf(stderr, "newcg-licm:   hoist %d %s %%%d <- %%%d to %d; body", cast(int)n, lopName(i.op),
