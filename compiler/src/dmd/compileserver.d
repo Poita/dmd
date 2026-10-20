@@ -52,6 +52,7 @@ import dmd.astenums : FileType;
 import dmd.dimport : Import;
 import dmd.dmodule;
 import dmd.dsymbol;
+import dmd.file_manager : PathProbe;
 import dmd.globals;
 import dmd.location : Loc;
 import dmd.root.array;
@@ -121,6 +122,8 @@ struct Stamp
     long mtime, mtimeNsec, ctime, ctimeNsec;
 }
 __gshared Array!Stamp stamps;
+// in a server: the paths looked up for the imported modules, each once
+__gshared PathProbe[] probes;
 
 public:
 
@@ -178,7 +181,11 @@ bool start(const(char)[][] argv, ref Param params, out int status)
         import dmd.dsymbolsem : onImport;
         onImport = &noteImport;
         if (role == Role.server)
+        {
+            // a file that would now be found first for an import makes the server stale
+            global.fileManager.recordProbes();
             return false;
+        }
 
         if (verify)
             return verifyRequest(status);
@@ -906,6 +913,13 @@ bool stampFiles(ref Modules roots)
             return false;
         stamps.push(s);
     }
+    bool[const(char)[]] seen;
+    foreach (ref p; global.fileManager.probedPaths())
+        if (p.path !in seen)
+        {
+            seen[p.path] = true;
+            probes ~= p;
+        }
     return true;
 }
 
@@ -934,7 +948,8 @@ bool stampOf(ref Stamp s)
     return true;
 }
 
-/// The first file read that has changed since, or null
+/// The first file read that has changed since, or a path looked up for an import that
+/// has appeared, gone or changed between file and directory since; null if none
 const(char)[] changedFile()
 {
     foreach (ref s; stamps)
@@ -943,6 +958,9 @@ const(char)[] changedFile()
         if (!stampOf(now) || now != s)
             return s.name;
     }
+    foreach (ref p; probes)
+        if (FileName.exists(p.path) != p.exists)
+            return p.path;
     return null;
 }
 

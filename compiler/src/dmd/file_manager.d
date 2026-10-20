@@ -75,6 +75,14 @@ private struct PathStack
  * Cache path lookups so the operating system
  * is only consulted once for each path.
  */
+/// A path looked up while looking for a source file, with what `FileName.exists`
+/// gave for it
+struct PathProbe
+{
+    const(char)[] path;
+    int exists;
+}
+
 private struct PathCache
 {
     /* for filespec "a/b/c/d.ext"
@@ -82,8 +90,19 @@ private struct PathCache
      */
 
     StringTable!(bool) pathStatus;      // cached value of does a path exist or not
+    bool recording;                     // whether the paths looked up are recorded
+    PathProbe[] probes;                 // the paths looked up while recording
 
   nothrow:
+
+    /// Returns: `FileName.exists(path)`, recording it when recording
+    int exists(const(char)[] path)
+    {
+        const r = FileName.exists(path);
+        if (recording)
+            probes ~= PathProbe(path.idup, r);
+        return r;
+    }
 
     /**
      * Determine if the path part of path/filename exists.
@@ -118,7 +137,7 @@ private struct PathCache
             if (!exists)
                 pathStatus.insert(st.cur, false);
             else
-                exists = pathStatus.insert(st.cur, FileName.exists(st.cur) == 2).value;
+                exists = pathStatus.insert(st.cur, this.exists(st.cur) == 2).value;
         }
 
         return exists;
@@ -136,7 +155,7 @@ private struct PathCache
     {
         auto cached = pathStatus.lookup(path);
         if (!cached)
-            cached = pathStatus.insert(path, FileName.exists(path) == 2);
+            cached = pathStatus.insert(path, exists(path) == 2);
         return cached.value;
     }
 }
@@ -216,7 +235,7 @@ nothrow:
             foreach (ext; extensions)
             {
                 const file = FileName.combine(path, ext);
-                if (FileName.exists(file) == 1)
+                if (pathCache.exists(file) == 1)
                 {
                     import dmd.root.rmem : xarraydup;
                     return checkLocal ? file.xarraydup : file;
@@ -233,12 +252,12 @@ nothrow:
                  * iff filename/package.d is a file
                  */
                 const ni = FileName.combine(n, package_di);
-                if (FileName.exists(ni) == 1)
+                if (pathCache.exists(ni) == 1)
                     return ni;
                 FileName.free(ni.ptr);
 
                 const nd = FileName.combine(n, package_d);
-                if (FileName.exists(nd) == 1)
+                if (pathCache.exists(nd) == 1)
                     return nd;
                 FileName.free(nd.ptr);
             }
@@ -248,7 +267,7 @@ nothrow:
             foreach (ext; importCextensions)
             {
                 const file = FileName.combine(path, ext);
-                if (FileName.exists(file) == 1)
+                if (pathCache.exists(file) == 1)
                 {
                     import dmd.root.rmem : xarraydup;
                     return checkLocal ? file.xarraydup : file;
@@ -324,6 +343,21 @@ nothrow:
     void forgetPaths()
     {
         pathCache.pathStatus.reset();
+    }
+
+    /**
+     * Records from now on each path looked up while looking for a source file, with
+     * whether it existed and was a file or a directory.
+     */
+    void recordProbes()
+    {
+        pathCache.recording = true;
+    }
+
+    /// Returns: the paths recorded since `recordProbes`, each once
+    const(PathProbe)[] probedPaths()
+    {
+        return pathCache.probes;
     }
 
     /**

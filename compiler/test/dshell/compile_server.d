@@ -128,13 +128,21 @@ int main()
     expectOutput("app2 2 6 10 b2");
     assert(logs.count("served 0") == 2, logs);
 
+    // a file that now comes first in the lookup of an imported module, here an
+    // interface file beside it, is not compiled by the stale server
+    std.file.write(src ~ "/imp/lib.di", readText(src ~ "/imp/lib.d").replace("return 2;", "return 5;"));
+    expectOutput("app2 5 6 10 b2");
+    assert(logs.count("stale") == 2, logs);
+    waitForServer(3);
+
     // a root module named like a package of its imports is parsed before them, so no
     // server starts for it
     const pkgroot = "$DMD -m$MODEL -c -I" ~ src ~ "/imp -of" ~ OUTPUT_BASE ~ "/pkgroot.o " ~ src ~ "/pkgroot.d";
+    const readyBefore = logs.count("ready ");
     run(pkgroot);
     run(pkgroot);
     const deadline = MonoTime.currTime + 5.seconds;
-    while (logs.count("ready ") < 3 && MonoTime.currTime < deadline)
+    while (logs.count("ready ") <= readyBefore && MonoTime.currTime < deadline)
         Thread.sleep(20.msecs);
     run(pkgroot);
     return 0;
