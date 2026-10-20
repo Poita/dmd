@@ -3442,6 +3442,16 @@ private AggVal genAgg(elem* e)
                     v.r = av.slots;
                     return v;
                 }
+                // a part within one of the integer registers it is held in, shifted down
+                const psz = e.ET ? type_size(cast(type*)e.ET) : tysize(e.Ety);
+                if (av.abi.kind == AggregateABI.Kind.gpr && e.Voffset % 8 && e.Voffset / 8 < av.abi.nregs &&
+                    psz && e.Voffset % 8 + psz <= 8)
+                {
+                    Reg t = newVreg(RC.gp, 8);
+                    emitIns(LOp.lsri, 8, t, av.slots[cast(size_t)(e.Voffset / 8)], noReg, (e.Voffset % 8) * 8);
+                    v.r[0] = t;
+                    return v;
+                }
                 // the later fields of one held in integer registers, from the register at the offset
                 if (av.abi.kind != AggregateABI.Kind.gpr || e.Voffset % 8 || e.Voffset / 8 >= av.abi.nregs)
                 {
