@@ -5020,11 +5020,19 @@ void prolog_loadparams(ref CGstate cg, ref CodeBuilder cdb, tym_t tyf, bool push
         //assert(refparam);
         if (cg.AArch64)
         {
-            // LDR reg,[X16] where X16 = address of the parameter above the frame
+            /* LDR reg,[X16] where X16 = address of the parameter, above the frame
+             * record and the locals, above just the frame record when the locals
+             * are below the realigned SP, or above the locals from SP when there
+             * is no frame record
+             */
             import dmd.backend.arm.cod3 : genaddimm;
             enum reg_t R16 = 16;
-            assert(cg.hasframe && !cg.enforcealign);
-            genaddimm(cdb, R16, 29, cast(uint)(s.Soffset + localsize + 16));    // ADD X16,BP,#offset
+            if (!cg.hasframe)
+                genaddimm(cdb, R16, INSTR.SP, cast(uint)(s.Soffset + localsize));   // ADD X16,SP,#offset
+            else if (cg.enforcealign)
+                genaddimm(cdb, R16, 29, cast(uint)(s.Soffset + 16));                // ADD X16,BP,#offset
+            else
+                genaddimm(cdb, R16, 29, cast(uint)(s.Soffset + localsize + 16));    // ADD X16,BP,#offset
             void load(reg_t reg, uint size, uint offset)
             {
                 if (reg & 32)
