@@ -173,6 +173,9 @@ struct CGstate
     targ_size_t pushoff;        // offset of saved registers
     bool pushoffuse;            // save/restore registers using pushoff rather than PUSH/POP
 
+    regm_t deadEntryPregs;      // registers passing parameters that are in registers
+                                // only after being assigned, so not loaded by the prolog
+
     bool needframe;             // if true, then need the frame
                                 // pointer (BP for the 8088)
 

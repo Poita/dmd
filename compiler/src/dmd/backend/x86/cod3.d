@@ -4956,6 +4956,10 @@ void prolog_loadparams(ref CGstate cg, ref CodeBuilder cdb, tym_t tyf, bool push
             continue;
         }
 
+        // a parameter whose incoming value is dead
+        if (s.Spregm() & cg.deadEntryPregs)
+            continue;
+
         type* t = s.Stype;
         type* t2 = null;
         if (tybasic(t.Tty) == TYstruct && config.exe != EX_WIN64)
