@@ -325,15 +325,17 @@ def failure_log(text):
     return "\n".join(marks + ["..."] + lines[-30:])
 
 
-def dub_home_with(work, name, packages):
-    """A DUB_HOME holding copies of the given cached packages {name: version or None for all}."""
+def dub_home_with(work, name, packages, native=False):
+    """A DUB_HOME holding copies of the given cached packages {name: version or None for all},
+    with the native libraries built in them if native, else without built files."""
     home = os.path.join(work, name)
     os.makedirs(os.path.join(home, "packages"), exist_ok=True)
     cache = os.path.expanduser("~/.dub/packages")
     for p, v in packages.items():
         src = os.path.join(cache, p, v) if v else os.path.join(cache, p)
         dst = os.path.join(home, "packages", p, v) if v else os.path.join(home, "packages", p)
-        shutil.copytree(src, dst, symlinks=True, ignore=shutil.ignore_patterns(".dub", "*.a", "*.o"))
+        shutil.copytree(src, dst, symlinks=True,
+                        ignore=shutil.ignore_patterns(*((".dub",) if native else (".dub", "*.a", "*.o"))))
     local = os.path.join(cache, "local-packages.json")
     if os.path.exists(local):
         shutil.copy(local, os.path.join(home, "packages"))
@@ -363,7 +365,8 @@ def item_whiteout(args, comp, mode, work):
     # with its .git, a file naming the checkout, for the build's check of the pinned revision
     shutil.copytree(cy, os.path.join(work, "cydonia"), symlinks=True,
                     ignore=shutil.ignore_patterns(".dub", "*.o", "*.a"))
-    home = dub_home_with(work, "dubhome", {p: None for p in WHITEOUT_PACKAGES})
+    # the C libraries of the physics bindings are built by cmake, not measured, and kept
+    home = dub_home_with(work, "dubhome", {p: None for p in WHITEOUT_PACKAGES}, native=True)
     wdir, tlog = comp.wrapper(mode, work)
     env = dict(os.environ, DUB_HOME=home)
     cmd = ["dub", "build", "-b", "plain", "--config=headless", "--skip-registry=all", "--force",
