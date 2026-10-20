@@ -2137,7 +2137,7 @@ public:
          * inlined is optimized again in each caller: past a budget, only
          * functions about as cheap as the call are inlined there
          */
-        bool withinBudget(FuncDeclaration fd)
+        bool withinBudget(FuncDeclaration fd, bool hasThis, bool asStates)
         {
             enum cheapCost = 10;        // cost of a function about as cheap as the call
             enum budget = 500;          // cost a function may inline outside loops
@@ -2150,13 +2150,20 @@ public:
             // can be inlined into it
             if (givenLiteral(e))
                 return true;
-            const cost = inlineCostOf(fd);
+            int cost = inlineCostOf(fd);
             /* on a path that runs rarely, as one ending in a throw, or in a call of a
              * function that never returns, inlining saves next to nothing and only
              * grows the caller
              */
             if (coldDepth || isNoReturn(e.type) || (cost > cheapCost && alwaysThrows(fd)))
                 return cost <= cheapCost;
+            // what is left once the constant arguments are folded, where the whole would not be cheap
+            if (cost > cheapCost && (!loopDepth || tooCostlyOutsideLoops(cost)))
+            {
+                const folded = inlineCostCall(fd, hasThis, asStates, e.arguments);
+                if (folded >= 0 && folded < cost)
+                    cost = folded;
+            }
             if (loopDepth)
             {
                 /* what is too costly outside loops is inlined into loops up to a
@@ -2221,7 +2228,7 @@ public:
                 hasThis = parent == fd.toParent2();
             }
 
-            if (canInline(fd, hasThis, asStates, pass, eSink) && withinBudget(fd) && inlineAllowed(fd, parent, e.loc))
+            if (canInline(fd, hasThis, asStates, pass, eSink) && withinBudget(fd, hasThis, asStates) && inlineAllowed(fd, parent, e.loc))
             {
                 expandInline(e, fd, parent, eret, explicitThis, asStates, propagateNRVO,
                              eresult, sresult, again);

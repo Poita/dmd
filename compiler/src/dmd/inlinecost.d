@@ -100,6 +100,75 @@ int inlineCostFunction(FuncDeclaration fd, bool hasThis, bool statementsToo = fa
 }
 
 /**
+ * Cost of inlining `fd` at a call passing it `arguments`: that of
+ * `inlineCostFunction`, except that of an if statement whose condition the
+ * constant arguments decide only the branch taken counts, for what is left of the
+ * function once those are folded. A parameter the function changes, or whose
+ * address it takes or passes by reference, is not taken to be constant.
+ * Params:
+ *      fd = function to determine cost of
+ *      hasThis = if the caller can access the callee's this pointer
+ *      statementsToo = if the function is inlined as statements
+ *      arguments = the arguments of the call
+ * Returns:
+ *      the cost, or -1 if no constant argument decides anything
+ */
+int inlineCostCall(FuncDeclaration fd, bool hasThis, bool statementsToo, Expressions* arguments)
+{
+    import dmd.expressionsem : calledFunctionType;
+    auto params = fd.parameters;
+    if (!params || !arguments || arguments.length != params.length || !fd.fbody)
+        return -1;
+    auto values = new long[params.length];
+    auto known = new bool[params.length];
+    bool any;
+    foreach (i, p; *params)
+    {
+        if (p.storage_class & (STC.ref_ | STC.out_ | STC.lazy_))
+            continue;
+        auto ie = (*arguments)[i].isIntegerExp();
+        if (!ie || !(p.type.isIntegral() || p.type.isBoolean()))
+            continue;
+        values[i] = ie.getInteger();
+        known[i] = true;
+        any = true;
+    }
+    if (!any)
+        return -1;
+    foreach (v; fd.closureVars)
+        foreach (i, p; *params)
+            if (p == v)
+                known[i] = false;
+
+    scope InlineCostVisitor icv = new InlineCostVisitor(hasThis);
+    icv.gotoReturns = statementsToo;
+    icv.literal = fd.isFuncLiteralDeclaration() !is null;
+    icv.earlyReturns = fd.isNested() || fd.isFuncLiteralDeclaration();
+    icv.params = params;
+    icv.values = values;
+    icv.known = known;
+    // first only find the parameters the body changes
+    icv.findChanges = true;
+    fd.fbody.accept(icv);
+    any = false;
+    foreach (k; known)
+        any |= k;
+    if (!any)
+        return -1;
+    icv.findChanges = false;
+    icv.decided = false;
+    icv.cost = 0;
+    icv.leavesLoops = false;
+    icv.nested = 0;
+    fd.fbody.accept(icv);
+    if (!icv.decided)
+        return -1;
+    if (icv.leavesLoops && tooCostlyOutsideLoops(icv.cost))
+        return COST_MAX;
+    return icv.cost;
+}
+
+/**
  * Indicates if a nested aggregate prevents or not a function to be inlined.
  * It's used to compute the cost but also to avoid a copy of the aggregate
  * while the inliner processes.
@@ -170,6 +239,14 @@ public:
     int cost;           // zero start for subsequent AST
     bool leavesLoops;   // whether a loop is left by break or continue
 
+    // for the cost at a call: the parameters, the constant values the call passes
+    // them, and which of those are known, as the body does not change them
+    VarDeclarations* params;
+    long[] values;
+    bool[] known;
+    bool findChanges;   // whether only parameters the body changes are looked for
+    bool decided;       // whether a condition was decided by the constants
+
     extern (D) this(bool hasThis) scope @safe
     {
         this.hasThis = hasThis;
@@ -182,6 +259,93 @@ public:
         earlyReturns = icv.earlyReturns;
         gotoReturns = icv.gotoReturns;
         literal = icv.literal;
+        params = icv.params;
+        values = icv.values;
+        known = icv.known;
+        findChanges = icv.findChanges;
+    }
+
+    /// Whether the constant arguments decide `e`, giving its value in `v`
+    bool eval(Expression e, out long v)
+    {
+        if (!params || findChanges)
+            return false;
+        if (auto ie = e.isIntegerExp())
+        {
+            v = ie.getInteger();
+            return true;
+        }
+        if (auto ve = e.isVarExp())
+        {
+            foreach (i, p; *params)
+                if (p == ve.var)
+                {
+                    v = values[i];
+                    return known[i];
+                }
+            return false;
+        }
+        long a, b;
+        if (auto ne = e.isNotExp())
+        {
+            if (!eval(ne.e1, a))
+                return false;
+            v = !a;
+            return true;
+        }
+        if (auto ce = e.isCastExp())
+        {
+            if (!ce.to || ce.to.toBasetype().ty != Tbool || !eval(ce.e1, a))
+                return false;
+            v = a != 0;
+            return true;
+        }
+        if (auto le = e.isLogicalExp())
+        {
+            const ka = eval(le.e1, a);
+            const kb = eval(le.e2, b);
+            const and = le.op == EXP.andAnd;
+            // one operand decides it alone
+            if (ka && (a != 0) != and || kb && (b != 0) != and)
+            {
+                v = !and;
+                return true;
+            }
+            if (!ka || !kb)
+                return false;
+            v = and;
+            return true;
+        }
+        auto be = e.isBinExp();
+        if (!be || !(e.isEqualExp() || cast(CmpExp) e))
+            return false;
+        auto t = be.e1.type.toBasetype();
+        if (!(t.isIntegral() || t.isBoolean()) || !eval(be.e1, a) || !eval(be.e2, b))
+            return false;
+        const unsigned = t.isUnsigned();
+        bool lt(long x, long y) { return unsigned ? cast(ulong) x < cast(ulong) y : x < y; }
+        switch (e.op)
+        {
+            case EXP.equal:         v = a == b; break;
+            case EXP.notEqual:      v = a != b; break;
+            case EXP.lessThan:      v = lt(a, b); break;
+            case EXP.lessOrEqual:   v = !lt(b, a); break;
+            case EXP.greaterThan:   v = lt(b, a); break;
+            case EXP.greaterOrEqual: v = !lt(a, b); break;
+            default:                return false;
+        }
+        return true;
+    }
+
+    /// Takes the parameter `e` refers to, if any, as not known
+    void changes(Expression e)
+    {
+        if (!params)
+            return;
+        if (auto ve = e.isVarExp())
+            foreach (i, p; *params)
+                if (p == ve.var)
+                    known[i] = false;
     }
 
     override void visit(Statement s)
@@ -215,6 +379,16 @@ public:
                     ifs.ifbody &&
                     ifs.ifbody.endsWithReturnStatement() &&
                     !ifs.elsebody;
+                // a return the constant arguments decide on: what follows it, or it
+                long v;
+                if (ifReturn && !ifs.param && icv.eval(ifs.condition, v))
+                {
+                    decided = true;
+                    if (!v)
+                        continue;
+                    ifs.ifbody.accept(icv);
+                    break;
+                }
                 /* And, in statements only, as of a function returning void:
                  *  if (condition)
                  *      return;
@@ -254,6 +428,7 @@ public:
         }
         cost += icv.cost;
         leavesLoops |= icv.leavesLoops;
+        decided |= icv.decided;
     }
 
     override void visit(UnrolledLoopStatement s)
@@ -270,6 +445,7 @@ public:
         }
         cost += icv.cost;
         leavesLoops |= icv.leavesLoops;
+        decided |= icv.decided;
     }
 
     override void visit(ScopeStatement s)
@@ -289,6 +465,21 @@ public:
             cost = COST_MAX;
             return;
         }
+        const bothReturn = s.elsebody && s.ifbody && s.ifbody.endsWithReturnStatement() &&
+            s.elsebody.endsWithReturnStatement();
+        long v;
+        if (eval(s.condition, v))
+        {
+            // only the branch taken is left
+            decided = true;
+            if (auto taken = v ? s.ifbody : s.elsebody)
+            {
+                nested += !bothReturn;
+                taken.accept(this);
+                nested -= !bothReturn;
+            }
+            return;
+        }
         expressionInlineCost(s.condition);
 
         /* Specifically allow:
@@ -298,7 +489,7 @@ public:
          *      return exp2;
          * Otherwise, we can't handle return statements nested in if's.
          */
-        if (s.elsebody && s.ifbody && s.ifbody.endsWithReturnStatement() && s.elsebody.endsWithReturnStatement())
+        if (bothReturn)
         {
             s.ifbody.accept(this);
             s.elsebody.accept(this);
@@ -436,11 +627,31 @@ public:
             walkPostorder(e, lic);
             cost += icv.cost;
             leavesLoops |= icv.leavesLoops;
+            decided |= icv.decided;
         }
     }
 
     override void visit(Expression e)
     {
+        cost++;
+    }
+
+    override void visit(AssignExp e)
+    {
+        changes(e.e1);
+        cost++;
+    }
+
+    override void visit(BinAssignExp e)
+    {
+        changes(e.e1);
+        cost++;
+    }
+
+    override void visit(UnaExp e)
+    {
+        if (e.isPreExp() || e.isPostExp() || e.isAddrExp())
+            changes(e.e1);
         cost++;
     }
 
@@ -586,5 +797,17 @@ public:
             cost = COST_MAX; // inlining alloca may cause stack overflows
         else
             cost++;
+        // an argument passed by reference may be changed
+        if (params && e.arguments)
+        {
+            import dmd.expressionsem : calledFunctionType;
+            auto tf = e.calledFunctionType();
+            foreach (i, arg; *e.arguments)
+            {
+                if (!tf || i >= tf.parameterList.length ||
+                    tf.parameterList[i].storageClass & (STC.ref_ | STC.out_ | STC.lazy_))
+                    changes(arg);
+            }
+        }
     }
 }
