@@ -381,6 +381,7 @@ bool lirCodegen(ref CGstate cg)
         foldAddresses();
         numberValues();
         reuseInvariantLoads();
+        reuseDominatingMemory();
         removeBoundsChecks();
         if (!env!"DMD_NEWCG_NOIFCONV")
         {
@@ -7247,6 +7248,40 @@ private bool mayAlias(ref const Footprint x, ref const Footprint y, bool sameBas
     return true;
 }
 
+/* Make the load i, of the bytes the store s wrote, the value s stored, extended as
+ * the load extends it. Returns false if that cannot be done
+ */
+@trusted
+private bool loadStored(ref LIns i, ref const LIns s)
+{
+    if (s.sz != i.sz || !s.a || isPhys(s.a) || rcOf(s.a) != rcOf(i.d))
+        return false;
+    LIns c;
+    c.d = i.d;
+    c.a = s.a;
+    if (rcOf(i.d) == RC.fp || i.sz == 8)
+    {
+        c.op = LOp.copy;
+        c.sz = i.sz;
+    }
+    else if (i.flags & F.signed && (i.sz < 4 || i.flags & F.toX))
+    {
+        // LDRSB, LDRSH into a W register, or LDRSW, LDRSB, LDRSH into an X register
+        c.op = LOp.sext;
+        c.sz = i.flags & F.toX ? 8 : 4;
+        c.imm = i.sz * 8;
+    }
+    else
+    {
+        // the other loads zero extend to 64 bits
+        c.op = LOp.zext;
+        c.sz = 8;
+        c.imm = i.sz * 8;
+    }
+    i = c;
+    return true;
+}
+
 /* Whether i is a barrier no memory access is moved across or matched over
  */
 private bool memoryBarrier(ref const LIns i)
@@ -7342,31 +7377,8 @@ private void numberValues()
             if (s.sym !is i.sym || s.b != i.a || s.imm != i.imm || st.vb != verOf(i.a))
                 continue;
             // the latest store there, as one of the same bytes made earlier is forgotten by it
-            if (s.sz != i.sz || st.va != verOf(s.a) || rcOf(s.a) != rcOf(i.d))
+            if (st.va != verOf(s.a) || !loadStored(i, *s))
                 return false;
-            LIns c;
-            c.d = i.d;
-            c.a = s.a;
-            if (rcOf(i.d) == RC.fp || i.sz == 8)
-            {
-                c.op = LOp.copy;
-                c.sz = i.sz;
-            }
-            else if (i.flags & F.signed && (i.sz < 4 || i.flags & F.toX))
-            {
-                // LDRSB, LDRSH into a W register, or LDRSW, LDRSB, LDRSH into an X register
-                c.op = LOp.sext;
-                c.sz = i.flags & F.toX ? 8 : 4;
-                c.imm = i.sz * 8;
-            }
-            else
-            {
-                // the other loads zero extend to 64 bits
-                c.op = LOp.zext;
-                c.sz = 8;
-                c.imm = i.sz * 8;
-            }
-            i = c;
             if (env!"DMD_NEWCG_MEMOPT")
                 fprintf(stderr, "newcg-memopt: forward %s\n", funcsym_p.Sident.ptr);
             return true;
@@ -7932,6 +7944,244 @@ private void reuseInvariantLoads()
         mem_free(lp.body.ptr);
     loops.dtor(); preds.dtor(); predStart.dtor(); ndefs.dtor(); subst.dtor();
     inLoop.dtor(); defInLoop.dtor(); preLoads.dtor();
+}
+
+/* A load of the memory a load or store in a segment dominating it read or wrote,
+ * through the same base register or by name, takes that value when nothing on
+ * any way from there to it may write that memory or change the registers involved
+ */
+@trusted
+private void reuseDominatingMemory()
+{
+    if (env!"DMD_NEWCG_NOMEMOPT")
+        return;
+    buildSegments();
+    const ns = segStart.length - 1;
+    if (ns < 2)
+        return;
+    Barray!uint predStart, preds, idom;
+    Barray!Loop loops;
+    findLoops(predStart, preds, loops, &idom);
+    foreach (ref lp; loops[])
+        mem_free(lp.body.ptr);
+    loops.dtor();
+    scope (exit) { predStart.dtor(); preds.dtor(); idom.dtor(); }
+    analyzeMemory();
+
+    Barray!uint segOf, depth, ndefs;
+    scope (exit) { segOf.dtor(); depth.dtor(); ndefs.dtor(); }
+    segOf.setLength(ins.length);
+    segOf[][] = uint.max;
+    foreach (si; 0 .. ns)
+        foreach (n; segStart[si] .. segEnd(si))
+            segOf[n] = cast(uint)si;
+    ndefs.setLength(vinfo.length);
+    ndefs[][] = 0;
+    foreach (ref i; ins[])
+        if (i.d && !isPhys(i.d))
+            ++ndefs[i.d - firstVreg];
+    // the depth of each segment in the dominator tree, 0 for one not reached
+    depth.setLength(ns);
+    depth[][] = 0;
+    foreach (si; 0 .. ns)
+    {
+        uint k = 0;
+        for (uint x = cast(uint)si; x != 0 && x != uint.max && k <= ns; x = idom[x])
+            ++k;
+        depth[si] = idom[si] == uint.max && si ? 0 : k + 1;
+    }
+    bool dominates(uint a, uint b)
+    {
+        for (uint x = b; x != uint.max; x = idom[x])
+        {
+            if (x == a)
+                return true;
+            if (x == 0)
+                break;
+        }
+        return false;
+    }
+    bool once(Reg r) { return r && !isPhys(r) && ndefs[r - firstVreg] == 1 && memDef[r - firstVreg] != uint.max; }
+
+    // the loads and stores by what they reach: chained from a hash of base, sym and offset
+    enum tableBits = 10;
+    Barray!uint head, next;
+    scope (exit) { head.dtor(); next.dtor(); }
+    head.setLength(1 << tableBits);
+    head[][] = uint.max;
+    next.setLength(ins.length);
+    static uint keyOf(Reg base, const(Symbol)* sym, long imm)
+    {
+        size_t h = base * 31 + cast(size_t)cast(void*)sym;
+        h = h * 131 + cast(size_t)imm;
+        h ^= h >> 13;
+        return cast(uint)(h & ((1 << tableBits) - 1));
+    }
+    Reg baseOf(ref const LIns i) { return i.op == LOp.ld ? i.a : i.b; }
+    bool usable(ref const LIns i)
+    {
+        if (i.op == LOp.ld)
+            return !i.b && !(i.flags & (F.volatile_ | F.condDef)) && once(i.d) && (i.sym ? !i.a : once(i.a));
+        if (i.op == LOp.st)
+            return !i.c && once(i.a) && (i.sym ? !i.b : once(i.b));
+        return false;
+    }
+    foreach (n, ref i; ins[])
+        if (segOf[n] != uint.max && usable(i))
+        {
+            const k = keyOf(baseOf(i), i.sym, i.imm);
+            next[n] = head[k];
+            head[k] = cast(uint)n;
+        }
+
+    Barray!ubyte mark;          // 1: reached from the source, 2: also reaching the load
+    Barray!uint work, touched;
+    Barray!Reg subst;
+    scope (exit) { mark.dtor(); work.dtor(); touched.dtor(); subst.dtor(); }
+    mark.setLength(ns);
+    mark[][] = 0;
+    subst.setLength(vinfo.length);
+    subst[][] = noReg;
+    bool any;
+    enum maxRegion = 256;
+
+    /* Whether, on every way from instruction k to instruction n, which k's segment
+     * dominates, nothing may write what f reaches or define one of the registers
+     */
+    bool clear(uint k, uint n, ref const Footprint f, Reg r1, Reg r2)
+    {
+        const ks = segOf[k], ls = segOf[n];
+        foreach (v; touched[])
+            mark[v] = 0;
+        touched.setLength(0);
+        // forward from k's segment, not through it again
+        work.setLength(0);
+        work.push(ks);
+        while (work.length)
+        {
+            const v = work[work.length - 1];
+            work.setLength(work.length - 1);
+            foreach (t; segSucc[segSuccStart[v] .. segSuccStart[v + 1]])
+                if (t != ks && !mark[t])
+                {
+                    if (touched.length == maxRegion)
+                        return false;
+                    mark[t] = 1;
+                    touched.push(t);
+                    work.push(t);
+                }
+        }
+        if (!mark[ls])
+            return false;
+        // backward from the load's segment, within what is reached
+        work.setLength(0);
+        bool lsCycles;      // the load's segment is reached again after it
+        foreach (p; preds[predStart[ls] .. predStart[ls + 1]])
+            if (p != ks && mark[p] == 1)
+            {
+                mark[p] = 2;
+                work.push(p);
+            }
+        while (work.length)
+        {
+            const v = work[work.length - 1];
+            work.setLength(work.length - 1);
+            foreach (p; preds[predStart[v] .. predStart[v + 1]])
+                if (p != ks && mark[p] == 1)
+                {
+                    mark[p] = 2;
+                    work.push(p);
+                }
+        }
+        lsCycles = mark[ls] == 2;
+        bool bad(ref const LIns i)
+        {
+            if (i.d && (i.d == r1 || i.d == r2))
+                return true;
+            if (i.op == LOp.call && i.target)
+                return true;        // the value is not taken into a landing pad
+            if (!writesMemory(i) && i.op != LOp.call)
+                return false;
+            if (memoryBarrier(i))
+                return true;
+            const w = footprint(i);
+            return mayAlias(w, f);
+        }
+        foreach (m; k + 1 .. segEnd(ks))
+            if (bad(ins[m]))
+                return false;
+        foreach (m; segStart[ls] .. (lsCycles ? segEnd(ls) : n))
+            if (bad(ins[m]))
+                return false;
+        foreach (v; touched[])
+            if (mark[v] == 2 && v != ls)
+                foreach (m; segStart[v] .. segEnd(v))
+                    if (bad(ins[m]))
+                        return false;
+        return true;
+    }
+
+    foreach (n; 0 .. ins.length)
+    {
+        LIns* l = &ins[n];
+        if (l.op != LOp.ld || segOf[n] == uint.max || !usable(*l) || depth[segOf[n]] == 0)
+            continue;
+        const ls = segOf[n];
+        const base = l.a;
+        // the source in the nearest dominating segment that is the same access
+        uint best = uint.max;
+        foreach (attempt; 0 .. 4)
+        {
+            uint pick = uint.max;
+            for (uint k = head[keyOf(base, l.sym, l.imm)]; k != uint.max; k = next[k])
+            {
+                const s = &ins[k];
+                const ks = segOf[k];
+                if (s.op != LOp.ld && s.op != LOp.st || ks == ls || baseOf(*s) != base || s.sym !is l.sym || s.imm != l.imm || s.sz != l.sz ||
+                    !dominates(ks, ls))
+                    continue;
+                if (s.op == LOp.ld && (s.flags != l.flags || s.cond != l.cond || rcOf(s.d) != rcOf(l.d)))
+                    continue;
+                if (s.op == LOp.st && rcOf(s.a) != rcOf(l.d))
+                    continue;
+                if (best != uint.max && depth[ks] >= depth[segOf[best]])
+                    continue;       // tried already
+                if (pick == uint.max || depth[ks] > depth[segOf[pick]] || depth[ks] == depth[segOf[pick]] && k > pick)
+                    pick = k;
+            }
+            if (pick == uint.max)
+                break;
+            best = pick;
+            const s = &ins[pick];
+            const f = footprint(*l);
+            if (!clear(pick, cast(uint)n, f, base, s.op == LOp.st ? s.a : noReg))
+                continue;
+            if (s.op == LOp.ld)
+            {
+                subst[l.d - firstVreg] = s.d;
+                *l = LIns.init;
+            }
+            else if (!loadStored(*l, *s))
+                continue;
+            any = true;
+            if (env!"DMD_NEWCG_MEMOPT")
+                fprintf(stderr, "newcg-memopt: dominated %s\n", funcsym_p.Sident.ptr);
+            break;
+        }
+    }
+    if (any)
+        foreach (ref i; ins[])
+        {
+            Reg value(Reg r)
+            {
+                while (r && !isPhys(r) && subst[r - firstVreg])
+                    r = subst[r - firstVreg];
+                return r;
+            }
+            i.a = value(i.a);
+            i.b = value(i.b);
+            i.c = value(i.c);
+        }
 }
 
 /* Whether cmp and the branch br after it branch when unsigned l > x, as cmp l, x; b.hi or

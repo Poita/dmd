@@ -53,6 +53,21 @@ pragma(inline, false) int optHoistDominated(S* s, int n, bool b)
     return s.y;
 }
 
+// s.y, read before the branch, is read again after it, with only a store to
+// s.x on the way
+pragma(inline, false) int optDominated(S* s, bool b, int v)
+{
+    int r = s.y;
+    if (b)
+    {
+        s.x = r + v;
+        s.f = v;
+    }
+    else
+        r = r * 3 + v;
+    return r + s.y;
+}
+
 // the long is read back from the store made of it
 pragma(inline, false) long optForwardLong(S* s, long v, int w)
 {
@@ -70,5 +85,7 @@ void main()
     s.x = 3;
     check(optHoist(&s, 4) == 18);
     check(optHoistDominated(&s, 3, true) == 18 && optHoistDominated(&s, 3, false) == 9);
+    s.y = 2;
+    check(optDominated(&s, true, 5) == 4 && s.x == 7 && optDominated(&s, false, 5) == 13);
     check(optForwardLong(&s, 1L << 40, -2) == (1L << 40) - 2);
 }
