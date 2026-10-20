@@ -5452,7 +5452,7 @@ private Reg genCall(elem* e, Pair* pair = null, Reg[4]* agg = null, Reg* hidden 
         }
         if (alignsize > 16)
             alignsize = 16;
-        if (p.isVariadic || p.isAp)
+        if (p.isVariadic)
             alignsize = 8;
         numpara = (numpara + (alignsize - 1)) & ~(alignsize - 1);
         p.offset = numpara;

@@ -2553,11 +2553,11 @@ void cdfunc(ref CGstate cg, ref CodeBuilder cdb, elem* e, ref regm_t pretregs)
         if (alignsize > STACKALIGN)
             alignsize = STACKALIGN;         // no point if the stack is less aligned
 
-        /* Alignment on OSX64 AArch64 is the same as for struct fields.
-         * If it is a variadic function, the last parameter (lastPar) is aligned on 8 bytes.
-         * Match behavior in backend.arm.cod1.cdfunc()
+        /* Alignment on OSX64 AArch64 is the same as for struct fields, also for the
+         * last named argument of a variadic function; the variadic arguments are
+         * aligned on 8 bytes. Match behavior in x86.cgcod.stackoffsets()
          */
-        if (p.isVariadic | p.isAp)
+        if (p.isVariadic)
             numpara = cast(uint)_align(REGSIZE, numpara); /* align on register size */
         else
             numpara = (numpara + (alignsize - 1)) & ~(alignsize - 1);
@@ -2700,7 +2700,7 @@ void cdfunc(ref CGstate cg, ref CodeBuilder cdb, elem* e, ref regm_t pretregs)
             CodeBuilder cdbparams;
             cdbparams.ctor();
 
-            const bool isVariadicAlignment = parameters[i].isVariadic | parameters[i].isAp;
+            const bool isVariadicAlignment = parameters[i].isVariadic;
             //printf("isVariadicAlignment: %d\n", isVariadicAlignment);
 
             // Alignment for parameter comes after it was placed on stack
