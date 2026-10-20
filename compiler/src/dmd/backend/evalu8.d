@@ -1453,8 +1453,14 @@ else
                 e.Vcent = cast(long)e1.Vcent.hi < 0 ? dmd.common.int128.neg(e1.Vcent) : e1.Vcent;
                 break;
             default:
-                e.Vllong = l1 < 0 ? -l1 : l1;
+            {
+                // the operand is taken as signed, as the code generated for it does,
+                // also when the type is unsigned
+                const sz = tysize(tym);
+                const v = sz == 1 ? cast(byte)l1 : sz == 2 ? cast(short)l1 : sz == 4 ? cast(int)l1 : l1;
+                e.Vllong = v < 0 ? -v : v;
                 break;
+            }
         }
         break;
 
