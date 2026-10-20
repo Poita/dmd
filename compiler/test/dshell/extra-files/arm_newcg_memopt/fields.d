@@ -32,27 +32,33 @@ pragma(inline, false) int optReuse(S* s)
     return s.y * 2 + s.x;
 }
 
-// s.x is the same on every iteration, as the loop stores only s.y
+// s.y is the same on every iteration, as the loop stores only s.x, and the
+// bytes on either side of it are written on the way to the loop, so it is
+// accessible before the loop even when the loop does not run
 pragma(inline, false) int optHoist(S* s, int n)
 {
-    s.y = 0;
+    s.x = 0;
+    s.f = 0;
     foreach (i; 0 .. n)
-        s.y += s.x * i;
-    return s.y;
+        s.x += s.y * i;
+    return s.x;
 }
 
-// s.x is the same on every iteration, and s is gone through on the way to the
-// loop, before the branch ahead of it
+// the same, with s gone through before a branch on the way to the loop, after
+// any call
 pragma(inline, false) int pick(int n) { return n + 1; }
 pragma(inline, false) int optHoistDominated(S* s, int n, bool b)
 {
-    s.y = 0;
     int k = n;
     if (b)
         k = pick(n);
+    s.x = 0;
+    s.f = 0;
+    if (b)
+        s.l = k;
     foreach (i; 0 .. k)
-        s.y += s.x * i;
-    return s.y;
+        s.x += s.y * i;
+    return s.x;
 }
 
 // s.y, read before the branch, is read again after it, with only a store to
@@ -96,9 +102,8 @@ void main()
     check(optForward(&s, 1.5f) == 3.0f && s.x == 4);
     s.y = 5;
     check(optReuse(&s) == 16);
-    s.x = 3;
-    check(optHoist(&s, 4) == 18);
-    check(optHoistDominated(&s, 3, true) == 18 && optHoistDominated(&s, 3, false) == 9);
+    check(optHoist(&s, 4) == 30);
+    check(optHoistDominated(&s, 3, true) == 30 && optHoistDominated(&s, 3, false) == 15);
     s.y = 2;
     check(optDominated(&s, true, 5) == 4 && s.x == 7 && optDominated(&s, false, 5) == 13);
     s.y = 1;
