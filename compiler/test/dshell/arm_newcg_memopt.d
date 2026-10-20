@@ -1,6 +1,6 @@
 // Each program in extra-files/arm_newcg_memopt has a load of each of its
 // functions named opt<Kind>... optimized as that kind says (reuse, forward,
-// hoist, dominated) by the new AArch64 code generator, and runs
+// hoist, dominated, promote) by the new AArch64 code generator, and runs
 // correctly with and without the memory optimizations.
 module test.dshell.arm_newcg_memopt;
 
