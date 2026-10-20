@@ -1635,6 +1635,23 @@ private bool hasSelect(const(elem)* x)
     return false;
 }
 
+/* Whether op is an assignment of an operation on the variable assigned that an arm of a
+ * select can do
+ */
+private bool selectableOpAssign(OPER op)
+{
+    switch (op)
+    {
+        case OPaddass: case OPminass: case OPmulass:
+        case OPandass: case OPorass: case OPxorass:
+        case OPshlass: case OPshrass: case OPashrass:
+        case OPpostinc: case OPpostdec:
+            return true;
+        default:
+            return false;
+    }
+}
+
 /* The assignment of block b to a whole register variable of a cheap value, b's only
  * code but for the comparison it may end in, tail, or null
  */
@@ -1654,7 +1671,8 @@ private elem* selectableAssign(block* b, block* pred, out elem* tail)
     }
     else if (b.bc != BC.goto_)
         return null;
-    if (a.Eoper != OPeq && a.Eoper != OPnegass || a.Ecount || a.E1.Eoper != OPvar || a.E1.Voffset)
+    if (a.Eoper != OPeq && a.Eoper != OPnegass && !selectableOpAssign(a.Eoper) || a.Ecount ||
+        a.E1.Eoper != OPvar || a.E1.Voffset)
         return null;
     const ty = tybasic(a.E1.Ety);
     if (!scalarType(ty) || pairType(ty) || tyaggregate(ty))
@@ -1663,11 +1681,56 @@ private elem* selectableAssign(block* b, block* pred, out elem* tail)
     if (!r || tysize(ty) != type_size(a.E1.Vsym.Stype) || (rcOf(r) == RC.fp) != (tyfloating(ty) != 0))
         return null;
     // an operation at most, as both arms are evaluated
-    int budget = 2;
-    if (a.Eoper == OPeq && !cheapArm(a.E2, budget))
-        return null;
+    if (a.Eoper == OPeq)
+    {
+        int budget = 3;
+        if (!cheapArm(a.E2, budget))
+            return null;
+    }
+    else if (a.Eoper != OPnegass)
+    {
+        /* an integer operation on the variable, of an operand that is cheap: one that
+         * cannot fault, nor raise a floating point exception that the arm not taken
+         * would not
+         */
+        int budget = 2;
+        if (tyfloating(ty) || rcOf(r) != RC.gp || !cheapArm(a.E2, budget) ||
+            (a.Eoper == OPshlass || a.Eoper == OPshrass || a.Eoper == OPashrass) && a.E2.Eoper != OPconst)
+            return null;
+    }
     tail = t;
     return a;
+}
+
+/* Whether the condition c is an integer value tested for being nonzero, or with !
+ * for being zero: a variable or the bits of one
+ */
+@trusted
+private bool testedValue(const(elem)* c)
+{
+    if (c.Eoper == OPnot)
+        c = c.E1;
+    const ty = tybasic(c.Ety);
+    if (!(tyintegral(ty) || typtr(ty)) || !scalarType(ty) || pairType(ty))
+        return false;
+    if (c.Eoper == OPvar)
+        return true;
+    return c.Eoper == OPand && c.E1.Eoper == OPvar && c.E2.Eoper == OPconst;
+}
+
+/* Compare the value c tests with 0, returning the condition under which it holds
+ */
+@trusted
+private COND testValue(elem* c)
+{
+    const not = c.Eoper == OPnot;
+    elem* x = not ? c.E1 : c;
+    Reg a = gen(x);
+    const sz = tysize(x.Ety);
+    if (sz < 4)
+        a = extend(a, x.Ety, 4);
+    emitIns(LOp.cmpi, sz <= 4 ? 4 : 8, noReg, a, noReg, 0);
+    return not ? COND.eq : COND.ne;
 }
 
 /* Do block b, ending in a comparison choosing between blocks that each assign a
@@ -1679,8 +1742,10 @@ private bool ifConvert(block* b)
     block* bt = b.Bsucc[0];
     block* bf = b.Bsucc[1];
     elem* c = b.Belem;
-    if (!c || c.Eoper < OPle || c.Eoper > OPne || !scalarType(c.E1.Ety) || pairType(c.E1.Ety) ||
-        bt == b || bf == b || bt == bf)
+    if (!c || bt == b || bf == b || bt == bf)
+        return false;
+    const plain = testedValue(c);
+    if (!plain && (c.Eoper < OPle || c.Eoper > OPne || !scalarType(c.E1.Ety) || pairType(c.E1.Ety)))
         return false;
     elem* tailT, tailF;
     elem* at = selectableAssign(bt, b, tailT);
@@ -1738,7 +1803,7 @@ private bool ifConvert(block* b)
         collectAssigned(af);
     // the comparison, side effects and all, before the values, which change no flags
     // unless they are selects themselves
-    const early = at && at.Eoper == OPeq && hasSelect(at.E2) || af && af.Eoper == OPeq && hasSelect(af.E2);
+    const early = at && at.Eoper != OPnegass && hasSelect(at.E2) || af && af.Eoper != OPnegass && hasSelect(af.E2);
     if (early && el_sideeffect(c))
         return false;
     // the value an arm assigns
@@ -1748,8 +1813,15 @@ private bool ifConvert(block* b)
             return noReg;
         if (a.Eoper == OPeq)
             return gen(a.E2);
-        // the variable negated
         Reg r = varReg(a.E1.Vsym);
+        if (a.Eoper != OPnegass)
+        {
+            // the variable op the operand, as the assignment computes it
+            const ty = tybasic(a.E1.Ety);
+            Reg o = a.E2.Eoper == OPconst ? noReg : gen(a.E2);
+            return arith(a.Eoper, ty, r, a.E2, o, ty);
+        }
+        // the variable negated
         const sz = tysize(a.E1.Ety);
         const fp = rcOf(r) == RC.fp;
         const isz = fp ? sz : (sz <= 4 ? 4 : 8);
@@ -1763,7 +1835,7 @@ private bool ifConvert(block* b)
         vt = value(at);
         vf = value(af);
     }
-    const cond = compare(c);
+    const cond = plain ? testValue(c) : compare(c);
     if (!early)
     {
         vt = value(at);
