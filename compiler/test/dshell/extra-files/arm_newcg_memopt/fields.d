@@ -61,6 +61,18 @@ pragma(inline, false) int optHoistDominated(S* s, int n, bool b)
     return s.x;
 }
 
+// s.y is read on entering the loop, which nothing can skip, and only s.x is
+// stored in it
+pragma(inline, false) int optHoistEntered(S* s, int n)
+{
+    int i = 0;
+    s.x = 0;
+    do
+        s.x += s.y * i;
+    while (++i < n);
+    return s.x;
+}
+
 // s.y, read before the branch, is read again after it, with only a store to
 // s.x on the way
 pragma(inline, false) int optDominated(S* s, bool b, int v)
@@ -104,6 +116,7 @@ void main()
     check(optReuse(&s) == 16);
     check(optHoist(&s, 4) == 30);
     check(optHoistDominated(&s, 3, true) == 30 && optHoistDominated(&s, 3, false) == 15);
+    check(optHoistEntered(&s, 4) == 30 && optHoistEntered(&s, 0) == 0);
     s.y = 2;
     check(optDominated(&s, true, 5) == 4 && s.x == 7 && optDominated(&s, false, 5) == 13);
     s.y = 1;
