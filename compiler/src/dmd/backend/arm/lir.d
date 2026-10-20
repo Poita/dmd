@@ -129,6 +129,7 @@ enum LOp : ubyte
     vgq,            // the general register d = imm on a
     vld,            // d = the sz (4, 8 or 16) bytes at [a + imm], or [a + b]
     vst,            // the sz (4, 8 or 16) bytes at [b + imm], or [b + c], = a
+    linnum,         // the code from here is of the source position srcposes[imm]
 }
 
 /// The atomic operations, sequentially consistent, druntime's _d_aarch64_* functions are
@@ -227,6 +228,8 @@ private __gshared
     Barray!uint tlvBlocks;      // in these blocks
     uint condDepth;             // number of conditionally evaluated regions being selected
     bool usesFrame;             // the code refers to locals or parameters in memory
+    bool fast;                  // generating without optimization, every variable kept in memory
+    Barray!Srcpos srcposes;     // the source positions of the linnum instructions
 }
 
 /// The value of the environment variable `name`, looked up once
@@ -252,6 +255,20 @@ bool newCodegenEnabled()
     {
         auto p = getenv("DMD_NEWCG");
         enabled = p && *p != '0';
+    }
+    return enabled != 0;
+}
+
+/// Whether code generated without optimization is generated through virtual registers
+/// too, unless DMD_NEWCG_FAST is 0
+@trusted
+bool lirFastEnabled()
+{
+    __gshared int enabled = -1;
+    if (enabled < 0)
+    {
+        auto p = getenv("DMD_NEWCG_FAST");
+        enabled = newCodegenEnabled() && !(p && *p == '0');
     }
     return enabled != 0;
 }
@@ -306,6 +323,8 @@ bool lirCodegen(ref CGstate cg)
 
     cgp = &cg;
     failed = false;
+    fast = !(config.flags4 & CFG4optimized);
+    srcposes.setLength(0);
     wrappedProlog = null;
     ins.setLength(0);
     foreach (ref v; vinfo[])
@@ -328,8 +347,10 @@ bool lirCodegen(ref CGstate cg)
     switchesFibers = callsFiberSwitch();
     condDepth = 0;
 
-    if (splitReturnConds())
-        compdfo(bo.dfo, bo.startblock);     // for code generation without virtual registers too
+    if (splitReturnConds() || fast)
+        // for code generation without virtual registers too, and as the optimizer
+        // leaves it, which without optimization does not run
+        compdfo(bo.dfo, bo.startblock);
     for (block* b = bo.startblock; b; b = b.Bnext)
         blocks.push(b);
     savedDfoidx.setLength(blocks.length);
@@ -362,7 +383,9 @@ bool lirCodegen(ref CGstate cg)
     findNoLocalAddress(hasTry);
     returnCallsInPlace();
     select();
-    if (!failed)
+    if (!failed && fast)
+        insertHoisted();
+    else if (!failed)
     {
         insertHoisted();
         fuseFloorConverts();
@@ -425,10 +448,18 @@ bool lirCodegen(ref CGstate cg)
         dump();
     splitSpilled();
     rewriteSpills();
-    pairMemoryOps();
+    if (!fast)
+        pairMemoryOps();
     if (env!"DMD_NEWCG_RASTATS")
         printAllocationStats();
-    shrinkWrap();
+    if (fast)
+    {
+        wrappedFunc = funcsym_p;
+        wrappedProlog = null;
+        sunk.setLength(0);
+    }
+    else
+        shrinkWrap();
     emit(cg);
     finishVariables();
     if (hasTry)
@@ -879,6 +910,16 @@ private void assignVariables()
     symAssigned[][] = false;
     symCached.setLength(globsym.length);
     symCached[][] = false;
+    if (fast)
+    {
+        // every variable stays in memory, where the debugger finds it
+        partial.dtor();
+        crossBlockVars.setLength(0);
+        aggs.setLength(0);
+        symAgg.setLength(globsym.length);
+        symAgg[][] = -1;
+        return;
+    }
     static struct Use { const(elem)* e; uint block; }
     Barray!Use varCses;
     uint markBlock;
@@ -1884,7 +1925,11 @@ private void select()
             continue;       // done as a select by its predecessor
         blockAssigned.setLength(0);
         if (b.Belem)
+        {
             collectAssigned(b.Belem);
+            if (fast)
+                lineOf(b.Belem);
+        }
         block* next = bi + 1 < blocks.length ? blocks[bi + 1] : null;
         if (b.bc == BC.jcatch || b.bc == BC.lpad)
         {
@@ -1933,7 +1978,7 @@ private void select()
             {
                 block* bt = b.Bsucc[0];
                 block* bf = b.Bsucc[1];
-                if (ifConvert(b))
+                if (!fast && ifConvert(b))
                     break;
                 if (bt == next)
                     genCondBlock(b.Belem, false, bf);
@@ -2080,6 +2125,8 @@ private void knownExtended(Reg d, uint bits, bool signed, uint toSize)
 @trusted
 private void genEffect(elem* e)
 {
+    if (fast)
+        lineOf(e);
     switch (e.Eoper)
     {
         case OPcomma:
@@ -2913,6 +2960,33 @@ private Reg gen(elem* e)
         cseBlocks.push(curBlock);
     }
     return r;
+}
+
+/* Mark the code from here as of the source position of e, a statement's
+ * expression, if it has one, so a debugger steps through the source as the code goes
+ */
+@trusted
+private void lineOf(const(elem)* e)
+{
+    if (!config.addlinenumbers || !e.Esrcpos.Slinnum)
+        return;
+    // the last mark made is the one the code is at
+    if (srcposes.length)
+    {
+        const last = &srcposes[srcposes.length - 1];
+        if (last.Slinnum == e.Esrcpos.Slinnum && last.Sfilename is e.Esrcpos.Sfilename)
+            return;
+    }
+    // a mark with no code of its own after it is replaced
+    const n = ins.length;
+    if (n > blockStart[blockStart.length - 1] && ins[n - 1].op == LOp.linnum)
+    {
+        srcposes[cast(size_t)ins[n - 1].imm] = e.Esrcpos;
+        return;
+    }
+    auto i = emitIns(LOp.linnum, 0);
+    i.imm = srcposes.length;
+    srcposes.push(e.Esrcpos);
 }
 
 /* Record in blockAssigned the variables e assigns
@@ -4371,6 +4445,8 @@ private void returnCallsInPlace()
 @trusted
 private bool tailCallable(block* b, elem* e, bool isVoid)
 {
+    if (fast)
+        return false;   // the caller stays in stack traces
     if (!noLocalAddress[b.Bdfoidx] || takesLocalAddress(e) || b.Btry)
         return false;
     while (e.Eoper == OPcomma)
@@ -5161,6 +5237,8 @@ private bool selectable(const(elem)* e)
 @trusted
 private Reg hoistConst(long bits, ubyte sz, RC rc)
 {
+    if (fast)
+        return noReg;
     if (blocks[curBlock].Bweight <= blocks[0].Bweight)
         return noReg;
     if (rc == RC.fp)
@@ -15140,6 +15218,10 @@ private void emitOne(ref CodeBuilder cdb, ref LIns i, ref Barray!(code*) labelCo
     switch (i.op)
     {
         case LOp.nop:
+            break;
+
+        case LOp.linnum:
+            cdb.genlinnum(srcposes[cast(size_t)i.imm]);
             break;
 
         case LOp.label:

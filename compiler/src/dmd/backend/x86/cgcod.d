@@ -98,10 +98,12 @@ void codgenx(ref CGstate cg, Symbol* sfunc)
     assert(sfunc == funcsym_p);
     assert(cseg == funcsym_p.Sseg);
 
-    /* On AArch64 with optimization the code may be generated through virtual registers
-     * without the register candidates cgreg_init() works out, so it is done once that fails
+    /* On AArch64 the code may be generated through virtual registers without the
+     * register candidates cgreg_init() works out, so it is done once that fails
      */
-    const tryLir = config.target_cpu == TARGET_AArch64 && config.flags4 & CFG4optimized;
+    import dmd.backend.arm.lir : lirFastEnabled;
+    const tryLir = config.target_cpu == TARGET_AArch64 &&
+        (config.flags4 & CFG4optimized || lirFastEnabled());
     if (!tryLir)
         cgreg_init();
     CSE.initialize();
