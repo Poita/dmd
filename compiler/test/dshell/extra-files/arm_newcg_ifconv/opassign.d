@@ -103,3 +103,26 @@ void main()
     if (divIf(7, 0) != 7) assert(0);
     if (divIf(7, 2) != 3) assert(0);
 }
+
+// a select of a value and of it plus one, inverted or negated is one instruction
+int ops2_incIf(int x, int c)
+{
+    return c > 0 ? x + 1 : x;
+}
+
+long ops2_negIf(long x, long c)
+{
+    return c == 7 ? x : -x;
+}
+
+uint ops2_notIf(uint x, uint c)
+{
+    return c < 3 ? ~x : x;
+}
+
+static this()
+{
+    if (ops2_incIf(int.max, 1) != int.min || ops2_incIf(5, 0) != 5) assert(0);
+    if (ops2_negIf(long.min, 0) != long.min || ops2_negIf(4, 0) != -4 || ops2_negIf(4, 7) != 4) assert(0);
+    if (ops2_notIf(0, 2) != uint.max || ops2_notIf(9, 3) != 9) assert(0);
+}
