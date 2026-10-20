@@ -1,7 +1,7 @@
 // Each function named opt<Kind>... has a load optimized by the new AArch64 code
 // generator as Kind says: reused across a store (Reuse), taken from a store
 // (Forward), moved out of a loop (Hoist), taken from a dominating access
-// (Dominated).
+// (Dominated), or kept in a register through a loop (Promote).
 
 struct S { int x; int y; float f; long l; }
 
@@ -70,6 +70,18 @@ pragma(inline, false) int optDominated(S* s, bool b, int v)
     return r + s.y;
 }
 
+// s.y is kept in a register through the loop, with the stores to it still made
+pragma(inline, false) int optPromote(S* s, int[] a)
+{
+    s.x = 0;
+    foreach (v; a)
+    {
+        s.y += v;
+        s.x += s.y;
+    }
+    return s.y;
+}
+
 // the long is read back from the store made of it
 pragma(inline, false) long optForwardLong(S* s, long v, int w)
 {
@@ -89,5 +101,7 @@ void main()
     check(optHoistDominated(&s, 3, true) == 18 && optHoistDominated(&s, 3, false) == 9);
     s.y = 2;
     check(optDominated(&s, true, 5) == 4 && s.x == 7 && optDominated(&s, false, 5) == 13);
+    s.y = 1;
+    check(optPromote(&s, [1, 2, 3]) == 7 && s.x == 2 + 4 + 7);
     check(optForwardLong(&s, 1L << 40, -2) == (1L << 40) - 2);
 }
