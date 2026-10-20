@@ -1995,6 +1995,7 @@ void flowlv(ref BlockOpt bo)
      */
     vec_t ehlv = anyTry ? vec_calloc(globsym.length) : null;
     vec_t notPseudo = null;
+    vec_t handlers = null;      // the handlers of the tries, by dfo index
     if (anyTry)
     {
         notPseudo = vec_calloc(globsym.length);
@@ -2002,6 +2003,16 @@ void flowlv(ref BlockOpt bo)
         {
             if (globsym[i].Sclass != SC.pseudo)
                 vec_setbit(i, notPseudo);
+        }
+        handlers = vec_calloc(bo.dfo.length);
+        foreach (b; bo.dfo[])
+        {
+            if (b.bc == BC.try_)
+            {
+                foreach (bh; b.Bsucc[1 .. $])
+                    if (inDfo(bo, bh))
+                        vec_setbit(bh.Bdfoidx, handlers);
+            }
         }
     }
     Dirty dirty;                // only a change to the Binlv of a successor changes Boutlv
@@ -2061,8 +2072,13 @@ void flowlv(ref BlockOpt bo)
             {
                 anychng = true;
                 dirty.mark(bo, b.Bpred[]);
-                if (anyTry)
-                    dirty.p[0 .. dirty.n] = true;   // the guarded blocks go to the handler
+                // the guarded blocks go to the handler
+                if (anyTry && vec_testbit(i, handlers))
+                {
+                    foreach (j, bg; bo.dfo[])
+                        if (bg.Btry)
+                            dirty.p[j] = true;
+                }
             }
             vec_copy(b.Binlv,tmp);
         }
@@ -2071,6 +2087,7 @@ void flowlv(ref BlockOpt bo)
     } while (anychng);
 
     dirty.free();
+    vec_free(handlers);
     vec_free(notPseudo);
     vec_free(ehlv);
     vec_free(tmp);
