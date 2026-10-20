@@ -13138,10 +13138,12 @@ private void expandTlvs()
 /// A loop of segments: its header, and all the segments reaching a back edge to it
 struct Loop { uint header; uint size; uint[] body; uint idom; /* the header's immediate dominator */ }
 
-/* The predecessors of each segment, and the loops, smallest first; buildSegments() has run
+/* The predecessors of each segment, and the loops, smallest first, and if idomOut,
+ * the immediate dominator of each segment, uint.max for one not reached; buildSegments() has run
  */
 @trusted
-private void findLoops(ref Barray!uint predStart, ref Barray!uint preds, ref Barray!Loop loops)
+private void findLoops(ref Barray!uint predStart, ref Barray!uint preds, ref Barray!Loop loops,
+    Barray!uint* idomOut = null)
 {
     const ns = segStart.length - 1;
     // the predecessors of each segment
@@ -13312,6 +13314,11 @@ private void findLoops(ref Barray!uint predStart, ref Barray!uint preds, ref Bar
     }
     if (loops.length > 1)
         qsort(loops[].ptr, loops.length, Loop.sizeof, &bySize);
+    if (idomOut)
+    {
+        idomOut.setLength(ns);
+        (*idomOut)[][] = idom[][];
+    }
     inLoop.dtor(); isHeader.dtor();
     idom.dtor(); rpo.dtor(); order.dtor();
 }
@@ -13330,7 +13337,9 @@ private bool hoistInvariants()
 
     Barray!uint predStart, preds;
     Barray!Loop loops;
-    findLoops(predStart, preds, loops);
+    Barray!uint idom;
+    scope (exit) idom.dtor();
+    findLoops(predStart, preds, loops, &idom);
     analyzeMemory();
     const precise = !env!"DMD_NEWCG_NOMEMOPT";
     Barray!Footprint loopStores;    // what the loop's stores and calls may reach
@@ -13483,6 +13492,49 @@ private bool hoistInvariants()
                 witnessed.push(i.a);
             if (i.op == LOp.st && i.b && !isPhys(i.b) && !i.c && !i.sym)
                 witnessed.push(i.b);
+        }
+        /* A base register defined once outside any loop holds the same address from its
+         * definition on, so it is gone through too by a load or store after that definition
+         * in a segment dominating the preheader
+         */
+        {
+            uint d = pre;
+            foreach (up; 0 .. 16)
+            {
+                if (d == uint.max || inLoop[d])
+                    break;
+                foreach (n; segStart[d] .. segEnd(d))
+                {
+                    const i = &ins[n];
+                    Reg r;
+                    if (i.op == LOp.ld && !i.b && !i.sym)
+                        r = i.a;
+                    else if (i.op == LOp.st && !i.c && !i.sym)
+                        r = i.b;
+                    if (!r || isPhys(r) || ndefs[r - firstVreg] != 1)
+                        continue;
+                    const def = memDef[r - firstVreg];
+                    if (def == uint.max || inAnyLoop[segOf[def]])
+                        continue;
+                    const ds = segOf[def];
+                    bool dom = ds == d ? def < n : false;
+                    if (ds != d)
+                        for (uint x = d; x != uint.max && x != 0; )
+                        {
+                            x = idom[x];
+                            if (x == ds)
+                            {
+                                dom = true;
+                                break;
+                            }
+                        }
+                    if (dom)
+                        witnessed.push(r);
+                }
+                if (d == 0)
+                    break;
+                d = idom[d];
+            }
         }
         bool movableLoad(ref const LIns i)
         {
