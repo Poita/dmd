@@ -321,6 +321,17 @@ void codgenx(ref CGstate cg, Symbol* sfunc)
             b.Bcode = null;
         }
     }
+
+    /* A parameter in a register only in blocks after the start is assigned
+     * before it is read, and until then the register may hold another variable
+     */
+    cg.deadEntryPregs = 0;
+    foreach (s; globsym[])
+    {
+        if ((s.Sclass == SC.fastpar || s.Sclass == SC.shadowreg) && s.Sfl == FL.reg &&
+            s.Srange && !vec_testbit(bo.startblock.Bdfoidx, s.Srange))
+            cg.deadEntryPregs |= s.Spregm();
+    }
     cgreg_term();
 
     // See if we need to enforce a particular stack alignment
