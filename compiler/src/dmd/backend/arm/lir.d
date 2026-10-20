@@ -3204,6 +3204,10 @@ private Pair genPairx(elem* e)
             {
                 if (av.abi.kind == AggregateABI.Kind.gpr && av.abi.nregs == 2 && e.Voffset == 0)
                     return Pair(av.slots[0], av.slots[1]);
+                // its bytes, from the elements, as a 16 byte value passed by
+                if (av.abi.kind == AggregateABI.Kind.hfa && av.abi.size > 8 && av.abi.size <= 16 &&
+                    e.Voffset == 0)
+                    return Pair(hfaWord(av, 0), hfaWord(av, 1));
                 fail("pair of aggregate");
                 return Pair(newVreg(RC.gp, 8), newVreg(RC.gp, 8));
             }
