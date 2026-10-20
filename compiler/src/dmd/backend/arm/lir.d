@@ -11854,10 +11854,26 @@ private bool vectorizeLoops()
                     continue;
                 const P = c.phi;
                 const F = lv.valOf[c.r - firstVreg];
-                const x = &lv.vals[F];
+                const(LvVal)* x = &lv.vals[F];
                 if (F == P || x.kind != LvVal.Kind.lanes || x.uses || x.sz != 4)
                     return fails("reduction");
-                const pu = lv.vals[P].uses;
+                auto pu = lv.vals[P].uses;
+                /* a select of P op Y, made only for it, and P, from a comparison not of
+                 * P: each lane does the operation in the iterations of it the condition
+                 * holds in, and keeps its value in the others
+                 */
+                if (x.op == LOp.csel && (x.oa == P) != (x.ob == P))
+                {
+                    const Z = x.oa == P ? x.ob : x.oa;
+                    const z = &lv.vals[Z];
+                    if (Z >= 0 && z.kind == LvVal.Kind.lanes && z.uses == 1 && z.sz == 4 && pu == 2 &&
+                        (z.op == LOp.add || z.op == LOp.sub || z.op == LOp.orr || z.op == LOp.eor ||
+                         z.op == LOp.and_ || z.op == LOp.addi || z.op == LOp.subi))
+                    {
+                        x = z;
+                        pu = 1;
+                    }
+                }
                 switch (x.op)
                 {
                     case LOp.add, LOp.sub, LOp.orr, LOp.eor, LOp.and_, LOp.addi, LOp.subi:
