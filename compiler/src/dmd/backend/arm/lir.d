@@ -3155,6 +3155,17 @@ private Pair genPairx(elem* e)
             return Pair(hfaWord(a, r, 0), hfaWord(a, r, 1));
         }
     }
+    if (hfaAsInteger(e) && (e.Eoper == OPcond || e.Eoper == OPcomma))
+    {
+        // its bytes, from the elements it leaves in V registers
+        const a = aarch64Aggregate(cast(type*)e.ET);
+        if (a.size <= 16)
+        {
+            AggVal v = genAgg(e);
+            Reg[4] r = aggParts(v, a);
+            return Pair(hfaWord(a, r, 0), hfaWord(a, r, 1));
+        }
+    }
     // the halves of a pair are the bytes of the aggregate
     if (hfaAsInteger(e) && e.Eoper != OPpair && e.Eoper != OPrpair)
     {
@@ -4811,6 +4822,17 @@ private Reg genx(elem* e)
             {
                 Reg[4] r;
                 genCall(e, null, &r);
+                return hfaWord(a, r, 0);
+            }
+        }
+        if (op == OPcond || op == OPcomma)
+        {
+            // from the elements it leaves in V registers
+            const a = aarch64Aggregate(cast(type*)e.ET);
+            if (a.size <= 8)
+            {
+                AggVal v = genAgg(e);
+                Reg[4] r = aggParts(v, a);
                 return hfaWord(a, r, 0);
             }
         }
