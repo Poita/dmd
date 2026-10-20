@@ -461,8 +461,10 @@ private void buildloop(ref BlockOpt bo, ref Loops ploops, block* head, block* ta
     //printf("buildloop()\n");
 
      /* Add a block b and all its predecessors to vector v.
+      * A landing pad is also entered from each block of the body its try guards,
+      * which the flow graph has no edges for.
       */
-    static void insert(block* b, vec_t v)
+    void insert(block* b, vec_t v)
     {
         assert(b && v);
         if (!vec_testbit(b.Bdfoidx,v))      // if block is not in loop
@@ -471,6 +473,25 @@ private void buildloop(ref BlockOpt bo, ref Loops ploops, block* head, block* ta
             b.Bweight = loop_weight(b.Bweight,1);   // *10 usage count
             foreach (bl; b.Bpred[])
                 insert(bl, v);              // insert all its predecessors
+            if (b.bc == BC.jcatch || b.bc == BC.lpad)
+            {
+                foreach (bt; b.Bpred[])
+                {
+                    if (bt.bc != BC.try_)
+                        continue;
+                    foreach (bg; bo.dfo[])
+                    {
+                        for (block* t = bg.Btry; t; t = t.Btry)
+                        {
+                            if (t is bt)
+                            {
+                                insert(bg, v);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

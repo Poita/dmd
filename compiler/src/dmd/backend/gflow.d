@@ -107,7 +107,17 @@ void flowrd(ref GlobalOptimizer go, ref BlockOpt bo)
             dirty.p[i] = false;
             /* Binrd = union of Boutrds of all predecessors of b */
             vec_clear(b.Binrd);
-            if (b.bc != BC.catch_ /*&& b.bc != BC.jcatch*/)
+            if (b.bc == BC.jcatch || b.bc == BC.lpad)
+            {
+                /* A landing pad is entered from anywhere in the guarded body, after
+                 * any of its definitions, which the flow graph has no edges for:
+                 *      i = 0;
+                 *      try { i = 1; throw; } catch () { x = i; }
+                 * so take every definition as reaching it
+                 */
+                vec_set(b.Binrd);
+            }
+            else if (b.bc != BC.catch_)
             {
                 /* Set Binrd to 0 to account for:
                  * i = 0;
@@ -499,7 +509,7 @@ private void flowaecp(ref GlobalOptimizer go, ref BlockOpt bo)
             }
             assert(!first);     // it must have had predecessors
 
-            if (b.bc == BC.jcatch)
+            if (b.bc == BC.jcatch || b.bc == BC.lpad)
             {
                 /* Set Bin to 0 to account for:
                     void* pstart = p;
@@ -912,7 +922,7 @@ void flowcpBit(ref GlobalOptimizer go, ref BlockOpt bo, uint j, vec_t[] ins)
                 assert(p < nblocks && bo.dfo[p] is bp);
                 v &= (bp.bc == BC.iftrue && bp.Bsucc[0] != b) ? bout2[p] : bout[p];
             }
-            if (b.bc == BC.jcatch)
+            if (b.bc == BC.jcatch || b.bc == BC.lpad)
                 v = false;
             bin[i] = v;
             const o = (v && !kill[i]) || gen[i];
@@ -1970,6 +1980,9 @@ void flowlv(ref BlockOpt bo)
     vec_t tmp = vec_calloc(globsym.length);
     uint cnt = 0;
     bool anychng;
+    bool anyTry;                // any block in a guarded body
+    foreach (b; bo.dfo[])
+        anyTry |= b.Btry !is null;
     Dirty dirty;                // only a change to the Binlv of a successor changes Boutlv
     dirty.init(bo.dfo.length);
     do
@@ -1999,6 +2012,15 @@ void flowlv(ref BlockOpt bo)
                 vec_copy(b.Boutlv,livexit);
             }
 
+            /* A block in a guarded body can also go to the handlers of each try
+             * enclosing it, which the flow graph has no edges for
+             */
+            for (block* bt = b.Btry; bt; bt = bt.Btry)
+            {
+                foreach (bh; bt.Bsucc[1 .. $])
+                    vec_orass(b.Boutlv, bh.Binlv);
+            }
+
             /* Bin = (Bout - Bkill) | Bgen                  */
             vec_sub(tmp,b.Boutlv,b.Bkill);
             vec_orass(tmp,b.Bgen);
@@ -2006,6 +2028,8 @@ void flowlv(ref BlockOpt bo)
             {
                 anychng = true;
                 dirty.mark(bo, b.Bpred[]);
+                if (anyTry)
+                    dirty.p[0 .. dirty.n] = true;   // the guarded blocks go to the handler
             }
             vec_copy(b.Binlv,tmp);
         }
