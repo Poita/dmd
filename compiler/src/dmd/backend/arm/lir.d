@@ -1347,7 +1347,7 @@ private void finishVariables()
         Symbol* s = globsym[k];
         if (!r)
             continue;
-        const v = &vinfo[r - firstVreg];
+        auto v = &vinfo[r - firstVreg];
         if (s.Sclass == SC.parameter)
             continue;           // its stack slot is the caller's
         if (symCached[k])
@@ -1357,6 +1357,21 @@ private void finishVariables()
         s.Sreglsw = cast(reg_t)preg;
         s.Sregmsw = NOREG;
         s.Sregm = mask(preg);
+        // debug info finds it where it is kept, which for a parameter is not where it is passed
+        // once that register is reused
+        s.SdbgLoc = DbgLoc.reg;
+        if (v.spilled)
+        {
+            s.SdbgLoc = v.slot ? DbgLoc.slot : DbgLoc.none;
+            s.SdbgSlot = v.slot;
+        }
+        else if (v.preg == uint.max)
+            s.SdbgLoc = DbgLoc.none;
+        else if (v.preg != preg)
+        {
+            s.SdbgLoc = DbgLoc.other;
+            s.SdbgReg = cast(reg_t)v.preg;
+        }
     }
     // pair and aggregate parameters held in registers are copied from where they are passed
     foreach (ref av; aggs[])
