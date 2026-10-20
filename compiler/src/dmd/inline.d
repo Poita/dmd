@@ -1171,6 +1171,75 @@ private Result doInlineAs(Result)(Expression e, InlineDoState ids)
     return v.result;
 }
 
+/// Whether `t` is the type of an expression that does not complete
+private bool isNoReturn(Type t)
+{
+    return t && t.toBasetype().isTypeNoreturn() !is null;
+}
+
+/// Whether `e` does not complete: a throw, assert(0), halt or a call that never returns
+private bool isNoReturnExp(Expression e)
+{
+    if (e.isThrowExp() || e.isHaltExp())
+        return true;
+    if (auto ae = e.isAssertExp())
+        if (auto ie = ae.e1.isIntegerExp())
+            return ie.getInteger() == 0;
+    return isNoReturn(e.type);
+}
+
+/**
+ * Whether the last statement of `s` does not complete, so that `s` completes only
+ * by leaving it earlier, as by return, break or goto.
+ * Conservative: false where it cannot tell.
+ */
+private bool endsInNoReturn(Statement s)
+{
+    if (!s)
+        return false;
+    if (s.isThrowStatement())
+        return true;
+    if (auto es = s.isExpStatement())
+        return es.exp && isNoReturnExp(es.exp);
+    if (auto cs = s.isCompoundStatement())
+    {
+        foreach_reverse (st; cs.statements)
+            if (st)
+                return endsInNoReturn(st);
+        return false;
+    }
+    if (auto ss = s.isScopeStatement())
+        return endsInNoReturn(ss.statement);
+    if (auto ifs = s.isIfStatement())
+        return endsInNoReturn(ifs.ifbody) && endsInNoReturn(ifs.elsebody);
+    return false;
+}
+
+/// Whether functions, by address, never return normally (see `alwaysThrows`)
+private __gshared bool[void*] neverReturns;
+
+/**
+ * Whether `fd` never returns normally: it has no return statement and its body
+ * ends in a statement that does not complete, so a call of it is on an error path.
+ */
+private bool alwaysThrows(FuncDeclaration fd)
+{
+    if (auto p = cast(void*)fd in neverReturns)
+        return *p;
+    bool result;
+    if (auto fb = fd.fbody)
+    {
+        if (endsInNoReturn(fb))
+        {
+            auto statements = new Statements(1);
+            (*statements)[0] = fb;
+            result = restHasNoReturn(*statements, 0);
+        }
+    }
+    neverReturns[cast(void*)fd] = result;
+    return result;
+}
+
 /***********************************************************
  * Walk the trees, looking for functions to inline.
  * Inline any that can be.
@@ -1196,6 +1265,7 @@ public:
     int inlinedCost;            // cost of the functions inlined outside loops
     int loopInlinedCost;        // cost of the functions too costly outside loops inlined into loops
     int loopDepth;              // number of loops around what is being scanned
+    int coldDepth;              // number of rarely run paths around what is being scanned
 
     // As the visit method cannot return a value, these variables
     // are used to pass the result from 'visit' back to 'inlineScan'
@@ -1719,8 +1789,11 @@ public:
     {
         auto lifted = s.param ? null : liftCalls(s.condition);
         inlineScan(s.condition);
-        inlineScan(s.ifbody);
-        inlineScan(s.elsebody);
+        // a branch that cannot complete, where the other can, is the error path
+        const ifCold = endsInNoReturn(s.ifbody);
+        const elseCold = endsInNoReturn(s.elsebody);
+        scanCold(s.ifbody, ifCold && !elseCold);
+        scanCold(s.elsebody, elseCold && !ifCold);
         if (lifted)
             sresult = new CompoundStatement(s.loc, lifted, s);
     }
@@ -1748,12 +1821,12 @@ public:
     {
         //printf("CaseStatement.inlineScan()\n");
         inlineScan(s.exp);
-        inlineScan(s.statement);
+        scanCold(s.statement, endsInNoReturn(s.statement));
     }
 
     override void visit(DefaultStatement s)
     {
-        inlineScan(s.statement);
+        scanCold(s.statement, endsInNoReturn(s.statement));
     }
 
     override void visit(ReturnStatement s)
@@ -1813,7 +1886,7 @@ public:
         {
             foreach (c; *s.catches)
             {
-                inlineScan(c.handler);
+                scanCold(c.handler, true);
             }
         }
     }
@@ -1826,12 +1899,22 @@ public:
 
     override void visit(ThrowStatement s)
     {
+        ++coldDepth;
         inlineScan(s.exp);
+        --coldDepth;
     }
 
     override void visit(LabelStatement s)
     {
         inlineScan(s.statement);
+    }
+
+    /// Scan `s`, as a rarely run path if `cold`
+    void scanCold(ref Statement s, bool cold)
+    {
+        coldDepth += cold;
+        inlineScan(s);
+        coldDepth -= cold;
     }
 
     /********************************
@@ -1913,7 +1996,17 @@ public:
     override void visit(AssertExp e)
     {
         inlineScan(e.e1);
+        // the message is evaluated only when the assertion fails
+        ++coldDepth;
         inlineScan(e.msg);
+        --coldDepth;
+    }
+
+    override void visit(ThrowExp e)
+    {
+        ++coldDepth;
+        inlineScan(e.e1);
+        --coldDepth;
     }
 
     override void visit(CatExp e)
@@ -2058,6 +2151,12 @@ public:
             if (givenLiteral(e))
                 return true;
             const cost = inlineCostOf(fd);
+            /* on a path that runs rarely, as one ending in a throw, or in a call of a
+             * function that never returns, inlining saves next to nothing and only
+             * grows the caller
+             */
+            if (coldDepth || isNoReturn(e.type) || (cost > cheapCost && alwaysThrows(fd)))
+                return cost <= cheapCost;
             if (loopDepth)
             {
                 /* what is too costly outside loops is inlined into loops up to a
