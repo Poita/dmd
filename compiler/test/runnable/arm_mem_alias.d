@@ -254,6 +254,76 @@ pragma(inline, false) int dominatedStore(S* s, int* q, bool b, int v)
     return s.y;
 }
 
+// two declarations of the one static variable
+pragma(mangle, "arm_mem_alias_shared") __gshared int sameA;
+pragma(mangle, "arm_mem_alias_shared") extern __gshared int sameB;
+
+pragma(inline, false) int sameStatic(int v)
+{
+    sameA = 1;
+    sameB = v;
+    return sameA;
+}
+
+pragma(inline, false) int promoteAliasStore(S* s, int* q, int n)
+{
+    foreach (i; 0 .. n)
+    {
+        s.y += 1;
+        *q = 10;
+    }
+    return s.y;
+}
+
+pragma(inline, false) int promoteNarrowStore(S* s, int n)
+{
+    foreach (i; 0 .. n)
+    {
+        s.y += 0x101;
+        *cast(ubyte*)&s.y = 0;
+    }
+    return s.y;
+}
+
+pragma(inline, false) int promoteSkip(S* s, int n)
+{
+    foreach (i; 0 .. n)
+        s.y += i;
+    return n;
+}
+
+pragma(inline, false) int promoteSigned(B* p, int n)
+{
+    foreach (i; 0 .. n)
+        p.b += 100;
+    return p.b;
+}
+
+pragma(inline, false) int promoteRead(S* s, int* q, int n)
+{
+    int sum;
+    foreach (i; 0 .. n)
+    {
+        s.y = i;
+        sum += *q;
+    }
+    return sum;
+}
+
+pragma(inline, false) int promoteSum(S* s, int[] a)
+{
+    foreach (v; a)
+        s.y += v;
+    return s.y;
+}
+
+pragma(inline, false) float promoteFloatSum(S* s, int[] a)
+{
+    foreach (v; a)
+        s.f += v * 0.5f;
+    return s.f;
+}
+
 void main()
 {
     int a;
@@ -323,4 +393,21 @@ void main()
     check(dominatedLoop(&s, &s.x, 2) == 6);
     check(dominatedStore(&s, &s.y, true, 7) == 1);
     check(dominatedStore(&s, &s.x, true, 7) == 7);
+    check(sameStatic(5) == 5);
+
+    s = S.init;
+    check(promoteAliasStore(&s, &s.y, 3) == 10);
+    s.y = 0;
+    check(promoteNarrowStore(&s, 2) == 0x200);
+    check(promoteSkip(null, 0) == 0);
+    bb = B.init;
+    check(promoteSigned(&bb, 2) == -56);
+    check(promoteRead(&s, &s.y, 3) == 3);
+    auto big = new int[37];
+    foreach (i, ref v; big)
+        v = cast(int)i;
+    s = S.init;
+    check(promoteSum(&s, big) == 666 && s.y == 666);
+    s.f = 0;
+    check(promoteFloatSum(&s, big) == 333.0f && s.f == 333.0f);
 }

@@ -1,6 +1,7 @@
 // Each program in extra-files/arm_newcg_memopt has a load of each of its
-// functions named opt... removed, taken from a store or moved out of a loop by
-// the new AArch64 code generator, and runs correctly with and without that.
+// functions named opt<Kind>... optimized as that kind says (reuse, forward,
+// hoist, dominated) by the new AArch64 code generator, and runs
+// correctly with and without the memory optimizations.
 module test.dshell.arm_newcg_memopt;
 
 import dshell;
@@ -12,6 +13,7 @@ import std.path : baseName, stripExtension;
 import std.regex : matchAll, regex;
 import std.stdio : File, writeln;
 import std.string : lineSplitter;
+import std.uni : toLower;
 
 int main()
 {
@@ -32,18 +34,21 @@ int main()
         }
         const text = readText(src);
         const memLog = readText(log);
-        // the functions named opt..., by the names their mangled names end in
-        foreach (m; text.matchAll(regex(`\bopt[A-Z]\w*`)))
+        /* the functions named opt<Kind>..., by the names their mangled names end in,
+         * each with an optimization of that kind
+         */
+        foreach (m; text.matchAll(regex(`\bopt([A-Z][a-z]+)\w*`)))
         {
             const fn = m.hit;
             const tag = fn.length.to!string ~ fn;
+            const kind = "newcg-memopt: " ~ m[1].toLower ~ " ";
             bool done;
             foreach (line; memLog.lineSplitter)
-                if (line.canFind("newcg-memopt:") && line.canFind(tag))
+                if (line.canFind(kind) && line.canFind(tag))
                     done = true;
             if (!done)
             {
-                writeln(name, ": ", fn, " has no load optimized");
+                writeln(name, ": ", fn, " has no load optimized as ", m[1]);
                 ++failures;
             }
         }

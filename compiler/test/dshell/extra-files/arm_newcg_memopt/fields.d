@@ -1,5 +1,7 @@
-// Functions named opt... each have a load removed, taken from a store, or moved
-// out of a loop by the new AArch64 code generator's memory optimizations.
+// Each function named opt<Kind>... has a load optimized by the new AArch64 code
+// generator as Kind says: reused across a store (Reuse), taken from a store
+// (Forward), moved out of a loop (Hoist), taken from a dominating access
+// (Dominated).
 
 struct S { int x; int y; float f; long l; }
 
