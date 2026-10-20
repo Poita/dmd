@@ -305,23 +305,25 @@ struct SourceLoc
 /// Given the `index` of a `Loc`, find the index in `locFileTable` of the corresponding `BaseLoc`
 private size_t fileTableIndex(uint index) nothrow @nogc
 {
-    // To speed up linear find, we cache the last hit and compare that first,
-    // since usually we stay in the same file for some time when resolving source locations.
-    // If it's a different file now, either scan forwards / backwards
+    // Locations are usually resolved in runs within one file, so the last hit is checked
+    // first; otherwise the table, which is sorted by `startIndex`, is binary searched.
     size_t i = lastFileTableIndex;
-    if (index >= locFileTable[i].startIndex)
-    {
-        while (i + 1 < locFileTable.length && index >= locFileTable[i+1].startIndex)
-            i++;
-    }
-    else
-    {
-        while (index < locFileTable[i].startIndex)
-            i--;
-    }
+    if (index >= locFileTable[i].startIndex &&
+        (i + 1 == locFileTable.length || index < locFileTable[i + 1].startIndex))
+        return i;
 
-    lastFileTableIndex = i;
-    return i;
+    size_t lo = 0;
+    size_t hi = locFileTable.length;
+    while (hi - lo > 1)
+    {
+        const mid = lo + (hi - lo) / 2;
+        if (locFileTable[mid].startIndex <= index)
+            lo = mid;
+        else
+            hi = mid;
+    }
+    lastFileTableIndex = lo;
+    return lo;
 }
 
 /**
@@ -604,3 +606,34 @@ private __gshared BaseLoc*[] locFileTable;
 
 // Index of last found hit in locFileTable, for optimization
 private __gshared size_t lastFileTableIndex = 0;
+
+unittest
+{
+    Loc._init();
+    scope (exit) Loc._init();
+
+    // Each file's text has its index on line i + 1 of the file
+    enum nfiles = 37;
+    BaseLoc*[nfiles] bases;
+    foreach (i; 0 .. nfiles)
+    {
+        char[] text;
+        foreach (l; 0 .. i + 1)
+            text ~= "x\n";
+        bases[i] = newBaseLoc("f.d", text);
+        foreach (l; 0 .. i + 1)
+            bases[i].newLine(cast(uint) (2 * (l + 1)));
+    }
+
+    // Resolve locations in an order that jumps between distant files in both directions
+    foreach (k; 0 .. 4 * nfiles)
+    {
+        const i = (k * 17 + (k & 1) * 11) % nfiles;
+        const line = i % (i + 1);
+        const loc = bases[i].getLoc(cast(uint) (2 * line + 1));
+        const sl = SourceLoc(loc);
+        assert(sl.line == line + 1);
+        assert(sl.column == 2);
+        assert(loc.fileOffset == 2 * line + 1);
+    }
+}
