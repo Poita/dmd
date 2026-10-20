@@ -37,6 +37,7 @@ import dmd.backend.debugprint : WRfunc;
 import dmd.backend.dout : out_regcand;
 import dmd.backend.util2 : binary;
 import dmd.backend.inliner;
+import dmd.backend.grange : rangeopt;
 
 public import dmd.backend.gdag : builddags, boolopt;
 public import dmd.backend.gflow : flowrd, flowlv, flowvbe, flowcp, flowae, genkillae, numberae;
@@ -600,6 +601,12 @@ void optfunc(ref GlobalOptimizer go, ref BlockOpt bo)
             sliceFloatStructs(globsym, bo.startblock);
         if (go.mfoptim & MFcnp)
             constprop(go, bo, go.changes);  /* make relationals unsigned     */
+        /* Conditions proven by the relations holding where they are tested,
+         * such as array bounds checks, go before the loop optimizations, which
+         * then have fewer uses of the induction variables to keep
+         */
+        if (iter == 1 && go.mfoptim & MFcnp)
+            rangeopt(go, bo);
         if (go.mfoptim & (MFli | MFliv))
         {
             if (loopChanged)
