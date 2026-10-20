@@ -4974,6 +4974,20 @@ private Reg genx(elem* e)
         case OPabs:
         case OPsqrt:
         {
+            if (rc != RC.fp && op == OPabs)
+            {
+                // CMP a,#0; NEG n,a; CSEL d,n,a,LT
+                Reg a = gen(e.E1);
+                const isz = sz <= 4 ? 4 : 8;
+                if (sz < 4)
+                    a = extendFrom(a, sz * 8, true, 4);
+                emitIns(LOp.cmpi, isz, noReg, a, noReg, 0);
+                Reg n = newVreg(RC.gp, isz);
+                emitIns(LOp.neg, isz, n, a);
+                Reg d = newVreg(RC.gp, sz);
+                emitIns(LOp.csel, isz, d, n, a).cond = COND.lt;
+                return d;
+            }
             if (rc != RC.fp)
             {
                 fail("fp op");
