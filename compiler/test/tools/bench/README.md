@@ -79,9 +79,12 @@ sides are not the same source; the ratios track a dmd over time better than
 they compare it with ldc2.
 
 **dub** (held-out): `dub test` of packages from the local dub cache (no
-network): `dyaml` 0.9.2 and `emsi_containers` 0.9.0 by default, and
-`mir-algorithm` 3.22.4 on request; the compile cost is the build of the test
-runner, the run cost that runner.
+network): `dyaml` 0.9.2, `emsi_containers` 0.9.0, `mir-core` 1.7.4 and
+`taggedalgebraic` 1.0.1 by default, and `mir-algorithm` 3.22.4 on request; the
+compile cost is the build of the test runner, the run cost that runner.
+
+The run costs of the unittest runners are small, a good part of them process
+start-up, so their ratios say less than those of langbench and whiteout.
 
 ## Comparing two dmds
 

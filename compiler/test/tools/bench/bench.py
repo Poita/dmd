@@ -51,8 +51,10 @@ DUB_PACKAGES = {
     "dyaml": {"version": "0.9.2", "deps": {"tinyendian": "0.2.0"}},
     "emsi_containers": {"version": "0.9.0", "deps": {}},
     "mir-algorithm": {"version": "3.22.4", "deps": {"mir-core": "1.7.4"}},
+    "mir-core": {"version": "1.7.4", "deps": {}},
+    "taggedalgebraic": {"version": "1.0.1", "deps": {}},
 }
-DEFAULT_DUB_PACKAGES = ["dyaml", "emsi_containers"]
+DEFAULT_DUB_PACKAGES = ["dyaml", "emsi_containers", "mir-core", "taggedalgebraic"]
 
 # The whiteout headless simulation, the program the tuning has been driven by.
 WHITEOUT_RUN = ["--demo-battle", "--perf", "--units", "512", "--ticks", "400", "--seed", "7"]
@@ -309,11 +311,18 @@ def item_langbench(args, comp, mode, work, slug):
     res = {"compile": parse_time_log(tlog), "source": os.path.relpath(src, args.langbench)}
     if b.returncode:
         res["status"] = "build-failed"
-        res["build_log"] = (b.stdout + b.stderr)[-2000:]
+        res["build_log"] = failure_log(b.stdout + b.stderr)
         return res
     status, m = run_langbench_case(args.langbench, slug, os.path.join(dst, "run.sh"), args.timeout)
     res.update(status=status, run=m)
     return res
+
+
+def failure_log(text):
+    """What to keep of a failed build or test log: the lines naming failures, then its end."""
+    lines = text.splitlines()
+    marks = [l for l in lines if re.search(r"Error|FAIL|failure|error:", l)][:20]
+    return "\n".join(marks + ["..."] + lines[-30:])
 
 
 def dub_home_with(work, name, packages):
@@ -363,7 +372,7 @@ def item_whiteout(args, comp, mode, work):
     res = {"compile": parse_time_log(tlog)}
     if b.returncode:
         res["status"] = "build-failed"
-        res["build_log"] = (b.stdout + b.stderr)[-2000:]
+        res["build_log"] = failure_log(b.stdout + b.stderr)
         return res
     m = timed([os.path.join(wo, "whiteout-headless")] + WHITEOUT_RUN, wo, timeout=args.timeout * 10)
     res.update(status="ok" if m["rc"] == 0 else "timeout" if m["rc"] is None else "error", run=m)
@@ -393,7 +402,7 @@ def item_phobos(args, comp, mode, work, module):
     res = {"compile": parse_time_log(tlog), "source": path}
     if b.returncode:
         res["status"] = "build-failed"
-        res["build_log"] = (b.stdout + b.stderr)[-2000:]
+        res["build_log"] = failure_log(b.stdout + b.stderr)
         return res
     m = timed([exe], work, timeout=args.timeout)
     res.update(status="ok" if m["rc"] == 0 else "timeout" if m["rc"] is None else "error", run=m)
@@ -419,7 +428,7 @@ def item_dub(args, comp, mode, work, pkg):
                 and open(os.path.join(dst, f), "rb").read(4) in MACHO), None)
     if b.returncode or not exe:
         res["status"] = "build-failed" if not exe else "error"
-        res["build_log"] = (b.stdout + b.stderr)[-2000:]
+        res["build_log"] = failure_log(b.stdout + b.stderr)
         return res
     m = timed([exe], dst, timeout=args.timeout)
     res.update(status="ok" if m["rc"] == 0 else "timeout" if m["rc"] is None else "error", run=m)
@@ -520,6 +529,8 @@ def main():
     ap.add_argument("--build-timeout", type=float, default=1800.0, help="seconds per build")
     ap.add_argument("--out", default=None, help="directory for results.json and results.md")
     ap.add_argument("--keep", action="store_true", help="keep the scratch build directories")
+    ap.add_argument("--update", default=None, metavar="RESULTS_JSON",
+                    help="start from the results of an earlier run, replacing the items measured again")
     ap.add_argument("--no-lock", action="store_true", help="do not take the heavy-work lock (already held)")
     args = ap.parse_args()
 
@@ -538,6 +549,9 @@ def main():
     os.makedirs(out, exist_ok=True)
     scratch = tempfile.mkdtemp(prefix="cbench-work-")
     results = []
+    if args.update:
+        with open(args.update) as f:
+            results = json.load(f)["results"]
     items = plan(args)
     try:
         for set_name, suite, name, fn in items:
@@ -550,6 +564,9 @@ def main():
                     except Exception as e:  # a broken item is reported, not fatal
                         res = {"status": "harness-error", "error": repr(e)}
                     res.update(set=set_name, suite=suite, name=name, mode=mode, compiler=cname)
+                    key = (set_name, suite, name, mode, cname)
+                    results = [r for r in results
+                               if (r["set"], r["suite"], r["name"], r["mode"], r["compiler"]) != key]
                     results.append(res)
                     run = res.get("run", {})
                     log(f"{set_name:8s} {suite:9s} {name:22s} {mode:7s} {cname}: {res.get('status'):12s} "
