@@ -6753,9 +6753,14 @@ private void numberValues()
         h = h * 131 + i.b;
         h = h * 131 + i.c;
         h = h * 131 + cast(size_t)i.imm;
-        h = h * 131 + cast(size_t)cast(void*)i.sym;
+        // a symbol by its name, not its address, so which instructions the table
+        // keeps does not change from one compilation to the next
+        if (i.sym)
+            for (const(char)* c = i.sym.Sident.ptr; *c; ++c)
+                h = h * 31 + *c;
         h = h * 131 + i.flags * 7 + i.cond;
-        return h ^ (h >> 17);
+        // the high bits of the product depend on all of h, so the slots spread evenly
+        return (h * 0x9E3779B97F4A7C15UL) >> 40;
     }
     bool any;
     // what is known flows on into a segment entered only from the one before
