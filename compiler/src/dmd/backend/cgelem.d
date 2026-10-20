@@ -1556,12 +1556,12 @@ private elem* elbitwise(elem* e, Goal goal)
                 goto Lopt;
             }
 
-            // Replace (((a & b) ^ c) & d) with ((a ^ c) & e), where
-            // e is (b&d).
+            // Replace (((a & b) ^ c) & d) with ((a ^ c) & d) when d has no
+            // bits outside b, as then b clears none of the bits d keeps
             if (e.Eoper == OPand && op == OPxor && e1.E1.Eoper == OPand &&
-                e1.E1.E2.Eoper == OPconst)
+                e1.E1.E2.Eoper == OPconst &&
+                (ul & ~el_tolong(e1.E1.E2) & (sz >= 8 ? ~0UL : (1UL << (sz * 8)) - 1)) == 0)
             {
-                e2.Vullong &= e1.E1.E2.Vullong;
                 e1.E1 = el_selecte1(e1.E1);
                 goto Lopt;
             }
