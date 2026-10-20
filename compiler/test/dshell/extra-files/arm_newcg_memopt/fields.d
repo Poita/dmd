@@ -100,6 +100,16 @@ pragma(inline, false) int optPromote(S* s, int[] a)
     return s.y;
 }
 
+// s.x is kept in a register through a loop with a bounds check, whose failure
+// does not come back into the loop
+pragma(inline, false) int optPromoteChecked(S* s, int[] a, int n)
+{
+    s.x = n;
+    foreach (i; 0 .. n)
+        s.x += a[i];
+    return s.x;
+}
+
 // the long is read back from the store made of it
 pragma(inline, false) long optForwardLong(S* s, long v, int w)
 {
@@ -122,4 +132,12 @@ void main()
     s.y = 1;
     check(optPromote(&s, [1, 2, 3]) == 7 && s.x == 2 + 4 + 7);
     check(optForwardLong(&s, 1L << 40, -2) == (1L << 40) - 2);
+    check(optPromoteChecked(&s, [1, 2, 3], 3) == 9);
+    // the bounds error leaves s.x as the stores before it made it
+    bool caught;
+    try
+        optPromoteChecked(&s, [1, 2, 3], 5);
+    catch (Error e)
+        caught = true;
+    check(caught && s.x == 11);
 }

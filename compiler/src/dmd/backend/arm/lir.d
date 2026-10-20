@@ -8333,6 +8333,11 @@ private void promoteLoopMemory()
                 const i = &ins[n];
                 if (i.d && !isPhys(i.d))
                     defInLoop[i.d - firstVreg] = true;
+                /* a call that does not return, nor go to a landing pad here, leaves the
+                 * loop for good, with memory as the stores made it
+                 */
+                if (i.op == LOp.call && i.flags & F.noreturn && !i.target && !blocks[segBlock[v]].Btry)
+                    continue;
                 if (writesMemory(*i) || i.op == LOp.call)
                 {
                     barrier |= memoryBarrier(*i) || i.op == LOp.call || done[n];
