@@ -1739,9 +1739,9 @@ private elem* selectableAssign(block* b, block* pred, out elem* tail)
     {
         /* an integer operation on the variable, of an operand that is cheap: one that
          * cannot fault, nor raise a floating point exception that the arm not taken
-         * would not
+         * would not, and at most one operation itself
          */
-        int budget = 2;
+        int budget = 3;
         if (tyfloating(ty) || rcOf(r) != RC.gp || !cheapArm(a.E2, budget) ||
             (a.Eoper == OPshlass || a.Eoper == OPshrass || a.Eoper == OPashrass) && a.E2.Eoper != OPconst)
             return null;
