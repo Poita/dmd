@@ -1023,6 +1023,12 @@ void writefunc2(Symbol* sfunc, ref GlobalOptimizer go, ref BlockOpt bo)
     {
         //printf("blockopt()\n");
         blockopt(go, bo, go.changes);       /* optimize                     */
+        // a function too large for the global optimizer still gets what -O selects
+        if (mfoptimSave)
+        {
+            import dmd.backend.go : pairSinCos;
+            pairSinCos(bo);
+        }
     }
 
     assert(funcsym_p == sfunc);

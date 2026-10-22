@@ -682,6 +682,8 @@ void optfunc(ref GlobalOptimizer go, ref BlockOpt bo)
         duplicateTests(bo);
     }
 
+    pairSinCos(bo);
+
     for (block* b = bo.startblock; b; b = b.Bnext)
     {
         if (b.Belem)
@@ -708,5 +710,575 @@ void optfunc(ref GlobalOptimizer go, ref BlockOpt bo)
     for (block* b = bo.startblock; b; b = b.Bnext)
     {
         block_optimizer_free(b);
+    }
+}
+
+/************************************* Sine and cosine pairs ***********************************/
+
+/* The sine and cosine of one value, both computed in the same straight-line
+ * code, are taken from one call to Darwin's __sincosf_stret or __sincos_stret,
+ * which is how LLVM selects them on Darwin. The combined call and the separate
+ * libm calls differ in the last bit for some arguments, so optimized code makes
+ * the same choice as LLVM to compute the same bits as code built by LDC.
+ *
+ * A pair is two calls of the C functions sinf and cosf, or sin and cos (sinl
+ * and cosl where real is double), in one block, outside of conditional code
+ * that has calls or assignments, with matching arguments that nothing assigns
+ * between the calls. A call with a constant argument is folded instead.
+ */
+
+private struct SinCosCand
+{
+    elem* e;            // the call
+    bool isCos;
+}
+
+private struct SinCosGroup
+{
+    elem* arg;          // the argument of its first call
+    bool dbl;           // double, not float
+    bool open;          // calls further on can join it
+    bool hasSin, hasCos;
+    elem** stmt;        // the statement its first call is in
+    bool hoist;         // the combined call can go before that statement
+    Barray!(elem*) path;    // the elems from its first call up to that statement
+    Barray!SinCosCand cands;
+}
+
+private __gshared
+{
+    Barray!SinCosGroup sinCosGroups;
+    size_t sinCosFloor;             // the first group the current code can join
+    elem** sinCosStmt;              // the statement being walked
+    Barray!(elem*) sinCosPath;      // the elems being walked, outermost first
+    Barray!(Symbol*) sinCosStmtWrites;  // the variables it assigns
+    bool sinCosStmtMemWrite;            // whether it writes memory
+    bool sinCosStmtCond;                // whether it has conditional code
+    type*[2] sinCosType;            // { float s, c; } and { double s, c; }
+    Symbol*[2] sinCosFunc;          // __sincosf_stret and __sincos_stret
+}
+
+/* Which of sin or cos call e is: 1 for sine, 2 for cosine, 0 for neither,
+ * with whether it is the double function
+ */
+@trusted
+private int sinCosKind(const(elem)* e, out bool dbl)
+{
+    if (e.Eoper != OPcall || e.E1.Eoper != OPvar || e.E2.Eoper == OPparam)
+        return 0;
+    const s = e.E1.Vsym;
+    if (!s.Stype || !tyfunc(s.Stype.Tty) || type_mangle(s.Stype) != Mangle.c)
+        return 0;
+    if (s.Sclass != SC.extern_ && s.Sclass != SC.global)
+        return 0;
+    const ty = tybasic(e.Ety);
+    if (!tyfloating(ty) || tycomplex(ty) || tyimaginary(ty) || tybasic(e.E2.Ety) != ty)
+        return 0;
+    const sz = tysize(ty);
+    const(char)[] name = s.Sident.ptr[0 .. strlen(s.Sident.ptr)];
+    if (sz == 4)
+    {
+        if (name == "sinf") return 1;
+        if (name == "cosf") return 2;
+    }
+    else if (sz == 8)
+    {
+        dbl = true;
+        if (name == "sin" || name == "sinl") return 1;
+        if (name == "cos" || name == "cosl") return 2;
+    }
+    return 0;
+}
+
+/* Replace the call e of sin or cos of a constant with its value, computed the
+ * way LLVM folds the libm call: in double with the host's libm, then rounded
+ * to the type of the call. Like LLVM, a call that raises a floating point
+ * exception other than inexact stays.
+ */
+@trusted
+private void sinCosFold(elem* e, bool isCos)
+{
+    import core.stdc.errno : errno, EDOM, ERANGE;
+    import core.stdc.fenv : feclearexcept, fetestexcept, FE_ALL_EXCEPT, FE_INEXACT;
+    import core.stdc.math : cos, sin;
+
+    const isFloat = tysize(e.Ety) == 4;
+    const double x = isFloat ? e.E2.Vfloat : e.E2.Vdouble;
+    if (x != x || x - x != 0)
+        return;                         // NaN or infinity
+    feclearexcept(FE_ALL_EXCEPT);
+    errno = 0;
+    const double r = isCos ? cos(x) : sin(x);
+    if (errno == EDOM || errno == ERANGE || fetestexcept(FE_ALL_EXCEPT & ~FE_INEXACT))
+        return;
+    el_free(e.E1);
+    el_free(e.E2);
+    e.Eoper = OPconst;
+    e.EV = Vconst.init;
+    if (isFloat)
+        e.Vfloat = cast(float) r;
+    else
+        e.Vdouble = r;
+}
+
+/* Whether e is an argument a pair can share: arithmetic on variables and
+ * loads, with no call or assignment
+ */
+@trusted
+private bool sinCosArg(const(elem)* e)
+{
+    switch (e.Eoper)
+    {
+        case OPvar:
+            return !(e.Vsym.ty() & mTYvolatile);
+        case OPconst:
+            return true;
+        case OPind:
+            return !(e.Ety & mTYvolatile) && sinCosArg(e.E1);
+        case OPrelconst:
+            return true;
+        case OPadd: case OPmin: case OPmul: case OPdiv:
+            return sinCosArg(e.E1) && sinCosArg(e.E2);
+        case OPneg:
+        case OPd_f: case OPf_d:
+        case OPs32_d: case OPu32_d: case OPs64_d: case OPu64_d:
+        case OPs16_d:
+            return sinCosArg(e.E1);
+        default:
+            return false;
+    }
+}
+
+/* Whether a and b compute the same value, whatever their type modifiers
+ */
+@trusted
+private bool sinCosMatch(const(elem)* a, const(elem)* b)
+{
+    if (a.Eoper != b.Eoper || tybasic(a.Ety) != tybasic(b.Ety))
+        return false;
+    switch (a.Eoper)
+    {
+        case OPvar:
+        case OPrelconst:
+            return a.Vsym == b.Vsym && a.Voffset == b.Voffset;
+        case OPconst:
+            return el_match(a, b);
+        default:
+            if (OTbinary(a.Eoper))
+                return sinCosMatch(a.E1, b.E1) && sinCosMatch(a.E2, b.E2);
+            if (OTunary(a.Eoper))
+                return sinCosMatch(a.E1, b.E1);
+            return false;
+    }
+}
+
+/* Whether e reads the variable s, or reads memory and s is null
+ */
+@trusted
+private bool sinCosReads(const(elem)* e, const(Symbol)* s)
+{
+    if (!e)
+        return false;
+    switch (e.Eoper)
+    {
+        case OPvar:
+            return s ? e.Vsym == s : Symbol_isAffected(*e.Vsym);
+        case OPind:
+            return !s || sinCosReads(e.E1, s);
+        case OPconst:
+        case OPrelconst:
+            return false;
+        default:
+            if (OTbinary(e.Eoper) && sinCosReads(e.E2, s))
+                return true;
+            return OTunary(e.Eoper) || OTbinary(e.Eoper) ? sinCosReads(e.E1, s) : false;
+    }
+}
+
+/* Close the groups the write of s (or of memory, for null) changes the
+ * argument of
+ */
+@trusted
+private void sinCosWrite(const(Symbol)* s)
+{
+    foreach (ref g; sinCosGroups[])
+        if (g.open && sinCosReads(g.arg, s))
+            g.open = false;
+}
+
+/* Close the groups from first on
+ */
+@trusted
+private void sinCosClose(size_t first)
+{
+    foreach (ref g; sinCosGroups[first .. $])
+        g.open = false;
+}
+
+/* What the statement e assigns, into sinCosStmtWrites and sinCosStmtMemWrite
+ */
+@trusted
+private void sinCosStmtScan(const(elem)* e)
+{
+    if (!e)
+        return;
+    const op = e.Eoper;
+    bool dbl;
+    if (OTcall(op) && sinCosKind(e, dbl) == 0)
+        sinCosStmtMemWrite = true;
+    if (OTassign(op))
+    {
+        if (e.E1.Eoper == OPvar)
+        {
+            sinCosStmtWrites.push(cast(Symbol*)e.E1.Vsym);
+            if (Symbol_isAffected(*e.E1.Vsym))
+                sinCosStmtMemWrite = true;
+        }
+        else
+            sinCosStmtMemWrite = true;
+    }
+    else if (op == OPmemcpy || op == OPmemset || op == OPstrcpy || op == OPstrcat)
+        sinCosStmtMemWrite = true;
+    if (op == OPandand || op == OPoror || op == OPcond || op == OPhalt)
+        sinCosStmtCond = true;
+    if (OTbinary(op))
+    {
+        sinCosStmtScan(e.E1);
+        sinCosStmtScan(e.E2);
+    }
+    else if (OTunary(op))
+        sinCosStmtScan(e.E1);
+}
+
+/* Whether e has a call or an assignment
+ */
+@trusted
+private bool sinCosEffects(const(elem)* e)
+{
+    if (!e)
+        return false;
+    const op = e.Eoper;
+    if (OTcall(op) || OTassign(op) || op == OPmemcpy || op == OPmemset || op == OPstrcpy ||
+        op == OPstrcat || op == OPhalt || op == OPvp_fp || op == OPcvp_fp)
+        return true;
+    if (OTbinary(op))
+        return sinCosEffects(e.E1) || sinCosEffects(e.E2);
+    if (OTunary(op))
+        return sinCosEffects(e.E1);
+    return false;
+}
+
+/* Walk the code at *pe, a statement or a sequence of them
+ */
+@trusted
+private void sinCosStatements(elem** pe)
+{
+    elem* e = *pe;
+    if (e.Eoper == OPcomma)
+    {
+        sinCosStatements(&e.E1);
+        sinCosStatements(&e.E2);
+        return;
+    }
+    auto saveStmt = sinCosStmt;
+    const saveMem = sinCosStmtMemWrite;
+    const saveCond = sinCosStmtCond;
+    const saveWrites = sinCosStmtWrites.length;
+    sinCosStmt = pe;
+    sinCosStmtMemWrite = false;
+    sinCosStmtCond = false;
+    sinCosStmtScan(e);
+    sinCosWalk(e);
+    sinCosStmt = saveStmt;
+    sinCosStmtMemWrite = saveMem;
+    sinCosStmtCond = saveCond;
+    sinCosStmtWrites.setLength(saveWrites);
+}
+
+/* Walk the code at *pe, which runs only under a condition
+ */
+@trusted
+private void sinCosArm(elem** pe)
+{
+    const saveFloor = sinCosFloor;
+    const first = sinCosGroups.length;
+    sinCosFloor = first;
+    sinCosStatements(pe);
+    sinCosClose(first);
+    sinCosFloor = saveFloor;
+}
+
+/* Whether the call being walked is evaluated after the call path leads to:
+ * in another statement, or after a comma or a condition evaluated first
+ */
+@trusted
+private bool sinCosSequenced(elem*[] path)
+{
+    auto cur = sinCosPath[];
+    size_t i = 0;
+    while (i < path.length && i < cur.length && path[i] == cur[i])
+        ++i;
+    if (i == 0)
+        return true;                    // another statement
+    if (i == path.length || i == cur.length)
+        return false;
+    const lca = path[i - 1];
+    switch (lca.Eoper)
+    {
+        case OPcomma:
+        case OPandand:
+        case OPoror:
+        case OPcond:
+            return path[i] == lca.E1 && cur[i] == lca.E2;
+        default:
+            return false;
+    }
+}
+
+/* Walk e in the order it is evaluated
+ */
+@trusted
+private void sinCosWalk(elem* e)
+{
+    if (!e)
+        return;
+    sinCosPath.push(e);
+    scope (exit) sinCosPath.setLength(sinCosPath.length - 1);
+    const op = e.Eoper;
+    switch (op)
+    {
+        case OPcomma:
+            sinCosWalk(e.E1);
+            sinCosWalk(e.E2);
+            return;
+
+        case OPandand:
+        case OPoror:
+            sinCosWalk(e.E1);
+            sinCosArm(&e.E2);
+            if (sinCosEffects(e.E2))
+                sinCosClose(0);         // the rest is in other basic blocks
+            return;
+
+        case OPcond:
+            sinCosWalk(e.E1);
+            if (e.E2.Eoper == OPcolon || e.E2.Eoper == OPcolon2)
+            {
+                sinCosArm(&e.E2.E1);
+                sinCosArm(&e.E2.E2);
+            }
+            else
+                sinCosArm(&e.E2);
+            if (sinCosEffects(e.E2))
+                sinCosClose(0);
+            return;
+
+        default:
+            break;
+    }
+
+    if (OTcall(op))
+    {
+        if (OTbinary(op))
+            sinCosWalk(e.E2);
+        if (e.E1.Eoper != OPvar)
+            sinCosWalk(e.E1);
+        bool dbl;
+        const kind = sinCosKind(e, dbl);
+        if (kind == 0)
+        {
+            sinCosWrite(null);          // a call can write memory
+            return;
+        }
+        /* The value of the argument is what calls match on: the variable an
+         * argument assigns stands for it
+         */
+        elem* arg = e.E2;
+        const assigns = arg.Eoper == OPeq && arg.E1.Eoper == OPvar;
+        elem* key = assigns ? arg.E1 : arg;
+        if (arg.Eoper == OPconst)
+        {
+            sinCosFold(e, kind == 2);
+            return;
+        }
+        if (!sinCosArg(key))
+            return;
+        SinCosGroup* g;
+        foreach (ref gi; sinCosGroups[sinCosFloor .. $])
+            if (gi.open && gi.dbl == dbl && sinCosMatch(gi.arg, key))
+            {
+                g = &gi;
+                break;
+            }
+        if (g)
+        {
+            /* Where the combined call replaces the first call, the others must
+             * be evaluated after it
+             */
+            if (!g.hoist && !sinCosSequenced(g.path[]))
+                return;
+        }
+        else
+        {
+            g = sinCosGroups.push();
+            *g = SinCosGroup.init;
+            g.arg = key;
+            g.dbl = dbl;
+            g.open = true;
+            g.stmt = sinCosStmt;
+            /* The combined call goes before the statement if the statement
+             * does not change the argument and has no test that may guard a
+             * load of it; otherwise it replaces the first call
+             */
+            g.hoist = !assigns && !(sinCosStmtCond && sinCosReads(arg, null)) &&
+                !(sinCosStmtMemWrite && sinCosReads(arg, null));
+            foreach (s; sinCosStmtWrites[])
+                if (sinCosReads(arg, s))
+                    g.hoist = false;
+            foreach (p; sinCosPath[])
+                g.path.push(p);
+        }
+        g.cands.push(SinCosCand(e, kind == 2));
+        if (kind == 2)
+            g.hasCos = true;
+        else
+            g.hasSin = true;
+        return;
+    }
+
+    if (OTassign(op))
+    {
+        sinCosWalk(e.E2);
+        elem* e1 = e.E1;
+        if (e1.Eoper == OPvar)
+        {
+            sinCosWrite(e1.Vsym);
+            if (Symbol_isAffected(*e1.Vsym))
+                sinCosWrite(null);
+        }
+        else
+        {
+            sinCosWalk(e1);
+            sinCosWrite(null);
+        }
+        return;
+    }
+
+    if (OTbinary(op))
+    {
+        sinCosWalk(e.E1);
+        sinCosWalk(e.E2);
+    }
+    else if (OTunary(op))
+        sinCosWalk(e.E1);
+    if (op == OPmemcpy || op == OPmemset || op == OPstrcpy || op == OPstrcat)
+        sinCosWrite(null);
+}
+
+/* Rewrite the calls of g as reads of one combined call's result
+ */
+@trusted
+private void sinCosFuse(ref SinCosGroup g)
+{
+    const i = g.dbl;
+    const tyf = g.dbl ? TYdouble : TYfloat;
+    const esz = g.dbl ? 8 : 4;
+    if (!sinCosType[i])
+    {
+        type* te = tstypes[tyf];
+        type* t = type_struct_class(g.dbl ? "__double2" : "__float2", esz, 2 * esz, te, te,
+            false, false, true, false);
+        sinCosType[i] = t;
+        type*[1] params = [te];
+        type* tf = type_function(TYnfunc, params[], false, t);
+        tf.Tmangle = Mangle.c;
+        sinCosFunc[i] = symbol_name(g.dbl ? "__sincos_stret" : "__sincosf_stret", SC.extern_, tf);
+    }
+    type* t = sinCosType[i];
+    Symbol* tmp = symbol_genauto(t);
+
+    elem* first = g.cands[0].e;
+    elem* arg = g.hoist ? el_copytree(first.E2) : first.E2;
+    elem* call = el_bin(OPcall, TYstruct, el_var(sinCosFunc[i]), arg);
+    call.ET = t;
+    elem* lhs = el_var(tmp);
+    lhs.ET = t;
+    elem* eq = el_bin(OPstreq, TYstruct, lhs, call);
+    eq.ET = t;
+    if (g.hoist)
+    {
+        *g.stmt = el_bin(OPcomma, (*g.stmt).Ety, eq, *g.stmt);
+        if (tyaggregate((*g.stmt).Ety))
+            (*g.stmt).ET = (*g.stmt).E2.ET;
+    }
+
+    foreach (k, ref c; g.cands[])
+    {
+        elem* e = c.e;
+        el_free(e.E1);
+        const ty = e.Ety;
+        elem* ev = el_var(tmp);
+        ev.Ety = ty;
+        ev.Voffset = c.isCos ? esz : 0;
+        if (k == 0 && !g.hoist)
+        {
+            // the first call becomes (tmp = combined call, its part)
+            e.Eoper = OPcomma;
+            e.E1 = eq;
+            e.E2 = ev;
+        }
+        else
+        {
+            el_free(e.E2);
+            *e = *ev;
+            ev.Eoper = OPconst;         // no longer refers to tmp
+            el_free(ev);
+        }
+    }
+}
+
+/* Whether b continues the straight-line code of the block before it
+ */
+@trusted
+private bool sinCosContinues(ref BlockOpt bo, block* b)
+{
+    if (b == bo.startblock || b.Bpred.length != 1)
+        return false;
+    block* p = b.Bpred[0];
+    return p != b && p.bc == BC.goto_ && p.Bsucc[0] == b && p.Btry == b.Btry;
+}
+
+/***************************************
+ * Pair the sine and cosine calls of the function's straight-line code, each
+ * a block and the blocks that continue it, on Darwin AArch64.
+ * Params:
+ *      bo = the function's blocks
+ */
+@trusted
+void pairSinCos(ref BlockOpt bo)
+{
+    if (config.target_cpu != TARGET_AArch64 || config.exe != EX_OSX64)
+        return;
+    for (block* b = bo.startblock; b; b = b.Bnext)
+    {
+        if (sinCosContinues(bo, b))
+            continue;
+        foreach (ref g; sinCosGroups[])
+        {
+            g.cands.dtor();
+            g.path.dtor();
+        }
+        sinCosGroups.setLength(0);
+        sinCosFloor = 0;
+        for (block* x = b; ; x = x.Bsucc[0])
+        {
+            if (x.Belem)
+                sinCosStatements(&x.Belem);
+            if (x.bc != BC.goto_ || !sinCosContinues(bo, x.Bsucc[0]))
+                break;
+        }
+        foreach (ref g; sinCosGroups[])
+            if (g.hasSin && g.hasCos)
+                sinCosFuse(g);
     }
 }
