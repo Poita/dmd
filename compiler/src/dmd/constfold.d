@@ -271,6 +271,42 @@ UnionExp Mul(Loc loc, Type type, Expression e1, Expression e2)
     return ue;
 }
 
+/***********************************
+ * Bring the integer operands of a division or remainder to the type they
+ * promote to together: the operands of an op-assignment keep their own types,
+ * as in `int /= uint`, which divides as uint.
+ * Params:
+ *      e1 = left operand
+ *      e2 = right operand
+ *      n1 = value of e1, converted
+ *      n2 = value of e2, converted
+ *      wide = set when the operation is 64 bits wide
+ * Returns:
+ *      true when the operation is unsigned
+ */
+private bool promoteDivOperands(Expression e1, Expression e2, ref sinteger_t n1, ref sinteger_t n2, out bool wide)
+{
+    Type t1 = e1.type.toBasetype();
+    Type t2 = e2.type.toBasetype();
+    if (!t1.isIntegral() || !t2.isIntegral() || t1.ty == Tvector || t2.ty == Tvector)
+    {
+        wide = true;
+        return t1.isUnsigned() || t2.isUnsigned();
+    }
+    const sz1 = t1.size();
+    const sz2 = t2.size();
+    wide = sz1 > 4 || sz2 > 4;
+    // operands narrower than int promote to int, which is signed
+    const width = wide ? 8 : 4;
+    const uns = (t1.isUnsigned() && sz1 >= width) || (t2.isUnsigned() && sz2 >= width);
+    if (!wide)
+    {
+        n1 = uns ? cast(sinteger_t)cast(uint)n1 : cast(sinteger_t)cast(int)n1;
+        n2 = uns ? cast(sinteger_t)cast(uint)n2 : cast(sinteger_t)cast(int)n2;
+    }
+    return uns;
+}
+
 UnionExp Div(Loc loc, Type type, Expression e1, Expression e2)
 {
     UnionExp ue = void;
@@ -322,10 +358,12 @@ UnionExp Div(Loc loc, Type type, Expression e1, Expression e2)
             emplaceExp!(ErrorExp)(&ue);
             return ue;
         }
-        if (n2 == -1 && !type.isUnsigned())
+        bool wide;
+        const uns = promoteDivOperands(e1, e2, n1, n2, wide);
+        if (n2 == -1 && !uns)
         {
             // Check for int.min / -1
-            if (n1 == 0xFFFFFFFF80000000UL && type.toBasetype().ty != Tint64)
+            if (n1 == 0xFFFFFFFF80000000UL && !wide)
             {
                 eSink.error(e2.loc, "integer overflow: `int.min / -1`");
                 emplaceExp!(ErrorExp)(&ue);
@@ -338,7 +376,7 @@ UnionExp Div(Loc loc, Type type, Expression e1, Expression e2)
                 return ue;
             }
         }
-        if (e1.type.isUnsigned() || e2.type.isUnsigned())
+        if (uns)
             n = (cast(dinteger_t)n1) / (cast(dinteger_t)n2);
         else
             n = n1 / n2;
@@ -388,10 +426,12 @@ UnionExp Mod(Loc loc, Type type, Expression e1, Expression e2)
             emplaceExp!(ErrorExp)(&ue);
             return ue;
         }
-        if (n2 == -1 && !type.isUnsigned())
+        bool wide;
+        const uns = promoteDivOperands(e1, e2, n1, n2, wide);
+        if (n2 == -1 && !uns)
         {
             // Check for int.min % -1
-            if (n1 == 0xFFFFFFFF80000000UL && type.toBasetype().ty != Tint64)
+            if (n1 == 0xFFFFFFFF80000000UL && !wide)
             {
                 eSink.error(e2.loc, "integer overflow: `int.min %% -1`");
                 emplaceExp!(ErrorExp)(&ue);
@@ -404,7 +444,7 @@ UnionExp Mod(Loc loc, Type type, Expression e1, Expression e2)
                 return ue;
             }
         }
-        if (e1.type.isUnsigned() || e2.type.isUnsigned())
+        if (uns)
             n = (cast(dinteger_t)n1) % (cast(dinteger_t)n2);
         else
             n = n1 % n2;
