@@ -1140,7 +1140,15 @@ private void intranges(ref Elemdatas rellist, ref Elemdatas inclist, ref uint ch
             }
             else if (final_ >= initial)
             {
-                if (increment > 0 && ((final_ - initial) % increment) == 0)
+                /* With (i <= final_) or (i > final_) the variable reaches
+                 * final_ + increment, which must not wrap around to a value
+                 * the signed and the unsigned comparison order differently
+                 */
+                const sz = tysize(rel.pelem.E1.Ety);
+                const targ_llong max = sz >= 8 ? targ_llong.max : (1L << (sz * 8 - 1)) - 1;
+                const reachesNext = relatop == OPle || relatop == OPgt;
+                if (increment > 0 && ((final_ - initial) % increment) == 0 &&
+                    !(reachesNext && final_ > max - increment))
                     goto makeuns;
             }
             else if (final_ >= 0)
