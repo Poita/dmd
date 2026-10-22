@@ -236,12 +236,50 @@ nothrow:
     vec_t all;
     uint changes;
 
+    Barray!uint slots;              // a hash table of the facts: index + 1, 0 for none
+
+    static size_t hashOf(ref const Term t)
+    {
+        size_t h = t.s ? t.s.Ssymnum + 1 : 0;
+        h = h * 31 + t.off;
+        h = h * 31 + (t.vsize | t.size << 8 | t.ext << 16);
+        return h * 31 + cast(size_t)t.c;
+    }
+
+    static size_t hashOf(ref const Fact f)
+    {
+        const h = (hashOf(f.a) * 131 + hashOf(f.b)) * 7 + f.rel;
+        return (h * 0x9E3779B97F4A7C15UL) >> 32;
+    }
+
+    /* Index the facts in `slots`, at most half full
+     */
+    @trusted
+    void index()
+    {
+        size_t size = 16;
+        while (size < 2 * facts.length + 2)
+            size *= 2;
+        slots.setLength(size);
+        slots[][] = 0;
+        foreach (i, ref f; facts[])
+        {
+            size_t k = hashOf(f) & (size - 1);
+            while (slots[k])
+                k = (k + 1) & (size - 1);
+            slots[k] = cast(uint)i + 1;
+        }
+    }
+
     @trusted
     int find(ref const Fact f)
     {
-        foreach (i, ref g; facts[])
-            if (g == f)
-                return cast(int)i;
+        if (!slots.length)
+            return -1;
+        const mask = slots.length - 1;
+        for (size_t k = hashOf(f) & mask; slots[k]; k = (k + 1) & mask)
+            if (facts[slots[k] - 1] == f)
+                return slots[k] - 1;
         return -1;
     }
 
@@ -253,6 +291,16 @@ nothrow:
         if (f.rel == Rel.eq && f.a.s is null && f.b.s is null)
             return;
         facts.push(f);
+        if (2 * facts.length + 2 > slots.length)
+            index();
+        else
+        {
+            const mask = slots.length - 1;
+            size_t k = hashOf(f) & mask;
+            while (slots[k])
+                k = (k + 1) & mask;
+            slots[k] = cast(uint)facts.length;
+        }
     }
 
     /* Collect the facts the function can use
@@ -347,6 +395,7 @@ nothrow:
             if (f.rel != Rel.eq || (f.a.s && used[f.a.s.Ssymnum]) || (f.b.s && used[f.b.s.Ssymnum]))
                 facts[n++] = f;
         facts.setLength(n);
+        index();
     }
 
     static bool mentions(ref const Term t, const Symbol* s)
@@ -756,6 +805,7 @@ nothrow:
             a.dtor();
         bySym.dtor();
         facts.dtor();
+        slots.dtor();
         if (all)
             vec_free(all);
     }
