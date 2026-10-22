@@ -2997,6 +2997,15 @@ private void elimbasivs(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
                 ref_.Eoper = cast(ubyte)swaprel(ref_.Eoper);
             }
 
+            /* An integer c1*X+c2 with c2 not known can wrap around within the
+             * loop where X does not, which reorders it, and with c1 even maps
+             * different X to the same value
+             */
+            if (tyintegral(fl.FLty) && !typtr(fl.FLty) && fl.c2.Eoper != OPconst &&
+                (ref_.Eoper >= OPle && ref_.Eoper <= OPge ||
+                 fl.c1.Eoper != OPconst || !(el_tolong(fl.c1) & 1)))
+                continue;
+
             // If e*c1+c2 would result in a sign change or an overflow
             // then we can't do it
             if (fl.c1.Eoper == OPconst)
