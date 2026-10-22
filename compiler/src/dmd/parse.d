@@ -2661,7 +2661,7 @@ class Parser(AST, Lexer = dmd.lexer.Lexer) : Lexer
         else
         {
             error("(expression) expected following `static if`");
-            exp = null;
+            exp = AST.ErrorExp.get();
         }
         condition = new AST.StaticIfCondition(loc, exp);
         return condition;
