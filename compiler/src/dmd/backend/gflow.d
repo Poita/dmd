@@ -65,6 +65,198 @@ void* util_realloc(void* p, size_t n, size_t size)
     return q;
 }
 
+/***************** EXCEPTION EDGES *********************/
+
+/* The flow graph has no edges for exceptions. A block of the body a try guards
+ * that calls a function may throw, from anywhere in it, before or after any of
+ * its definitions, to the handlers of each try enclosing it: the catch blocks,
+ * or the landing pad of a finally. The data flow analyses and the loops take
+ * these edges from here.
+ */
+struct EhEdges
+{
+    bool any;                   // a block may throw to a handler
+    vec_t throws;               // by dfo index: the block may throw to a handler
+    Barray!uint tryIndex;       // by dfo index: index in tries[] of a try block, or of the try
+                                // a handler is entered by, or uint.max
+    Barray!(block*) tries;      // the try blocks in the flow graph
+    Barray!uint guardStart;     // by index in tries[]: start of its blocks in guarded[]
+    Barray!uint guarded;        // the dfo indices of the blocks that may throw to each try's handlers
+
+  nothrow:
+
+    /*******************************
+     * Find the exception edges of the flow graph bo.dfo[].
+     */
+    @trusted
+    void compute(ref BlockOpt bo)
+    {
+        any = false;
+        tries.setLength(0);
+        guarded.setLength(0);
+        const n = bo.dfo.length;
+        bool anyTry;
+        foreach (b; bo.dfo[])
+        {
+            if (b.bc == BC.try_)
+                anyTry = true;
+        }
+        if (!anyTry)
+            return;
+
+        tryIndex.setLength(n);
+        tryIndex[][] = uint.max;
+        foreach (b; bo.dfo[])
+        {
+            if (b.bc != BC.try_)
+                continue;
+            const t = cast(uint)tries.length;
+            tries.push(b);
+            tryIndex[b.Bdfoidx] = t;
+            foreach (h; b.Bsucc[1 .. $])
+            {
+                h = handlerEntry(h);
+                if (inDfo(bo, h))
+                    tryIndex[h.Bdfoidx] = t;
+            }
+        }
+
+        vec_free(throws);
+        throws = vec_calloc(n);
+        guardStart.setLength(tries.length + 1);
+        guardStart[][] = 0;
+        foreach (i, b; bo.dfo[])
+        {
+            if (!b.Btry || !(b.bc == BC.asm_ || b.Belem && mayThrow(b.Belem)))
+                continue;
+            bool guards;
+            for (block* t = b.Btry; t; t = t.Btry)
+            {
+                if (isTry(bo, t))
+                {
+                    ++guardStart[tryIndex[t.Bdfoidx] + 1];
+                    guards = true;
+                }
+            }
+            if (guards)
+            {
+                vec_setbit(i, throws);
+                any = true;
+            }
+        }
+        if (!any)
+            return;
+        foreach (t; 1 .. guardStart.length)
+            guardStart[t] += guardStart[t - 1];
+        guarded.setLength(guardStart[tries.length]);
+        Barray!uint fill;
+        fill.setLength(tries.length);
+        fill[][] = 0;
+        foreach (i; VecRange(throws))
+        {
+            for (block* t = bo.dfo[i].Btry; t; t = t.Btry)
+            {
+                if (isTry(bo, t))
+                {
+                    const ti = tryIndex[t.Bdfoidx];
+                    guarded[guardStart[ti] + fill[ti]++] = cast(uint)i;
+                }
+            }
+        }
+        fill.dtor();
+    }
+
+    /// Whether t is a try block of the flow graph
+    bool isTry(ref BlockOpt bo, const block* t) const
+    {
+        return t.bc == BC.try_ && inDfo(bo, t);
+    }
+
+    /// The dfo indices of the blocks that may throw to the handlers of tries[t]
+    uint[] guardedBy(uint t)
+    {
+        return guarded[guardStart[t] .. guardStart[t + 1]];
+    }
+
+    /// Whether block b of the flow graph is entered by an exception
+    bool isHandler(const block* b) const
+    {
+        return any && b.bc != BC.try_ && tryIndex[b.Bdfoidx] != uint.max;
+    }
+
+    /// The try whose handler block b is, an index in tries[]
+    uint handlerOf(const block* b) const
+    {
+        return tryIndex[b.Bdfoidx];
+    }
+
+    /// Whether block b may throw to a handler
+    bool mayThrowAt(const block* b) const
+    {
+        return any && vec_testbit(b.Bdfoidx, throws);
+    }
+
+    /*********************************
+     * Call dg(h) for each handler h of each try enclosing block b of the
+     * flow graph, innermost first.
+     */
+    @trusted
+    void forHandlers(ref BlockOpt bo, block* b, scope void delegate(block*) nothrow dg)
+    {
+        for (block* t = b.Btry; t; t = t.Btry)
+        {
+            if (!isTry(bo, t))
+                continue;
+            foreach (h; t.Bsucc[1 .. $])
+            {
+                h = handlerEntry(h);
+                if (inDfo(bo, h))
+                    dg(h);
+            }
+        }
+    }
+}
+
+__gshared EhEdges ehEdges;
+
+/* The block an exception enters handler h of a try by: the landing pad of a
+ * finally, or the catch block itself
+ */
+@trusted
+private block* handlerEntry(block* h)
+{
+    if (h.bc == BC.finally_ && h.Bsucc.length && h.Bsucc[0].bc == BC.lpad)
+        return h.Bsucc[0];
+    return h;
+}
+
+/// Whether b is a block of the flow graph of bo
+@trusted
+private bool inDfo(ref BlockOpt bo, const block* b)
+{
+    return b.Bdfoidx < bo.dfo.length && bo.dfo[b.Bdfoidx] is b;
+}
+
+/// Whether evaluating e may throw an exception
+@trusted
+private bool mayThrow(const(elem)* e)
+{
+    while (1)
+    {
+        const op = e.Eoper;
+        if (OTcall(op) || op == OPasm)
+            return true;
+        if (OTbinary(op))
+        {
+            if (mayThrow(e.E2))
+                return true;
+        }
+        else if (!OTunary(op))
+            return false;
+        e = e.E1;
+    }
+}
+
 /***************** REACHING DEFINITIONS *********************/
 
 /************************************
@@ -93,6 +285,36 @@ void flowrd(ref GlobalOptimizer go, ref BlockOpt bo)
     foreach (b; bo.dfo[])
         vec_copy(b.Boutrd, b.Bgen);
 
+    /* An exception reaches a handler from anywhere in the body its try guards,
+     * entered only by the try block, so what reaches the handler is what
+     * reaches the try block, and any definition in the body:
+     *      i = 0;
+     *      try { i = 1; f(); i = 2; } catch () { x = i; }
+     */
+    ehEdges.compute(bo);
+    Barray!vec_t bodyDefs;      // by index in ehEdges.tries[]: the definitions in its body
+    if (ehEdges.any)
+    {
+        bodyDefs.setLength(ehEdges.tries.length);
+        bodyDefs[][] = null;
+        foreach (t; 0 .. ehEdges.tries.length)
+        {
+            if (ehEdges.guardedBy(cast(uint)t).length)
+                bodyDefs[t] = vec_calloc(go.defnod.length);
+        }
+        foreach (i, ref dn; go.defnod[])
+        {
+            for (block* t = dn.DNblock.Btry; t; t = t.Btry)
+            {
+                if (ehEdges.isTry(bo, t))
+                {
+                    if (vec_t v = bodyDefs[ehEdges.tryIndex[t.Bdfoidx]])
+                        vec_setbit(i, v);
+                }
+            }
+        }
+    }
+
     bool anychng;
     vec_t tmp = vec_calloc(go.defnod.length);
     Dirty dirty;                // only a change to the Boutrd of a predecessor changes Binrd
@@ -116,6 +338,11 @@ void flowrd(ref GlobalOptimizer go, ref BlockOpt bo)
                 foreach (bp; b.Bpred[])
                     vec_orass(b.Binrd,bp.Boutrd);
             }
+            if (ehEdges.isHandler(b))
+            {
+                if (vec_t v = bodyDefs[ehEdges.handlerOf(b)])
+                    vec_orass(b.Binrd, v);
+            }
             /* Bout = (Bin - Bkill) | Bgen */
             vec_sub(tmp,b.Binrd,b.Bkill);
             vec_orass(tmp,b.Bgen);
@@ -129,6 +356,9 @@ void flowrd(ref GlobalOptimizer go, ref BlockOpt bo)
     } while (anychng);              /* while any changes to Boutrd  */
     dirty.free();
     vec_free(tmp);
+    foreach (v; bodyDefs[])
+        vec_free(v);
+    bodyDefs.dtor();
 
     static if (0)
     {
@@ -499,9 +729,10 @@ private void flowaecp(ref GlobalOptimizer go, ref BlockOpt bo)
             }
             assert(!first);     // it must have had predecessors
 
-            if (b.bc == BC.jcatch)
+            if (b.bc == BC.jcatch || b.bc == BC.lpad)
             {
-                /* Set Bin to 0 to account for:
+                /* An exception enters a handler from anywhere in the body of
+                 * its try. Set Bin to 0 to account for:
                     void* pstart = p;
                     try
                     {
@@ -912,8 +1143,8 @@ void flowcpBit(ref GlobalOptimizer go, ref BlockOpt bo, uint j, vec_t[] ins)
                 assert(p < nblocks && bo.dfo[p] is bp);
                 v &= (bp.bc == BC.iftrue && bp.Bsucc[0] != b) ? bout2[p] : bout[p];
             }
-            if (b.bc == BC.jcatch)
-                v = false;
+            if (b.bc == BC.jcatch || b.bc == BC.lpad)
+                v = false;      // entered from anywhere in the body of its try
             bin[i] = v;
             const o = (v && !kill[i]) || gen[i];
             const o2 = (v && !kill2[i]) || gen2[i];
@@ -1968,6 +2199,26 @@ void flowlv(ref BlockOpt bo)
     }
 
     vec_t tmp = vec_calloc(globsym.length);
+
+    /* A block that may throw does so from anywhere in it, before or after its
+     * definitions, so what is live on entry to the handlers it may throw to is
+     * live on entry to and exit from it, but for the registers a landing pad
+     * receives the exception in, which only the landing pad defines
+     */
+    ehEdges.compute(bo);
+    vec_t ehlv;
+    vec_t notPseudo;
+    if (ehEdges.any)
+    {
+        ehlv = vec_calloc(globsym.length);
+        notPseudo = vec_calloc(globsym.length);
+        foreach (i, s; globsym[])
+        {
+            if (s.Sclass != SC.pseudo)
+                vec_setbit(i, notPseudo);
+        }
+    }
+
     uint cnt = 0;
     bool anychng;
     Dirty dirty;                // only a change to the Binlv of a successor changes Boutlv
@@ -2002,10 +2253,23 @@ void flowlv(ref BlockOpt bo)
             /* Bin = (Bout - Bkill) | Bgen                  */
             vec_sub(tmp,b.Boutlv,b.Bkill);
             vec_orass(tmp,b.Bgen);
+            if (ehEdges.mayThrowAt(b))
+            {
+                vec_clear(ehlv);
+                ehEdges.forHandlers(bo, b, (block* h) { vec_orass(ehlv, h.Binlv); });
+                vec_andass(ehlv, notPseudo);
+                vec_orass(b.Boutlv, ehlv);
+                vec_orass(tmp, ehlv);
+            }
             if (!vec_equal(tmp,b.Binlv))
             {
                 anychng = true;
                 dirty.mark(bo, b.Bpred[]);
+                if (ehEdges.isHandler(b))
+                {
+                    foreach (g; ehEdges.guardedBy(ehEdges.handlerOf(b)))
+                        dirty.p[g] = true;
+                }
             }
             vec_copy(b.Binlv,tmp);
         }
@@ -2014,6 +2278,8 @@ void flowlv(ref BlockOpt bo)
     } while (anychng);
 
     dirty.free();
+    vec_free(ehlv);
+    vec_free(notPseudo);
     vec_free(tmp);
     vec_free(livexit);
 
