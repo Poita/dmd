@@ -184,7 +184,8 @@ int toFacts(const(elem)* e, ref Fact[2] f, ref bool[2] has)
     }
     else
         return 0;
-    const uns = tyuns(e.Eoper == OPvar || e.Eoper == OPconst || !OTrel(e.Eoper) ? e.Ety : e.E1.Ety) != 0;
+    // a comparison is unsigned when either operand is, as in (x >= 1u)
+    const uns = OTrel(e.Eoper) ? (tyuns(e.E1.Ety) || tyuns(e.E2.Ety)) : tyuns(e.Ety) != 0;
     const lt = uns ? Rel.ltu : Rel.lts;
     const le = uns ? Rel.leu : Rel.les;
     void set(int i, Rel r, ref Term x, ref Term y)
