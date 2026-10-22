@@ -7859,6 +7859,41 @@ private bool writesMemory(ref const LIns i)
            i.op == LOp.atomic || i.op == LOp.spsub || i.op == LOp.spadd;
 }
 
+/* Whether a load reads, without an index, the memory another load or store accesses
+ * the same way, from the same base register or symbol and offset: what
+ * reuseDominatingMemory() needs to find anything
+ */
+@trusted
+private bool repeatsAccess()
+{
+    enum tableBits = 8;
+    uint[1 << tableBits] head = uint.max;
+    Barray!uint next;
+    scope (exit) next.dtor();
+    next.setLength(ins.length);
+    foreach (n, ref i; ins[])
+    {
+        Reg base;
+        if (i.op == LOp.ld && !i.b)
+            base = i.a;
+        else if (i.op == LOp.st && !i.c)
+            base = i.b;
+        else
+            continue;
+        const k = (base * 31 + i.imm + (i.sym ? i.sym.Ssymnum + 1 : 0) * 131) & ((1 << tableBits) - 1);
+        for (uint m = head[k]; m != uint.max; m = next[m])
+        {
+            const j = &ins[m];
+            if ((i.op == LOp.ld || j.op == LOp.ld) && j.sym is i.sym && j.imm == i.imm && j.sz == i.sz &&
+                (j.op == LOp.ld ? j.a : j.b) == base)
+                return true;
+        }
+        next[n] = head[k];
+        head[k] = cast(uint)n;
+    }
+    return false;
+}
+
 /* In a loop without stores or calls, a load of what a load at the end of its
  * preheader read, through registers the loop does not change, takes that load's value
  */
@@ -7993,6 +8028,8 @@ private void reuseDominatingMemory()
 {
     if (env!"DMD_NEWCG_NOMEMOPT")
         return;
+    if (!repeatsAccess())
+        return;
     buildSegments();
     const ns = segStart.length - 1;
     if (ns < 2)
@@ -8057,9 +8094,37 @@ private void reuseDominatingMemory()
     Barray!ubyte mark;          // 1: reached from the source, 2: also reaching the load
     Barray!uint work, touched;
     Barray!Reg subst;
-    scope (exit) { mark.dtor(); work.dtor(); touched.dtor(); subst.dtor(); }
+    /* The instructions of each segment that write memory or call, with what they may
+     * write: a size of -1 for one after which nothing is known
+     */
+    static struct Effect { uint ins; Footprint w; }
+    Barray!uint effectStart;
+    Barray!Effect effects;
+    scope (exit) { mark.dtor(); work.dtor(); touched.dtor(); subst.dtor(); effectStart.dtor(); effects.dtor(); }
     mark.setLength(ns);
     mark[][] = 0;
+    effectStart.setLength(ns + 1);
+    foreach (si; 0 .. ns)
+    {
+        effectStart[si] = cast(uint)effects.length;
+        foreach (m; segStart[si] .. segEnd(si))
+        {
+            const i = &ins[m];
+            if (!writesMemory(*i) && i.op != LOp.call)
+                continue;
+            Effect e;
+            e.ins = cast(uint)m;
+            // a value is not taken into a landing pad
+            if (i.op == LOp.call && i.target || memoryBarrier(*i))
+                e.w.size = -1;
+            else
+                e.w = footprint(*i);
+            effects.push(e);
+        }
+    }
+    effectStart[ns] = cast(uint)effects.length;
+    uint lastSource = uint.max;     // the segment the marks were last reached from
+    bool lastTooFar;                // more than maxRegion segments are reached from it
     subst.setLength(vinfo.length);
     subst[][] = noReg;
     bool any;
@@ -8071,25 +8136,40 @@ private void reuseDominatingMemory()
     bool clear(uint k, uint n, ref const Footprint f, Reg r1, Reg r2)
     {
         const ks = segOf[k], ls = segOf[n];
-        foreach (v; touched[])
-            mark[v] = 0;
-        touched.setLength(0);
-        // forward from k's segment, not through it again
-        work.setLength(0);
-        work.push(ks);
-        while (work.length)
+        // forward from k's segment, not through it again; the same for the same segment
+        if (ks == lastSource)
         {
-            const v = work[work.length - 1];
-            work.setLength(work.length - 1);
-            foreach (t; segSucc[segSuccStart[v] .. segSuccStart[v + 1]])
-                if (t != ks && !mark[t])
-                {
-                    if (touched.length == maxRegion)
-                        return false;
-                    mark[t] = 1;
-                    touched.push(t);
-                    work.push(t);
-                }
+            if (lastTooFar)
+                return false;
+            foreach (v; touched[])
+                mark[v] = 1;
+        }
+        else
+        {
+            foreach (v; touched[])
+                mark[v] = 0;
+            touched.setLength(0);
+            lastSource = ks;
+            lastTooFar = false;
+            work.setLength(0);
+            work.push(ks);
+            while (work.length)
+            {
+                const v = work[work.length - 1];
+                work.setLength(work.length - 1);
+                foreach (t; segSucc[segSuccStart[v] .. segSuccStart[v + 1]])
+                    if (t != ks && !mark[t])
+                    {
+                        if (touched.length == maxRegion)
+                        {
+                            lastTooFar = true;
+                            return false;
+                        }
+                        mark[t] = 1;
+                        touched.push(t);
+                        work.push(t);
+                    }
+            }
         }
         if (!mark[ls])
             return false;
@@ -8114,29 +8194,34 @@ private void reuseDominatingMemory()
                 }
         }
         lsCycles = mark[ls] == 2;
-        bool bad(ref const LIns i)
+        const lsEnd = lsCycles ? segEnd(ls) : n;
+        // r1 and r2, each defined once, must not be defined on the way
+        bool between(Reg r)
         {
-            if (i.d && (i.d == r1 || i.d == r2))
-                return true;
-            if (i.op == LOp.call && i.target)
-                return true;        // the value is not taken into a landing pad
-            if (!writesMemory(i) && i.op != LOp.call)
+            if (!r)
                 return false;
-            if (memoryBarrier(i))
-                return true;
-            const w = footprint(i);
-            return mayAlias(w, f);
+            const d = memDef[r - firstVreg];
+            const ds = segOf[d];
+            return d > k && d < segEnd(ks) || d >= segStart[ls] && d < lsEnd ||
+                ds != uint.max && ds != ls && mark[ds] == 2;
         }
-        foreach (m; k + 1 .. segEnd(ks))
-            if (bad(ins[m]))
+        if (between(r1) || between(r2))
+            return false;
+        // nor may anything write what f reaches
+        bool bad(ref const Effect e)
+        {
+            return e.w.size < 0 || mayAlias(e.w, f);
+        }
+        foreach (ref e; effects[effectStart[ks] .. effectStart[ks + 1]])
+            if (e.ins > k && bad(e))
                 return false;
-        foreach (m; segStart[ls] .. (lsCycles ? segEnd(ls) : n))
-            if (bad(ins[m]))
+        foreach (ref e; effects[effectStart[ls] .. effectStart[ls + 1]])
+            if (e.ins < lsEnd && bad(e))
                 return false;
         foreach (v; touched[])
             if (mark[v] == 2 && v != ls)
-                foreach (m; segStart[v] .. segEnd(v))
-                    if (bad(ins[m]))
+                foreach (ref e; effects[effectStart[v] .. effectStart[v + 1]])
+                    if (bad(e))
                         return false;
         return true;
     }
