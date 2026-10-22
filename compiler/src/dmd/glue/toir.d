@@ -48,6 +48,7 @@ import dmd.dmodule;
 import dmd.dstruct;
 import dmd.dsymbol;
 import dmd.dsymbolsem : followInstantiationContext, toParentP;
+import dmd.expression : Expression;
 import dmd.expressionsem : toInteger;
 import dmd.dtemplate;
 import dmd.errorsink;
@@ -130,6 +131,15 @@ struct IRState
         if (m.filetype == FileType.c)
             return false;
         return dmd.funcsem.arrayBoundsCheck(getFunc());
+    }
+
+    /**********************
+     * Returns:
+     *    true if do array bounds checking for `e` in the current function
+     */
+    bool arrayBoundsCheck(const Expression e)
+    {
+        return e.boundsCheckFixed ? e.boundsCheck : arrayBoundsCheck();
     }
 
     /**********************

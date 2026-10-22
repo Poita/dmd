@@ -1168,7 +1168,33 @@ private Result doInlineAs(Result)(Expression e, InlineDoState ids)
 
     scope DoInlineAs!Result v = new DoInlineAs!Result(ids);
     e.accept(v);
+    static if (is(Result == Expression))
+        fixBoundsCheck(v.result, ids.fd);
     return v.result;
+}
+
+/***********************************************************
+ * Keep the array bounds checks of a copy of an expression of `fd` as they are
+ * in `fd`, wherever it is inlined: under `-release` the bounds of `@safe` code
+ * are checked, while those of the code it may be inlined into are not.
+ * Params:
+ *      e = copy of an expression of fd
+ *      fd = function inlined
+ */
+private void fixBoundsCheck(Expression e, FuncDeclaration fd)
+{
+    if (!e || e.boundsCheckFixed)
+        return;
+    switch (e.op)
+    {
+        // the expressions whose code checks bounds, each a fresh copy
+        case EXP.index, EXP.slice, EXP.assign, EXP.construct, EXP.blit:
+            break;
+        default:
+            return;
+    }
+    e.boundsCheckFixed = true;
+    e.boundsCheck = !fd.isCsymbol() && arrayBoundsCheck(fd);
 }
 
 /// Whether `t` is the type of an expression that does not complete

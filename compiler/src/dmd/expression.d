@@ -130,6 +130,12 @@ extern (C++) abstract class Expression : ASTNode
     bool parens;    // if this is a parenthesized expression
     bool rvalue;    // true if this is considered to be an rvalue, even if it is an lvalue
     bool gcPassDone; // `checkGC` has been run on this expression
+    /* Whether array bounds are checked is decided by `boundsCheck` rather than
+     * by the function the code is generated in: the inliner fixes it to that of
+     * the function an expression is inlined from
+     */
+    bool boundsCheckFixed;
+    bool boundsCheck;
     }
     import dmd.common.bitfields;
     mixin(generateBitFields!(BitFields, ubyte));
