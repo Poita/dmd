@@ -2392,6 +2392,8 @@ void cdbyteint(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
     code* c1 = cdb1.finish();
     cdb.append(cdb1);
     reg_t reg = findreg(retregs);
+    // the register is changed in place, so a common subexpression it holds is saved first
+    getregs(cdb,retregs);
     code* c;
     if (!c1)
         goto L1;
@@ -2426,7 +2428,6 @@ void cdbyteint(ref CGstate cg, ref CodeBuilder cdb,elem* e,ref regm_t pretregs)
         }
         cdb.gen1(ins);
     }
-    getregs(cdb,retregs);
     fixresult(cg,cdb,e,retregs,pretregs);
 }
 
