@@ -25,6 +25,50 @@ import dmd.lib.mscoff;
 
 private enum LOG = false;
 
+/// The time, user and group a library records for the members it writes
+package struct MemberStamp
+{
+    long time;
+    uint userId, groupId;
+    bool fixed;         /// set by SOURCE_DATE_EPOCH, rather than by when and by whom
+}
+
+/**
+ * Returns: the stamp of the members of a library written now: with the environment
+ * variable SOURCE_DATE_EPOCH set to a UNIX time, that time and user and group 0, so
+ * that the library is the same whenever and by whoever it is written; otherwise the
+ * current time and the user and group of this process
+ */
+package MemberStamp memberStamp() nothrow
+{
+    import core.stdc.stdlib : getenv;
+    import core.stdc.string : strlen;
+    import core.stdc.time : time, time_t;
+    import dmd.utils : parseDigits;
+
+    MemberStamp stamp;
+    if (auto epoch = getenv("SOURCE_DATE_EPOCH"))
+    {
+        long t;
+        if (parseDigits(t, epoch[0 .. strlen(epoch)]))
+        {
+            stamp.time = t;
+            stamp.fixed = true;
+            return stamp;
+        }
+    }
+    time_t now;
+    time(&now);
+    stamp.time = now;
+    version (Posix)
+    {
+        import core.sys.posix.unistd : getgid, getuid;
+        stamp.userId = getuid();
+        stamp.groupId = getgid();
+    }
+    return stamp;
+}
+
 class Library
 {
     const(char)[] lib_ext;      // library file extension

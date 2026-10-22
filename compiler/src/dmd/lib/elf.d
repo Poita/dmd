@@ -266,7 +266,8 @@ final class LibElf : Library
         om.name = toCString(FileName.name(module_name));
         om.name_offset = -1;
         om.scan = 1;
-        if (fromfile)
+        const stamp = memberStamp();
+        if (fromfile && !stamp.fixed)
         {
             Statbuf statbuf;
             int i = module_name.toCStringThen!(name => stat(name.ptr, &statbuf));
@@ -279,34 +280,9 @@ final class LibElf : Library
         }
         else
         {
-            /* Mock things up for the object module file that never was
-             * actually written out.
-             */
-            version (Posix)
-            {
-                __gshared uid_t uid;
-                __gshared gid_t gid;
-                __gshared int _init;
-                if (!_init)
-                {
-                    _init = 1;
-                    uid = getuid();
-                    gid = getgid();
-                }
-                om.user_id = uid;
-                om.group_id = gid;
-            }
-            else version (Windows)
-            {
-                om.user_id = 0;  // meaningless on Windows
-                om.group_id = 0; // meaningless on Windows
-            }
-            else
-                static assert(0, "unsupported operating system");
-
-            time_t file_time = 0;
-            time(&file_time);
-            om.file_time = cast(long)file_time;
+            om.file_time = stamp.time;
+            om.user_id = stamp.userId;
+            om.group_id = stamp.groupId;
             om.file_mode = (1 << 15) | (6 << 6) | (4 << 3) | (4 << 0); // 0100644
         }
         objmodules.push(om);
@@ -434,7 +410,7 @@ private:
         om.length = cast(uint)(hoffset - (8 + ElfLibHeader.sizeof));
         om.offset = 8;
         om.name = "";
-        .time(&om.file_time);
+        om.file_time = memberStamp().time;
         om.user_id = 0;
         om.group_id = 0;
         om.file_mode = 0;

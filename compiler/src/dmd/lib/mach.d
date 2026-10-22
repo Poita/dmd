@@ -220,7 +220,8 @@ final class LibMach : Library
         const n = FileName.name(module_name); // remove path, but not extension
         om.name = n.toCString()[0 .. n.length];
         om.scan = 1;
-        if (fromfile)
+        const stamp = memberStamp();
+        if (fromfile && !stamp.fixed)
         {
             Statbuf statbuf;
             int i = module_name.toCStringThen!(slice => stat(slice.ptr, &statbuf));
@@ -233,32 +234,9 @@ final class LibMach : Library
         }
         else
         {
-            /* Mock things up for the object module file that never was
-             * actually written out.
-             */
-            version (Posix)
-            {
-                __gshared uid_t uid;
-                __gshared gid_t gid;
-                __gshared int _init;
-                if (!_init)
-                {
-                    _init = 1;
-                    uid = getuid();
-                    gid = getgid();
-                }
-                om.user_id = uid;
-                om.group_id = gid;
-            }
-            else version (Windows)
-            {
-                om.user_id = 0;  // meaningless on Windows
-                om.group_id = 0; // meaningless on Windows
-            }
-            else
-                static assert(0, "unsupported operating system");
-
-            time(&om.file_time);
+            om.file_time = cast(time_t)stamp.time;
+            om.user_id = stamp.userId;
+            om.group_id = stamp.groupId;
             om.file_mode = (1 << 15) | (6 << 6) | (4 << 3) | (4 << 0); // 0100644
         }
         objmodules.push(om);
@@ -393,20 +371,10 @@ private:
         om.length = cast(uint)(hoffset - (8 + MachLibHeader.sizeof));
         om.offset = 8;
         om.name = "";
-        .time(&om.file_time);
-
-        version (Posix)
-        {
-            om.user_id = getuid();
-            om.group_id = getgid();
-        }
-        else version (Windows)
-        {
-            om.user_id = 0;
-            om.group_id = 0;
-        }
-        else
-            static assert(0, "unsupported operating system");
+        const stamp = memberStamp();
+        om.file_time = cast(time_t)stamp.time;
+        om.user_id = stamp.userId;
+        om.group_id = stamp.groupId;
 
         om.file_mode = (1 << 15) | (6 << 6) | (4 << 3) | (4 << 0); // 0100644
         MachLibHeader h;
