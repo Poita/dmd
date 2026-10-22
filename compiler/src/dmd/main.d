@@ -666,9 +666,14 @@ private int tryMain(const(char)[][] argv, out Param params)
         removeHdrFilesAndFail(params.dihdr.doOutput, modules);
 
     /* Split the rest of the compilation of the root modules across worker processes,
-     * when nothing but code generation needs all of them
+     * when nothing but code generation needs all of them. On Mach-O, the parts of one
+     * object file are combined with `ld -r`, which replaces their debug information with
+     * a debug map pointing at the parts, so an object file with debug information is
+     * not split.
      */
-    if (driverParams.workers != 1 && params.obj && !includeImports && !params.addMain &&
+    const debugMap = driverParams.symdebug && driverParams.oneobj && !driverParams.lib &&
+        target.objectFormat() == Target.ObjectFormat.macho;
+    if (driverParams.workers != 1 && params.obj && !includeImports && !params.addMain && !debugMap &&
         !params.json.doOutput && !params.ddoc.doOutput && !params.vcg_ast &&
         !params.cxxhdr.doOutput && !params.moduleDeps.buffer && !params.dihdr.doOutput &&
         !params.timeTrace && !params.v.verbose && !params.v.templates && !params.makeDeps.doOutput)
