@@ -5,6 +5,7 @@ These files implement tools and utilities used by the test suite.
 | File                                       | Purpose                                                                                         |
 |--------------------------------------------|-------------------------------------------------------------------------------------------------|
 | [`d_do_test.d`](d_do_test.d)               | Test runner for all non-`unit` tests                                                            |
+| [`determinism.sh`](determinism.sh)         | Compile programs repeatedly, split and unsplit, and compare the outputs byte for byte           |
 | [`dshell_prebuilt.d`](dshell_prebuilt.d)   | Common utilities for `dshell` tests                                                             |
 | [`paths.d`](paths.d)                       | Definitions for [common environment variables](../README.md#environment-variables) (e.g. `DMD`) |
 | [`sanitize_json.d`](sanitize_json.d)       | Remove platform-specific information from dmd's JSON output (`-X`)                              |
