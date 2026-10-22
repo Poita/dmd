@@ -112,6 +112,7 @@ void out_config_init(
     cfg.flags |= CFGuchar;   // make sure TYchar is unsigned
     cfg.exe = exefmt;
     tytab[TYchar] |= TYFLuns;
+    tyequiv[TYchar] = TYuchar;  // so a char matches only what is as unsigned
     if (generatedMain)
         cfg.flags2 |= CFG2genmain;
     if (ibt)
