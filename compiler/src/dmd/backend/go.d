@@ -575,14 +575,15 @@ void optfunc(ref GlobalOptimizer go, ref BlockOpt bo)
 
         if (go.mfoptim & MFdc)
             blockopt(go, bo, go.changes); // do block optimization
-        /* The register candidates are recomputed by each copyprop(), and what
-         * runs after it in a round does not change them
+        /* The register candidates are recomputed by each copyprop(). What runs
+         * after it in a round can remove the uses that disqualify a symbol,
+         * which leaves the candidates conservative, but adds none
          */
         if (iter == 1)
             out_regcand(globsym[]);     // recompute register candidates
         else debug
         {
-            // check they are unchanged
+            // check the candidates kept claim nothing a recomputation does not, and keep them
             Barray!uint before;
             foreach (sym; globsym[])
                 before.push(sym.Sflags & (GTregcand | SFLdistinct));
@@ -591,7 +592,11 @@ void optfunc(ref GlobalOptimizer go, ref BlockOpt bo)
                 nums.push(sym.Ssymnum);
             out_regcand(globsym[]);
             foreach (i, sym; globsym[])
-                assert(before[i] == (sym.Sflags & (GTregcand | SFLdistinct)) && nums[i] == sym.Ssymnum);
+            {
+                const now = sym.Sflags & (GTregcand | SFLdistinct);
+                assert((before[i] & ~now) == 0 && nums[i] == sym.Ssymnum);
+                sym.Sflags = (sym.Sflags & ~(GTregcand | SFLdistinct)) | before[i];
+            }
             before.dtor();
             nums.dtor();
         }
