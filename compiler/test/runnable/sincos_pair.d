@@ -10,6 +10,7 @@
  */
 
 import core.math : cos, sin;
+import core.stdc.stdarg : va_arg, va_end, va_list, va_start;
 
 version (OSX) version (AArch64) version = DarwinArm;
 
@@ -75,6 +76,16 @@ pragma(inline, false) float loop(float r, int n)
     return acc;
 }
 
+// A C variadic function, which the tree code generator compiles
+extern (C) pragma(inline, false) float variadic(int n, ...)
+{
+    va_list ap;
+    va_start(ap, n);
+    const x = cast(float) va_arg!double(ap);
+    va_end(ap);
+    return sin(x) * 2 + cos(x);
+}
+
 pragma(inline, false) float sinConst() { return sin(0x1.000032p-1f); }
 pragma(inline, false) float cosConst() { return cos(0x1.0007b8p-1f); }
 pragma(inline, false) double sinConstD() { return sin(0x1.9999ap-4); }
@@ -123,6 +134,8 @@ void main()
             expect += q.s + q.c;
         }
         assert(loop(opaque(xf), 3) == expect);
+
+        assert(variadic(1, cast(double) xf) == rf.s * 2 + rf.c);
 
         // sinf would give 0x1.eaeedep-2f and cosf 0x1.c14eccp-1f
         assert(sinConst() == 0x1.eaeeep-2f);

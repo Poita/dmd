@@ -1196,6 +1196,7 @@ private void sinCosFuse(ref SinCosGroup g)
     }
     type* t = sinCosType[i];
     Symbol* tmp = symbol_genauto(t);
+    tmp.Sfl = FL.auto_;
 
     elem* first = g.cands[0].e;
     elem* arg = g.hoist ? el_copytree(first.E2) : first.E2;
