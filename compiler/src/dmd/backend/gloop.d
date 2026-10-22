@@ -46,6 +46,7 @@ char symbol_isintab(const Symbol* s) { return sytab[s.Sclass] & SCSS; }
 
 
 import dmd.backend.gother : defIndex, defIndexChanged, findloopparameters;
+import dmd.backend.gflow : ehEdges;
 
 alias Loops = Rarray!Loop;
 
@@ -396,9 +397,11 @@ bool dom(ref BlockOpt bo, const block* A, const block* B)
  * Find all the loops.
  */
 
+@trusted
 private void findloops(ref BlockOpt bo, block*[] dfo, ref Loops loops)
 {
     freeloop(loops);
+    ehEdges.compute(bo);        // buildloop() takes the exception edges in
 
     //printf("findloops()\n");
     foreach (b; dfo)
@@ -461,8 +464,9 @@ private void buildloop(ref BlockOpt bo, ref Loops ploops, block* head, block* ta
     //printf("buildloop()\n");
 
      /* Add a block b and all its predecessors to vector v.
+      * A handler is also entered from each block that may throw to it.
       */
-    static void insert(block* b, vec_t v)
+    void insert(block* b, vec_t v)
     {
         assert(b && v);
         if (!vec_testbit(b.Bdfoidx,v))      // if block is not in loop
@@ -471,6 +475,11 @@ private void buildloop(ref BlockOpt bo, ref Loops ploops, block* head, block* ta
             b.Bweight = loop_weight(b.Bweight,1);   // *10 usage count
             foreach (bl; b.Bpred[])
                 insert(bl, v);              // insert all its predecessors
+            if (ehEdges.isHandler(b))
+            {
+                foreach (g; ehEdges.guardedBy(ehEdges.handlerOf(b)))
+                    insert(bo.dfo[g], v);
+            }
         }
     }
 
@@ -1653,6 +1662,9 @@ Lnextlis:
                         goto L3;
 
                 if (el_sideeffect(n.E2)) goto L3;              // case 5
+
+                // a handler reads v as it is where an exception leaves the loop
+                if (ehLive(bo, v, l)) goto L3;
 
                 // If case 1 or case 2 is not satisfied, return
 
@@ -2963,7 +2975,7 @@ private void elimbasivs(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
             if (!biv.IVfamily.length)
                 continue;
 
-            if (catchRef(bo, X, l))
+            if (ehLive(bo, X, l))
                 continue;
 
             elem* ref_ = *pref;
@@ -3233,8 +3245,8 @@ private void elimbasivs(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
         }
         else if (refcount == 0)                 /* if no uses of IV in loop  */
         {
-            // a catch or finally block may read it after a throw leaves the loop
-            if (catchRef(bo, X, l))
+            // a handler may read it as it is where an exception leaves the loop
+            if (ehLive(bo, X, l))
                 continue;
             /* Eliminate the basic IV if it is not live on any successor */
             for (uint i = 0; (i = cast(uint) vec_index(i, l.Lexit)) < bo.dfo.length; ++i)  // for each exit block
@@ -3300,8 +3312,8 @@ private void elimopeqs(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
         { }
         else if (refcount == 0)                 // if no uses of IV in loop
         {
-            // a catch or finally block may read it after a throw leaves the loop
-            if (catchRef(bo, X, l))
+            // a handler may read it as it is where an exception leaves the loop
+            if (ehLive(bo, X, l))
                 continue;
             // Eliminate the basic IV if it is not live on any successor
             uint i;
@@ -3478,35 +3490,32 @@ Lf2:
 }
 
 /*****************************
- * If loop is in a try block, see if there are references to x in an enclosing
- * try block. This is because the loop may throw and transfer control
- * outside the try block, and that will count as a use of x.
+ * A block of a loop that may throw does so from anywhere in it, to the
+ * handlers of each try enclosing it, which see each variable as it is at the
+ * throw: a definition in the loop of a variable a handler reads can be neither
+ * moved out of the loop nor removed.
  * Params:
- *      x = basic induction variable symbol
- *      l = loop x is in
+ *      x = variable
+ *      l = loop
  * Returns:
- *      true if x is used outside the try block
+ *      true if a handler a block of l may throw to reads x
  */
 @trusted
-private bool catchRef(ref BlockOpt bo, Symbol* x, ref Loop l)
+private bool ehLive(ref BlockOpt bo, const Symbol* x, ref Loop l)
 {
-    block* btry = l.Lhead.Btry;
-    if (!btry)
-        return false;   // not in a try block
-
-    foreach (i, b; bo.dfo[])
+    if (!ehEdges.any)
+        return false;
+    if (!symbol_isintab(x))
+        return true;
+    bool live;
+    foreach (i; VecRange(l.Lloop))
     {
-        if (vec_testbit(b.Bdfoidx, l.Lloop))
-            continue;
-        /* this is conservative, just checking if x is used outside the loop.
-         * A better check would see if the body of the loop throws, and would
-         * check the enclosing catch/finally blocks and their exit blocks.
-         * https://issues.dlang.org/show_bug.cgi?22104
-         */
-        if (vec_testbit(x.Ssymnum, b.Binlv))
+        block* b = bo.dfo[i];
+        if (ehEdges.mayThrowAt(b))
+            ehEdges.forHandlers(bo, b, (block* h) { live |= vec_testbit(x.Ssymnum, h.Binlv) != 0; });
+        if (live)
             return true;
     }
-
     return false;
 }
 
