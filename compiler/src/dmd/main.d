@@ -709,8 +709,8 @@ private int tryMain(const(char)[][] argv, out Param params)
     // Do pass 3 semantic analysis
     if (workers.isChild)
     {
-        import dmd.parallel : semantic3Shared;
-        semantic3Shared(workers, modules);
+        import dmd.parallel : semantic3Assigned;
+        semantic3Assigned(workers, modules);
     }
     else foreach (m; modules)
     {

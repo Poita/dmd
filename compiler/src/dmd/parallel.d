@@ -2,15 +2,22 @@
  * Split the semantic3, inlining and code generation of the root modules across
  * forked worker processes.
  *
- * After semantic2 the original process forks worker processes, which take the
- * modules one at a time, largest first, and carry on compiling the modules they take.
- * Each worker writes its output (an object file or a library) with a part suffix, and
- * the original process waits for the workers and combines the parts into the requested
- * output. Declarations are fully analyzed before the split, so every worker sees the
- * same symbols; a template instance can end up generated in more than one part, which
- * is harmless as template instances are weak definitions. What a worker finds cannot be
- * inlined is shared with the others, so that a function other workers consider inlining
- * is not analyzed by each of them.
+ * After semantic2 the original process forks worker processes, each of which compiles
+ * the root modules assigned to it: the modules are dealt out by size, largest first,
+ * each to the worker with the least source so far, so the split depends only on the
+ * sources and the number of workers. Each worker writes its output (an object file or
+ * a library) with a part suffix, and the original process waits for the workers and
+ * combines the parts, in the order of the workers, into the requested output.
+ * Declarations are fully analyzed before the split, so every worker sees the same
+ * symbols.
+ *
+ * A template instance function can be needed by more than one worker. Once their
+ * modules' code is generated, the workers settle in rounds which of them generates
+ * each such function: every worker publishes the ones it needs, and when all have, each
+ * function goes to one of the workers needing it, chosen by its mangled name. Generating
+ * those can need more, settled in the next round, until no worker needs any. What
+ * each worker generates is so a function of the sources and the flags only, not of
+ * how fast the workers run.
  *
  * Copyright:   Copyright (C) 1999-2026 by The D Language Foundation, All Rights Reserved
  * License:     $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0)
@@ -24,6 +31,7 @@ import core.stdc.string;
 import dmd.arraytypes;
 import dmd.dmodule;
 import dmd.dtemplate : TemplateInstance;
+import dmd.func : FuncDeclaration;
 import dmd.globals;
 import dmd.root.filename;
 
@@ -32,36 +40,27 @@ version (Posix)
     import core.sys.posix.sys.mman : mmap, MAP_ANON, MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE;
     import core.sys.posix.sys.types : pid_t;
     import core.sys.posix.sys.wait : waitpid, WIFEXITED, WEXITSTATUS;
-    import core.sys.posix.unistd : dup2, fork, _exit, sysconf, execvp, _SC_NPROCESSORS_ONLN;
+    import core.sys.posix.unistd : dup2, fork, _exit, execvp;
 }
 
 /**************************************
- * In a worker, run semantic3 on the modules it takes from those not yet taken by
- * any worker, largest first, so that faster workers take more of them.
+ * In a worker, run semantic3 on the modules assigned to it.
  * Params:
  *      w = the split
- *      modules = the root modules; narrowed to those this worker takes
+ *      modules = the root modules; narrowed to those of this worker
  */
-void semantic3Shared(ref Workers w, ref Modules modules) @system
+void semantic3Assigned(ref Workers w, ref Modules modules) @system
 {
-    import core.atomic : atomicFetchAdd;
     import dmd.semantic3 : semantic3;
 
-    auto taken = new bool[modules.length];
-    while (true)
-    {
-        const i = atomicFetchAdd(*w.next, 1);
-        if (i >= w.order.length)
-            break;
-        const j = w.order[i];
-        taken[j] = true;
-        modules[j].semantic3(null);
-    }
     size_t k = 0;
     foreach (j; 0 .. modules.length)
     {
-        if (taken[j])
+        if (w.assign[j] == w.index)
+        {
+            modules[j].semantic3(null);
             modules[k++] = modules[j];
+        }
         else
         {
             w.others ~= modules[j];
@@ -77,7 +76,8 @@ void semantic3Shared(ref Workers w, ref Modules modules) @system
  * worker has added since the split, or that were added before it and have completed
  * semantic analysis, are semantically analyzed here and added to this worker's first
  * module, so that it generates their code if it needs them. Which worker generates
- * the code of a template instance function is settled by `claimFunction`.
+ * the code of a template instance function is settled by `generateInstanceFunction`
+ * and `settleRound`.
  * Params:
  *      w = the split
  *      modules = this worker's root modules
@@ -212,10 +212,9 @@ struct Workers
     int index = -1;         /// in a worker, its number; -1 in the original process
     int count;              /// number of workers started, 0 if the compilation is not split
     bool succeeded;         /// in the original process: every worker wrote its output part
-    shared(size_t)* next;   /// the position in `order` of the next module to take, shared by the workers
-    size_t[] order;         /// indices of the root modules, largest first
+    uint[] assign;          /// the worker each root module is assigned to
     size_t[] membersAtSplit;/// the number of members of each root module when the split happened
-    Module[] others;        /// in a worker: the root modules other workers take
+    Module[] others;        /// in a worker: the root modules other workers compile
     size_t[] seen;          /// how many members of each of `others` have been looked at
     /// the template instances of the root modules that were speculative when the
     /// split happened, until this worker adopts them
@@ -233,9 +232,19 @@ const(char)[] partSuffix(int index)
     return buf[0 .. n].idup;
 }
 
+/// The most workers a compilation is split across; each is a bit of a mask
+enum maxWorkers = 32;
+
+/* The number of workers a compilation is split across when the number is not given:
+ * a constant rather than the number of processors, so that the output does not
+ * depend on the machine
+ */
+private enum autoWorkers = 8;
+
 version (Posix)
 {
-    /* Mangled names, each with a value, in memory shared by the workers
+    /* Mangled names of template instance functions, each with the mask of the
+     * workers needing it and the worker generating it, in memory shared by the workers
      */
     private struct NameTable
     {
@@ -243,14 +252,38 @@ version (Posix)
         enum arenaSize = 64 << 20;
         shared(uint)[slotCount] slots;  // offset + 1 in `arena` of a name, 0 if free
         shared(uint) used;              // bytes of `arena` in use
-        ubyte[arenaSize] arena;         // each name as its length and its value, uints, then its characters
+        ubyte[arenaSize] arena;         // each name as an `Entry` followed by its characters
     }
-    /// in a worker: the template instance functions each worker generates, by the worker
-    private __gshared NameTable* claims;
-    /// in a worker: the functions found not to be inlinable, with a bit set for each
-    /// way they were found not to be inlinable (see `inlineVerdictBit`)
-    private __gshared NameTable* verdicts;
-    private __gshared uint workerIndex;     // in a worker: its number
+
+    /// A name in a `NameTable`
+    private struct Entry
+    {
+        uint length;            // of the name
+        shared(uint) need;      // the workers that need the function, a bit for each
+        /* the worker generating it + 1, and the round in which that was settled shifted
+         * by `roundShift`; 0 until it is settled
+         */
+        shared(uint) owner;
+    }
+    private enum roundShift = 8;
+
+    /* Where the workers meet between the rounds of settling who generates the
+     * template instance functions, in memory shared by the workers and the original
+     * process
+     */
+    private struct Rendezvous
+    {
+        shared(uint) arrived;           // workers waiting for the others
+        shared(uint) meetings;          // how many times all the workers have met
+        shared(uint) abort;             // set when the split fails: waiting workers give up
+        shared(uint)[maxWorkers] pending;   // how many functions each worker has to settle
+        shared(uint)[maxWorkers] load;      // the work each worker has done, in functions
+    }
+
+    private __gshared NameTable* names;         // in a worker
+    private __gshared Rendezvous* rendezvous;
+    private __gshared uint workerIndex;         // in a worker: its number
+    private __gshared uint workerCount;         // in a worker: the number of workers
 
     /* In a worker: where it reports its results to the original process, and how
      * many library files were listed when it started
@@ -258,6 +291,20 @@ version (Posix)
     private __gshared FILE* resultFile;
     private __gshared size_t libfilesAtSplit;
 }
+
+/// A template instance function whose generation waits for the workers to settle
+private struct Pending
+{
+    FuncDeclaration fd;
+    const(char)[] name;     // its mangled name
+}
+
+private __gshared Pending[] pending;    // in a worker, in the order it needed them
+private __gshared bool[const(char)[]] pendingNames;
+private __gshared bool[const(char)[]] generatedHere;  // the instance functions this worker generates
+private __gshared bool settled;         // in a worker: no more rounds are held
+private __gshared uint round;           // in a worker: the rounds held so far
+private __gshared size_t needed;        // in a worker: the instance functions it has put off
 
 /**************************************
  * Split the root modules across worker processes.
@@ -269,8 +316,8 @@ version (Posix)
  * itself, so that diagnostics are exactly those of an unsplit compilation.
  * Params:
  *      modules = the root modules
- *      requested = number of workers asked for, 0 for one per processor, or fewer for
- *                  a small compilation
+ *      requested = number of workers asked for, 0 for as many as the amount of source
+ *                  warrants
  * Returns:
  *      the split
  */
@@ -279,6 +326,9 @@ Workers split(ref Modules modules, uint requested)
     Workers w;
     version (Posix)
     {
+        import core.atomic : atomicStore;
+        import core.stdc.errno : errno, EINTR;
+
         size_t n = requested;
         if (!n)
         {
@@ -289,45 +339,51 @@ Workers split(ref Modules modules, uint requested)
             size_t total;
             foreach (m; modules)
                 total += m.src.length;
-            n = cast(size_t)sysconf(_SC_NPROCESSORS_ONLN);
+            n = autoWorkers;
             if (n > total / sourcePerWorker)
                 n = total / sourcePerWorker;
         }
+        if (n > maxWorkers)
+            n = maxWorkers;
         if (n > modules.length)
             n = modules.length;
         if (n < 2)
             return w;
 
-        /* Workers take the largest modules first
+        /* Deal the modules out, largest first, each to the worker with the least
+         * source so far
          */
         auto order = new size_t[modules.length];
         foreach (i, ref o; order)
             o = i;
-        static size_t weight(Module m) { return m.src.length + 1; }
         __gshared Module[] sortModules;
         sortModules = modules[];
         extern (C) static int cmp(const void* a, const void* b)
         {
-            const wa = weight(sortModules[*cast(size_t*)a]);
-            const wb = weight(sortModules[*cast(size_t*)b]);
-            return wa < wb ? 1 : wa > wb ? -1 : 0;
+            const ia = *cast(size_t*)a, ib = *cast(size_t*)b;
+            const wa = sortModules[ia].src.length, wb = sortModules[ib].src.length;
+            return wa != wb ? (wa < wb ? 1 : -1) : (ia > ib) - (ia < ib);
         }
         qsort(order.ptr, order.length, size_t.sizeof, &cmp);
-
-        void* next = mmap(null, size_t.sizeof, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
-        if (next == MAP_FAILED)
-            return w;
-        w.next = cast(shared(size_t)*)next;
-        void* c = mmap(null, NameTable.sizeof, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
-        if (c != MAP_FAILED)
-            claims = cast(NameTable*)c;
-        if (global.params.useInline)
+        w.assign = new uint[modules.length];
+        auto load = new size_t[n];
+        foreach (i; order)
         {
-            void* v = mmap(null, NameTable.sizeof, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
-            if (v != MAP_FAILED)
-                verdicts = cast(NameTable*)v;
+            uint least = 0;
+            foreach (k; 1 .. n)
+                if (load[k] < load[least])
+                    least = cast(uint)k;
+            w.assign[i] = least;
+            load[least] += modules[i].src.length + 1;
         }
-        w.order = order;
+
+        void* r = mmap(null, Rendezvous.sizeof, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+        void* t = mmap(null, NameTable.sizeof, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+        if (r == MAP_FAILED || t == MAP_FAILED)
+            return w;
+        rendezvous = cast(Rendezvous*)r;
+        names = cast(NameTable*)t;
+        workerCount = cast(uint)n;
         foreach (m; modules)
         {
             w.membersAtSplit ~= m.members ? m.members.length : 0;
@@ -360,6 +416,7 @@ Workers split(ref Modules modules, uint requested)
                 resultFile = result;
                 workerIndex = cast(uint)k;
                 w.index = cast(int)k;
+                atexit(&leaving);
                 break;
             }
             children ~= pid;
@@ -373,17 +430,42 @@ Workers split(ref Modules modules, uint requested)
             return w;
         }
 
-        claims = null;              // the original process generates all it compiles
-        verdicts = null;            // and analyzes all it inlines
+        names = null;               // the original process generates all it compiles
         w.count = cast(int)children.length;
         w.succeeded = children.length == n;
-        foreach (k, pid; children)
+        if (!w.succeeded)           // the workers started would wait for the others
+            atomicStore(rendezvous.abort, 1u);
+        auto exited = new bool[children.length];
+        foreach (_; 0 .. children.length)
         {
             int status;
-            if (waitpid(pid, &status, 0) == -1 || !WIFEXITED(status) || WEXITSTATUS(status) != 0 ||
-                fseek(outputs[k], 0, SEEK_END) != 0 || ftell(outputs[k]) != 0)
+            pid_t pid;
+            do
+                pid = waitpid(-1, &status, 0);
+            while (pid == -1 && errno == EINTR);
+            if (pid == -1)
+            {
                 w.succeeded = false;
-            fclose(outputs[k]);
+                break;
+            }
+            foreach (k, c; children)
+            {
+                if (c != pid)
+                    continue;
+                exited[k] = true;
+                if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+                {
+                    // a worker that failed fails the split: the others need not finish
+                    w.succeeded = false;
+                    atomicStore(rendezvous.abort, 1u);
+                }
+            }
+        }
+        foreach (k, output; outputs)
+        {
+            if (!exited[k] || fseek(output, 0, SEEK_END) != 0 || ftell(output) != 0)
+                w.succeeded = false;
+            fclose(output);
         }
         if (w.succeeded)
         {
@@ -397,78 +479,160 @@ Workers split(ref Modules modules, uint requested)
 }
 
 /**************************************
- * Settle which worker generates the code of a template instance function, which
- * any worker needing it could.
+ * Decide whether this process generates the code of a template instance function
+ * now, which any worker of a split compilation needing it could. A worker puts off
+ * the ones it needs until the workers settle who generates them (see `settleRound`).
  * Params:
- *      name = the function's mangled name
- *      claim = claim the function for this worker if no worker has
+ *      fd = the function
+ *      name = its mangled name
+ *      enclosingHere = this worker generates the code of the function `fd` is nested in,
+ *                      or needs `fd` generated first to lay out the frames of others
  * Returns:
- *      true if this worker is to generate the function: the compilation is not split,
- *      this worker has claimed it, or no worker had and `claim` is set
+ *      true if this process is to generate the function now: the compilation is not
+ *      split, this worker generates the function it is nested in, the workers settled
+ *      that this worker generates it, or they settled before this worker needed it
+ *      and none generates it
  */
-bool claimFunction(const(char)[] name, bool claim)
+bool generateInstanceFunction(FuncDeclaration fd, const(char)[] name, bool enclosingHere)
 {
     version (Posix)
     {
         import core.atomic : atomicLoad;
 
-        if (!claims)
+        if (!names)
             return true;
-        auto claimer = lookUp(claims, name, workerIndex, claim);
-        return !claimer || atomicLoad(*claimer) == workerIndex;
+        if (name in generatedHere)
+            return true;
+        if (enclosingHere)
+        {
+            generatedHere[name] = true;
+            return true;
+        }
+        auto e = find(name, false);
+        if (e && atomicLoad(e.owner))
+            return false;
+        if (settled)
+        {
+            generatedHere[name] = true;
+            return true;
+        }
+        if (!(name in pendingNames))
+        {
+            pendingNames[name] = true;
+            pending ~= Pending(fd, name);
+            ++needed;
+        }
+        return false;
     }
     else
         return true;
 }
 
-/// Returns: true if this is a worker sharing with the others what it finds cannot be inlined
-bool sharingInlineVerdicts()
-{
-    version (Posix)
-        return verdicts !is null;
-    else
-        return false;
-}
-
-/// Returns: the bit `noteNotInlinable` and `foundNotInlinable` keep for one way of
-/// inlining a function
-uint inlineVerdictBit(bool hasThis, bool statementsToo)
-{
-    return 1u << (hasThis * 2 + statementsToo);
-}
-
 /**************************************
- * In a worker: record for the other workers that a function this worker has analyzed
- * cannot be inlined in one way, so that they need not analyze it to find that out.
+ * In a worker, take part in a round of settling which workers generate the template
+ * instance functions they have put off generating. Every worker, whether or not it has
+ * any, takes part in each round, until a round in which none has any.
+ *
+ * Once every worker has published what it needs, each takes the same decisions: the
+ * functions to settle are dealt out in the order of their mangled names, each to the
+ * worker needing it that has done the least work so far.
  * Params:
- *      name = the function's mangled name
- *      bit = the way it cannot be inlined, from `inlineVerdictBit`
+ *      generated = how many functions this worker has generated so far
+ *      generate = set to the functions this worker is to generate in this round
+ * Returns:
+ *      false if no worker had any left to settle, and no more rounds are held
  */
-void noteNotInlinable(const(char)[] name, uint bit)
+bool settleRound(size_t generated, out FuncDeclaration[] generate)
 {
     version (Posix)
     {
-        import core.atomic : atomicOp;
+        import core.atomic : atomicLoad, atomicOp, atomicStore;
 
-        if (!verdicts)
-            return;
-        if (auto bits = lookUp(verdicts, name, 0, true))
-            atomicOp!"|="(*bits, bit);
-    }
-}
-
-/// Returns: true if in a worker, a worker has recorded with `noteNotInlinable` that the
-/// function mangled as `name` cannot be inlined in the way `bit` stands for
-bool foundNotInlinable(const(char)[] name, uint bit)
-{
-    version (Posix)
-    {
-        import core.atomic : atomicLoad;
-
-        if (!verdicts)
+        if (!names || settled)
             return false;
-        auto bits = lookUp(verdicts, name, 0, false);
-        return bits && (atomicLoad(*bits) & bit) != 0;
+        // tell the others what this worker needs that is not yet settled
+        size_t kept = 0;
+        foreach (p; pending)
+        {
+            auto e = find(p.name, true);
+            if (!e)
+                giveUp();       // out of space: the split fails
+            if (atomicLoad(e.owner))
+                continue;
+            atomicOp!"|="(e.need, 1u << workerIndex);
+            pending[kept++] = p;
+        }
+        pending = pending[0 .. kept];
+        atomicStore(rendezvous.pending[workerIndex], cast(uint)kept);
+        /* Analyzing the template instances a worker needs is much of its work, which
+         * shows in how many of their functions it needs
+         */
+        atomicStore(rendezvous.load[workerIndex], cast(uint)(generated + needed / 3));
+        meet();
+        ++round;
+        size_t total = 0;
+        foreach (k; 0 .. workerCount)
+            total += atomicLoad(rendezvous.pending[k]);
+        if (!total)
+        {
+            settled = true;
+            return false;
+        }
+
+        /* The functions needed in this round: all those in the table not settled in an
+         * earlier round, in the order of their names
+         */
+        static struct Need { ulong hash; const(char)[] name; Entry* e; }
+        Need[] needs;
+        const used = atomicLoad(names.used);
+        for (size_t offset = 0; offset + Entry.sizeof <= used && offset < NameTable.arenaSize; )
+        {
+            auto e = cast(Entry*)(names.arena.ptr + offset);
+            offset += (Entry.sizeof + e.length + 3) & ~3;
+            const owner = atomicLoad(e.owner);
+            if (!atomicLoad(e.need) || owner && owner >> roundShift < round)
+                continue;
+            const name = (cast(const(char)*)(e + 1))[0 .. e.length];
+            needs ~= Need(fnv(name), name, e);
+        }
+        __gshared Need[] sorting;
+        extern (C) static int byName(const void* a, const void* b)
+        {
+            auto x = cast(const Need*)a, y = cast(const Need*)b;
+            if (x.hash != y.hash)
+                return x.hash < y.hash ? -1 : 1;
+            const n = x.name.length < y.name.length ? x.name.length : y.name.length;
+            if (const c = memcmp(x.name.ptr, y.name.ptr, n))
+                return c;
+            return (x.name.length > y.name.length) - (x.name.length < y.name.length);
+        }
+        qsort(needs.ptr, needs.length, Need.sizeof, &byName);
+
+        size_t[maxWorkers] load;
+        foreach (k; 0 .. workerCount)
+            load[k] = atomicLoad(rendezvous.load[k]);
+        foreach (ref n; needs)
+        {
+            const need = atomicLoad(n.e.need);
+            uint owner = uint.max;
+            foreach (k; 0 .. workerCount)
+                if (need & (1u << k) && (owner == uint.max || load[k] < load[owner]))
+                    owner = k;
+            ++load[owner];
+            if (owner == workerIndex)
+            {
+                atomicStore(n.e.owner, round << roundShift | (owner + 1));
+                generatedHere[n.name] = true;
+            }
+        }
+        foreach (p; pending)
+            if (p.name in generatedHere)
+                generate ~= p.fd;
+        pending = null;
+        pendingNames = null;
+        // no worker publishes what it needs next before all have read the needs
+        meet();
+        return true;
     }
     else
         return false;
@@ -476,24 +640,71 @@ bool foundNotInlinable(const(char)[] name, uint bit)
 
 version (Posix)
 {
-    /* Find `name` in `table`, adding it with `value` if it is not there and `add` is set.
-     * Returns: the name's value, null if the name is not there and not added, or the
-     * table is out of space
+    /* Wait for all the workers to arrive. A worker that gives up waiting, as the
+     * split has failed or the original process is gone, ends.
      */
-    private shared(uint)* lookUp(NameTable* table, const(char)[] name, uint value, bool add)
+    private void meet()
     {
-        import core.atomic : atomicFetchAdd, atomicLoad, cas;
+        import core.atomic : atomicFetchAdd, atomicLoad, atomicStore;
+        import core.sys.posix.time : nanosleep, timespec;
+        import core.sys.posix.unistd : getppid;
 
+        const meeting = atomicLoad(rendezvous.meetings);
+        if (atomicFetchAdd(rendezvous.arrived, 1) + 1 == workerCount)
+        {
+            atomicStore(rendezvous.arrived, 0u);
+            atomicStore(rendezvous.meetings, meeting + 1);
+            return;
+        }
+        for (uint spins = 0; atomicLoad(rendezvous.meetings) == meeting; ++spins)
+        {
+            if (atomicLoad(rendezvous.abort) || getppid() == 1)
+                giveUp();
+            timespec ts = timespec(0, spins < 100 ? 20_000 : 500_000);
+            nanosleep(&ts, null);
+        }
+    }
+
+    /// End this worker, and with it the split
+    private void giveUp()
+    {
+        import core.atomic : atomicStore;
+        atomicStore(rendezvous.abort, 1u);
+        _exit(1);
+    }
+
+    /// When a worker ends before the rounds are over, the others are not to wait for it
+    private extern (C) void leaving()
+    {
+        import core.atomic : atomicStore;
+        if (!settled)
+            atomicStore(rendezvous.abort, 1u);
+    }
+
+    private ulong fnv(const(char)[] name)
+    {
         ulong h = 14695981039346656037UL;          // FNV-1a
         foreach (c; name)
         {
             h ^= c;
             h *= 1099511628211UL;
         }
+        return h;
+    }
+
+    /* Find `name` in the shared table, adding it if it is not there and `add` is set.
+     * Returns: the name's entry, null if the name is not there and not added, or the
+     * table is out of space
+     */
+    private Entry* find(const(char)[] name, bool add)
+    {
+        import core.atomic : atomicFetchAdd, atomicLoad, cas;
+
+        const h = fnv(name);
         uint mine;
         foreach (probe; 0 .. NameTable.slotCount)
         {
-            shared(uint)* slot = &table.slots[(h + probe) & (NameTable.slotCount - 1)];
+            shared(uint)* slot = &names.slots[(h + probe) & (NameTable.slotCount - 1)];
             uint v = atomicLoad(*slot);
             if (v == 0)
             {
@@ -501,23 +712,22 @@ version (Posix)
                     return null;
                 if (!mine)
                 {
-                    const need = cast(uint)((2 * uint.sizeof + name.length + 3) & ~3);
-                    const offset = atomicFetchAdd(table.used, need);
+                    const need = cast(uint)((Entry.sizeof + name.length + 3) & ~3);
+                    const offset = atomicFetchAdd(names.used, need);
                     if (offset + need > NameTable.arenaSize)
                         return null;
-                    auto header = cast(uint*)(table.arena.ptr + offset);
-                    header[0] = cast(uint)name.length;
-                    header[1] = value;
-                    memcpy(table.arena.ptr + offset + 2 * uint.sizeof, name.ptr, name.length);
+                    auto e = cast(Entry*)(names.arena.ptr + offset);
+                    e.length = cast(uint)name.length;
+                    memcpy(names.arena.ptr + offset + Entry.sizeof, name.ptr, name.length);
                     mine = offset + 1;
                 }
                 if (cas(slot, 0u, mine))
-                    return cast(shared(uint)*)(table.arena.ptr + mine - 1 + uint.sizeof);
+                    return cast(Entry*)(names.arena.ptr + mine - 1);
                 v = atomicLoad(*slot);
             }
-            auto header = cast(uint*)(table.arena.ptr + v - 1);
-            if (header[0] == name.length && memcmp(header + 2, name.ptr, name.length) == 0)
-                return cast(shared(uint)*)(header + 1);
+            auto e = cast(Entry*)(names.arena.ptr + v - 1);
+            if (e.length == name.length && memcmp(e + 1, name.ptr, name.length) == 0)
+                return e;
         }
         return null;
     }
@@ -525,12 +735,19 @@ version (Posix)
 
 /**************************************
  * End a worker once its output part is written, reporting to the original process
- * the library files it added to the link.
+ * the library files it added to the link. A worker that has not settled with the
+ * others what it generates takes part in the remaining rounds first.
  */
 void exitWorker(bool ok)
 {
     version (Posix)
     {
+        FuncDeclaration[] generate;
+        if (pending.length)
+            ok = false;     // functions put off with no module left to generate them in
+        while (settleRound(0, generate))
+            if (generate.length)
+                ok = false;
         foreach (name; global.params.libfiles[libfilesAtSplit .. $])
             fwrite(name, 1, strlen(name) + 1, resultFile);
         if (fflush(resultFile) != 0)
