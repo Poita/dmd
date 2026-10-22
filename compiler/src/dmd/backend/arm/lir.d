@@ -7997,17 +7997,19 @@ private void reuseDominatingMemory()
     const ns = segStart.length - 1;
     if (ns < 2)
         return;
-    Barray!uint predStart, preds, idom;
+    Barray!uint predStart, preds;
     Barray!Loop loops;
-    findLoops(predStart, preds, loops, &idom);
+    Dominators dom;
+    findLoops(predStart, preds, loops, &dom);
     foreach (ref lp; loops[])
         mem_free(lp.body.ptr);
     loops.dtor();
-    scope (exit) { predStart.dtor(); preds.dtor(); idom.dtor(); }
+    scope (exit) { predStart.dtor(); preds.dtor(); dom.dtor(); }
     analyzeMemory();
+    const depth = dom.depth[];
 
-    Barray!uint segOf, depth, ndefs;
-    scope (exit) { segOf.dtor(); depth.dtor(); ndefs.dtor(); }
+    Barray!uint segOf, ndefs;
+    scope (exit) { segOf.dtor(); ndefs.dtor(); }
     segOf.setLength(ins.length);
     segOf[][] = uint.max;
     foreach (si; 0 .. ns)
@@ -8018,27 +8020,7 @@ private void reuseDominatingMemory()
     foreach (ref i; ins[])
         if (i.d && !isPhys(i.d))
             ++ndefs[i.d - firstVreg];
-    // the depth of each segment in the dominator tree, 0 for one not reached
-    depth.setLength(ns);
-    depth[][] = 0;
-    foreach (si; 0 .. ns)
-    {
-        uint k = 0;
-        for (uint x = cast(uint)si; x != 0 && x != uint.max && k <= ns; x = idom[x])
-            ++k;
-        depth[si] = idom[si] == uint.max && si ? 0 : k + 1;
-    }
-    bool dominates(uint a, uint b)
-    {
-        for (uint x = b; x != uint.max; x = idom[x])
-        {
-            if (x == a)
-                return true;
-            if (x == 0)
-                break;
-        }
-        return false;
-    }
+    bool dominates(uint a, uint b) { return dom.dominates(a, b); }
     bool once(Reg r) { return r && !isPhys(r) && ndefs[r - firstVreg] == 1 && memDef[r - firstVreg] != uint.max; }
 
     // the loads and stores by what they reach: chained from a hash of base, sym and offset
@@ -14343,12 +14325,92 @@ private void expandTlvs()
 /// A loop of segments: its header, and all the segments reaching a back edge to it
 struct Loop { uint header; uint size; uint[] body; uint idom; /* the header's immediate dominator */ }
 
-/* The predecessors of each segment, and the loops, smallest first, and if idomOut,
- * the immediate dominator of each segment, uint.max for one not reached; buildSegments() has run
+/// The dominator tree of the segments
+struct Dominators
+{
+    Barray!uint idom;           // the immediate dominator of each segment, uint.max for one not reached
+    Barray!uint enter, leave;   // a depth first numbering of the tree
+    Barray!uint depth;          // of each segment in the tree, 1 for the entry, 0 for one not reached
+
+    /// Whether segment `a` dominates segment `b`, both reached
+    bool dominates(uint a, uint b) const nothrow @safe
+    {
+        return depth[a] && depth[b] && enter[a] <= enter[b] && leave[b] <= leave[a];
+    }
+
+    void dtor() nothrow @safe
+    {
+        idom.dtor(); enter.dtor(); leave.dtor(); depth.dtor();
+    }
+}
+
+/* What computeLoops() found for the graph of segments it last ran on, which is all
+ * it depends on: the passes look for the loops of a function again and again, mostly
+ * of the same graph
+ */
+private struct LoopCache
+{
+    Barray!uint succStart, succ;    // the graph
+    Barray!uint predStart, preds;
+    Barray!Loop loops;
+    Dominators dom;
+    bool valid;
+}
+private __gshared LoopCache loopCache;
+
+/* The predecessors of each segment, and the loops, smallest first, each with a body
+ * of its own, and if domOut, the dominator tree of the segments; buildSegments() has run
  */
 @trusted
 private void findLoops(ref Barray!uint predStart, ref Barray!uint preds, ref Barray!Loop loops,
-    Barray!uint* idomOut = null)
+    Dominators* domOut = null)
+{
+    static void copy(ref Barray!uint to, ref Barray!uint from)
+    {
+        to.setLength(from.length);
+        to[][] = from[][];
+    }
+
+    const ns = segStart.length - 1;
+    auto c = &loopCache;
+    const succStart = segSuccStart[][0 .. ns + 1];
+    const succ = segSucc[][0 .. succStart[ns]];
+    if (!c.valid || c.succStart[] != succStart || c.succ[] != succ)
+    {
+        foreach (ref lp; c.loops[])
+            mem_free(lp.body.ptr);
+        c.loops.setLength(0);
+        computeLoops(c.predStart, c.preds, c.loops, &c.dom);
+        c.succStart.setLength(succStart.length);
+        c.succStart[][] = succStart[];
+        c.succ.setLength(succ.length);
+        c.succ[][] = succ[];
+        c.valid = true;
+    }
+    copy(predStart, c.predStart);
+    copy(preds, c.preds);
+    foreach (lp; c.loops[])
+    {
+        auto body = (cast(uint*)mem_malloc(lp.body.length * uint.sizeof))[0 .. lp.body.length];
+        body[] = lp.body[];
+        lp.body = body;
+        loops.push(lp);
+    }
+    if (domOut)
+    {
+        copy(domOut.idom, c.dom.idom);
+        copy(domOut.enter, c.dom.enter);
+        copy(domOut.leave, c.dom.leave);
+        copy(domOut.depth, c.dom.depth);
+    }
+}
+
+/* The predecessors of each segment, and the loops, smallest first, and if domOut,
+ * the dominator tree of the segments
+ */
+@trusted
+private void computeLoops(ref Barray!uint predStart, ref Barray!uint preds, ref Barray!Loop loops,
+    Dominators* domOut)
 {
     const ns = segStart.length - 1;
     // the predecessors of each segment
@@ -14451,9 +14513,11 @@ private void findLoops(ref Barray!uint predStart, ref Barray!uint preds, ref Bar
     /* Number the dominator tree in depth first order, so that `a` dominates `b` when
      * `b`'s interval of numbers lies within `a`'s
      */
-    Barray!uint enter, leave;
+    Barray!uint enter, leave, depth;
     enter.setLength(ns);
     leave.setLength(ns);
+    depth.setLength(ns);
+    depth[][] = 0;
     {
         Barray!uint childStart, children, fill;
         childStart.setLength(ns + 1);
@@ -14474,6 +14538,7 @@ private void findLoops(ref Barray!uint predStart, ref Barray!uint preds, ref Bar
         uint clock;
         stack.push(0);
         enter[0] = clock++;
+        depth[0] = 1;
         while (stack.length)
         {
             const v = stack[stack.length - 1];
@@ -14483,6 +14548,7 @@ private void findLoops(ref Barray!uint predStart, ref Barray!uint preds, ref Bar
                 ++next[v];
                 const c = children[k];
                 enter[c] = clock++;
+                depth[c] = depth[v] + 1;
                 stack.push(c);
             }
             else
@@ -14559,14 +14625,21 @@ private void findLoops(ref Barray!uint predStart, ref Barray!uint preds, ref Bar
     }
     if (loops.length > 1)
         qsort(loops[].ptr, loops.length, Loop.sizeof, &bySize);
-    if (idomOut)
-    {
-        idomOut.setLength(ns);
-        (*idomOut)[][] = idom[][];
-    }
     inLoop.dtor(); isHeader.dtor();
-    enter.dtor(); leave.dtor();
-    idom.dtor(); rpo.dtor(); order.dtor();
+    if (domOut)
+    {
+        domOut.dtor();
+        domOut.idom = idom;
+        domOut.enter = enter;
+        domOut.leave = leave;
+        domOut.depth = depth;
+    }
+    else
+    {
+        enter.dtor(); leave.dtor(); depth.dtor();
+        idom.dtor();
+    }
+    rpo.dtor(); order.dtor();
 }
 
 /* Move the instructions computing the same value on every iteration of a loop
@@ -14583,9 +14656,10 @@ private bool hoistInvariants()
 
     Barray!uint predStart, preds;
     Barray!Loop loops;
-    Barray!uint idom;
-    scope (exit) idom.dtor();
-    findLoops(predStart, preds, loops, &idom);
+    Dominators dom;
+    scope (exit) dom.dtor();
+    findLoops(predStart, preds, loops, &dom);
+    const idom = dom.idom[];
     analyzeMemory();
     const precise = !env!"DMD_NEWCG_NOMEMOPT";
     Barray!Footprint loopStores;    // what the loop's stores and calls may reach
@@ -14807,18 +14881,7 @@ private bool hoistInvariants()
                     if (def == uint.max || inAnyLoop[segOf[def]])
                         continue;
                     const ds = segOf[def];
-                    bool dom = ds == d ? def < n : false;
-                    if (ds != d)
-                        for (uint x = d; x != uint.max && x != 0; )
-                        {
-                            x = idom[x];
-                            if (x == ds)
-                            {
-                                dom = true;
-                                break;
-                            }
-                        }
-                    if (dom)
+                    if (ds == d ? def < n : dom.dominates(ds, d))
                         witnessed.push(w);
                 }
                 if (d == 0)
