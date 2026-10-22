@@ -754,12 +754,20 @@ nothrow:
 
         vec_t tmp = vec_calloc(facts.length);
         vec_t edge = vec_calloc(facts.length);
+        // the blocks whose facts at the start have changed since they were last looked at
+        Barray!bool dirty;
+        scope (exit) dirty.dtor();
+        dirty.setLength(bo.dfo.length);
+        dirty[][] = true;
         bool changed;
         do
         {
             changed = false;
             foreach (i, b; bo.dfo[])
             {
+                if (!dirty[i])
+                    continue;
+                dirty[i] = false;
                 vec_copy(tmp, inState[i]);
                 transfer(b, tmp, false);
                 Fact[2] f;
@@ -782,6 +790,7 @@ nothrow:
                         {
                             w[k] = x;
                             changed = true;
+                            dirty[j] = true;
                         }
                     }
                 }
