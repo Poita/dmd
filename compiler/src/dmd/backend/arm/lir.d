@@ -8035,30 +8035,22 @@ private void reuseDominatingMemory()
     if (ns < 2)
         return;
     Barray!uint predStart, preds;
-    Barray!Loop loops;
     Dominators dom;
-    findLoops(predStart, preds, loops, &dom);
-    foreach (ref lp; loops[])
-        mem_free(lp.body.ptr);
-    loops.dtor();
+    findLoops(predStart, preds, null, &dom);
     scope (exit) { predStart.dtor(); preds.dtor(); dom.dtor(); }
     analyzeMemory();
     const depth = dom.depth[];
 
-    Barray!uint segOf, ndefs;
-    scope (exit) { segOf.dtor(); ndefs.dtor(); }
+    Barray!uint segOf;
+    scope (exit) segOf.dtor();
     segOf.setLength(ins.length);
     segOf[][] = uint.max;
     foreach (si; 0 .. ns)
         foreach (n; segStart[si] .. segEnd(si))
             segOf[n] = cast(uint)si;
-    ndefs.setLength(vinfo.length);
-    ndefs[][] = 0;
-    foreach (ref i; ins[])
-        if (i.d && !isPhys(i.d))
-            ++ndefs[i.d - firstVreg];
     bool dominates(uint a, uint b) { return dom.dominates(a, b); }
-    bool once(Reg r) { return r && !isPhys(r) && ndefs[r - firstVreg] == 1 && memDef[r - firstVreg] != uint.max; }
+    // defined by one instruction, which then is its only definition
+    bool once(Reg r) { return r && !isPhys(r) && memDef[r - firstVreg] != uint.max; }
 
     // the loads and stores by what they reach: chained from a hash of base, sym and offset
     enum tableBits = 10;
@@ -14450,6 +14442,14 @@ private __gshared LoopCache loopCache;
 private void findLoops(ref Barray!uint predStart, ref Barray!uint preds, ref Barray!Loop loops,
     Dominators* domOut = null)
 {
+    findLoops(predStart, preds, &loops, domOut);
+}
+
+/// ditto, without the loops if `loops` is null
+@trusted
+private void findLoops(ref Barray!uint predStart, ref Barray!uint preds, Barray!Loop* loops,
+    Dominators* domOut)
+{
     static void copy(ref Barray!uint to, ref Barray!uint from)
     {
         to.setLength(from.length);
@@ -14474,13 +14474,14 @@ private void findLoops(ref Barray!uint predStart, ref Barray!uint preds, ref Bar
     }
     copy(predStart, c.predStart);
     copy(preds, c.preds);
-    foreach (lp; c.loops[])
-    {
-        auto body = (cast(uint*)mem_malloc(lp.body.length * uint.sizeof))[0 .. lp.body.length];
-        body[] = lp.body[];
-        lp.body = body;
-        loops.push(lp);
-    }
+    if (loops)
+        foreach (lp; c.loops[])
+        {
+            auto body = (cast(uint*)mem_malloc(lp.body.length * uint.sizeof))[0 .. lp.body.length];
+            body[] = lp.body[];
+            lp.body = body;
+            loops.push(lp);
+        }
     if (domOut)
     {
         copy(domOut.idom, c.dom.idom);
