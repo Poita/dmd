@@ -2589,7 +2589,7 @@ elem* toElem(Expression e, ref IRState irs)
                     printf("enbytes\n");    elem_print(enbytes);
                 }
 
-                if (irs.arrayBoundsCheck() && eupr && ta.ty != Tpointer)
+                if (irs.arrayBoundsCheck(ae) && eupr && ta.ty != Tpointer)
                 {
                     assert(elwr);
                     elem* enbytesx = enbytes;
@@ -2679,7 +2679,7 @@ elem* toElem(Expression e, ref IRState irs)
 
                     elem* epfr;
                     elem* echeck;
-                    if (irs.arrayBoundsCheck()) // check array lengths match and do not overlap
+                    if (irs.arrayBoundsCheck(ae)) // check array lengths match and do not overlap
                     {
                         auto ey = el_same(efrom);
                         auto eleny = getDotLength(irs, efrom, ey);
@@ -3934,7 +3934,7 @@ elem* toElem(Expression e, ref IRState irs)
             elem* eupr2 = eupr;
 
             //printf("upperIsInBounds = %d lowerIsLessThanUpper = %d\n", se.upperIsInBounds, se.lowerIsLessThanUpper);
-            if (irs.arrayBoundsCheck())
+            if (irs.arrayBoundsCheck(se))
             {
                 // Checks (unsigned compares):
                 //  upr <= array.length
@@ -4056,7 +4056,7 @@ elem* toElem(Expression e, ref IRState irs)
         elem* einit = resolveLengthVar(ie.lengthVar, &n1, t1);
         elem* n2 = toElem(ie.e2, irs);
 
-        if (irs.arrayBoundsCheck() && !ie.indexIsInBounds)
+        if (irs.arrayBoundsCheck(ie) && !ie.indexIsInBounds)
         {
             elem* elength;
 
