@@ -6034,7 +6034,11 @@ beg:
                     return el_selecte1(e);
                 }
                 if (!goal)
+                {
+                    // with the struct type, which gives the size of a struct copy moved out of it
                     e.Ety = e2.Ety;
+                    e.ET = e2.ET;
+                }
                 return e;
             }
 
